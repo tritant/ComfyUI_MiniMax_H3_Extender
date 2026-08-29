@@ -53,13 +53,14 @@ from .motion_context_ram import (
     _audio_t_for_frames,
     _auto_early_seam_shift,
     _frames_from_video_t,
-    _photometric_match_segment,
+    _luma_map,
+    _luma_stats,
     _pixel_frames,
     _steps_for_frames,
     _streams_from_latent,
 )
 
-BUILD = "motion-context-disk-v14.79-dynamic-per-clip-loras"
+BUILD = "motion-context-disk-v2.0.0"
 PREVIEW_AUDIO_MODE = "pcm_single_aac_gain_chain_v3_entry_ramp"
 CACHE_VERSION = 12
 PREVIEW_ROTATION_SLOTS = 3
@@ -900,18 +901,131 @@ def _decode_pair_video(vae, chain, meta):
     return decoded, previous_raw, current_raw, int(shift)
 
 
-def _correct_current_segment(previous_raw, current_raw):
+def _correct_current_segment(previous_raw, current_raw, chunk_frames=8):
+    """Memory-bounded disk Final Decode seam correction.
+
+    This is mathematically equivalent to the disk path's former
+    ``torch.cat(previous_tail, current) -> _photometric_match_segment()``
+    correction, but it deliberately avoids allocating a second full RGB clip.
+
+    ``current_raw`` is a disposable view into the decoded seam-pair buffer, so
+    the correction is applied in place.  Large per-frame operations are then
+    evaluated in small chunks to keep temporary float32 tensors bounded.  The
+    RAM/legacy Join still uses its original helper unchanged.
+    """
     tail_n = min(4, int(previous_raw.shape[0]))
-    if tail_n < 1:
+    current_n = int(current_raw.shape[0])
+    if tail_n < 1 or current_n < 1:
         return current_raw
-    pair = torch.cat((previous_raw[-tail_n:], current_raw), dim=0)
-    pair = _photometric_match_segment(
-        pair,
-        seam_frame=tail_n,
-        detect_window=4,
-        end_frame=int(pair.shape[0]),
+
+    ref = previous_raw[-min(4, tail_n):]
+    src = current_raw[:min(4, current_n)]
+
+    ref_mean, ref_std, ref_med = _luma_stats(ref)
+    src_mean, src_std, src_med = _luma_stats(src)
+
+    if abs(ref_mean - src_mean) < 0.008 and abs(ref_med - src_med) < 0.012:
+        return current_raw
+
+    eps = 1e-4
+    src_med_c = min(max(src_med, 0.05), 0.95)
+    ref_med_c = min(max(ref_med, 0.05), 0.95)
+
+    gamma_full = math.log(ref_med_c) / math.log(src_med_c)
+    gamma_full = float(max(0.88, min(1.15, gamma_full)))
+
+    src_y = _luma_map(src).detach().float()
+    src_y_gamma = src_y.clamp(eps, 1.0).pow(gamma_full)
+    gamma_mean = float(src_y_gamma.mean().item())
+    if gamma_mean <= eps:
+        del src_y, src_y_gamma
+        return current_raw
+
+    gain_full = ref_mean / gamma_mean
+    gain_full = float(max(0.88, min(1.12, gain_full)))
+
+    corrected_std = float(
+        (src_y_gamma * gain_full).std(unbiased=False).clamp_min(1e-5).item()
     )
-    return pair[tail_n:]
+    contrast_full = ref_std / corrected_std if corrected_std > eps else 1.0
+    contrast_full = float(max(0.92, min(1.08, contrast_full)))
+    del src_y, src_y_gamma
+
+    global_strength = 0.55
+    seam_full_mean = gamma_mean * gain_full
+    mean_offset = ref_mean - seam_full_mean
+    step = max(1, int(chunk_frames))
+
+    # Global correction, in place, with bounded temporary tensors.
+    for start in range(0, current_n, step):
+        end = min(current_n, start + step)
+        segment = current_raw[start:end]
+        rgb = segment[..., :3].float()
+        y = _luma_map(rgb)
+        y_full = y.clamp(eps, 1.0).pow(gamma_full)
+        y_full = (y_full - ref_mean) * contrast_full + ref_mean
+        y_full = y_full * gain_full
+        y_full = (y_full + mean_offset).clamp(0.0, 1.0)
+        delta = (y_full - y) * global_strength
+        segment[..., :3] = (
+            rgb + delta.unsqueeze(-1)
+        ).clamp(0.0, 1.0).to(segment.dtype)
+        del segment, rgb, y, y_full, delta
+
+    # Same local first-three-frame stabilization as the legacy helper.
+    local_count = min(3, current_n)
+    if local_count > 0:
+        stable_start = min(current_n, local_count)
+        stable_end = min(current_n, stable_start + 4)
+        if stable_end > stable_start:
+            stable_mean, _, _ = _luma_stats(current_raw[stable_start:stable_end])
+        else:
+            stable_mean = ref_mean
+
+        local_mix = (0.10, 0.40, 0.75)
+        for j in range(local_count):
+            frame = current_raw[j]
+            rgb = frame[..., :3].float()
+            y = _luma_map(rgb)
+            current_mean = float(y.mean().item())
+            t = local_mix[j]
+            target_mean = ref_mean * (1.0 - t) + stable_mean * t
+            offset = max(-0.060, min(0.060, float(target_mean - current_mean)))
+            y_local = (y + offset).clamp(0.0, 1.0)
+            delta = y_local - y
+            frame[..., :3] = (
+                rgb + delta.unsqueeze(-1)
+            ).clamp(0.0, 1.0).to(frame.dtype)
+            del frame, rgb, y, y_local, delta
+
+    # Same +3.5% stable continuation lift, also chunked in place.
+    tail_gain = 1.035
+    tail_start = 3
+    if tail_start < current_n:
+        for start in range(tail_start, current_n, step):
+            end = min(current_n, start + step)
+            tail = current_raw[start:end]
+            rgb = tail[..., :3].float()
+            y = _luma_map(rgb)
+            y_lift = (y * tail_gain).clamp(0.0, 1.0)
+
+            count = int(tail.shape[0])
+            strength = torch.ones(
+                (count, 1, 1), device=y.device, dtype=y.dtype
+            )
+            offset0 = start - tail_start
+            if offset0 == 0 and count >= 1:
+                strength[0] = 1.0 / 3.0
+            if offset0 <= 1 < offset0 + count:
+                strength[1 - offset0] = 2.0 / 3.0
+
+            delta = (y_lift - y) * strength
+            tail[..., :3] = (
+                rgb + delta.unsqueeze(-1)
+            ).clamp(0.0, 1.0).to(tail.dtype)
+            del tail, rgb, y, y_lift, strength, delta
+
+    return current_raw
 
 
 def _find_ffmpeg():
@@ -961,7 +1075,14 @@ def _replace_output_from_preview(
                 codec="H.264", crf=17, preset="fast",
             )
         else:
-            shutil.copy2(Path(preview_path), tmp)
+            # The neutral preview is already the exact file we want to persist.
+            # Prefer a same-volume hardlink so long clip-by-clip previews are not
+            # recopied in full after every card. Cross-volume/unsupported filesystems
+            # transparently fall back to the previous copy2 behaviour.
+            try:
+                os.link(Path(preview_path), tmp)
+            except OSError:
+                shutil.copy2(Path(preview_path), tmp)
         os.replace(tmp, destination)
     finally:
         try:
@@ -1009,7 +1130,9 @@ def _write_image_frames(proc, images, batch_frames=8):
             .mul(255.0).add_(0.5).to(torch.uint8)
             .cpu().contiguous()
         )
-        proc.stdin.write(part.numpy().tobytes(order="C"))
+        # part is already contiguous uint8. Feed its buffer directly to ffmpeg
+        # instead of materialising a second Python bytes object with .tobytes().
+        proc.stdin.write(memoryview(part.numpy()).cast("B"))
         del part
 
 
@@ -2153,33 +2276,34 @@ def _render_one_final_video_segment(
     decoded, previous_raw, current_raw, shift = _decode_pair_video(
         vae, chain, meta
     )
+    # The latent seam pair is no longer needed once VAE decode returned.  Drop
+    # it before photometric work so latent + large RGB temporaries do not overlap.
+    del chain
     if progress is not None:
         progress.advance()
     current_video = _correct_current_segment(previous_raw, current_raw)
-    del chain, decoded, previous_raw, current_raw
+    del decoded, previous_raw, current_raw
     return current_video, int(shift)
 
 
-def _render_one_final_segment(
+def _render_one_final_audio_segment(
     data_path,
     segments,
     index,
-    vae,
     audio_vae,
     fps,
+    seam_shift,
     progress=None,
 ):
+    """Decode exactly one final audio segment for a known video seam shift."""
     i = int(index)
     curr = segments[i]
-    video, shift = _render_one_final_video_segment(
-        data_path, segments, i, vae, progress=progress
-    )
 
     if i == 0:
         audio = _decode_single_audio(data_path, curr, audio_vae, fps)
         if progress is not None:
             progress.advance()
-        return video, audio, 0
+        return audio
 
     prev = segments[i - 1]
     pair_audio, prev_frames, curr_frames = _decode_pair_audio(
@@ -2188,7 +2312,7 @@ def _render_one_final_segment(
         curr,
         audio_vae,
         fps,
-        int(shift),
+        int(seam_shift),
     )
     if progress is not None:
         progress.advance()
@@ -2220,6 +2344,37 @@ def _render_one_final_segment(
     }
 
     del pair_audio, wave, previous_audio
+    return audio
+
+
+def _render_one_final_segment(
+    data_path,
+    segments,
+    index,
+    vae,
+    audio_vae,
+    fps,
+    progress=None,
+):
+    """Compatibility helper returning one video+audio segment.
+
+    Memory-sensitive progressive-preview code calls the video/audio helpers
+    separately so the large VideoVAE pair can be encoded and released before
+    AudioVAE work starts.
+    """
+    i = int(index)
+    video, shift = _render_one_final_video_segment(
+        data_path, segments, i, vae, progress=progress
+    )
+    audio = _render_one_final_audio_segment(
+        data_path,
+        segments,
+        i,
+        audio_vae,
+        fps,
+        int(shift),
+        progress=progress,
+    )
     return video, audio, int(shift)
 
 def _sync_committed_preview(
@@ -2429,26 +2584,14 @@ def _export_live_candidate_preview(
         except Exception:
             shutil.copy2(committed_path, preview_path)
 
-        # Small compatibility output only: recover last frame from the last
-        # segment. This does not affect the full preview cache itself.
-        last_i = len(segments) - 1
-        video, audio, shift = _render_one_final_segment(
-            data_path,
-            segments,
-            last_i,
-            vae,
-            audio_vae,
-            fps,
-            progress=progress,
-        )
-        last_frame = video[-1:].detach().cpu().clone()
-        del video, audio
-
+        # The Final Decode node has no tensor outputs. Once every clip is
+        # validated the complete committed preview is already authoritative, so
+        # decoding the last clip/pair merely to manufacture an unused last_frame
+        # would waste a full VideoVAE pass and several GB of temporary RGB memory.
         return (
             preview_path,
-            last_frame,
             int(manifest.get("final_frame_count", 0)),
-            int(shift),
+            0,
             None,
             "committed_full_cache",
         )
@@ -2461,13 +2604,15 @@ def _export_live_candidate_preview(
 
     # Normal VAE cost:
     #   clip 1 alone, otherwise ONLY previous + current pair.
-    current_video, current_audio, seam_shift = _render_one_final_segment(
+    # Decode/correct video first, encode it immediately, then release the
+    # VideoVAE pair storage BEFORE AudioVAE starts. This prevents the two large
+    # native workloads from
+    # overlapping in Clip by Clip mode.
+    current_video, seam_shift = _render_one_final_video_segment(
         data_path,
         segments,
         candidate_index,
         vae,
-        audio_vae,
-        fps,
         progress=progress,
     )
 
@@ -2480,6 +2625,17 @@ def _export_live_candidate_preview(
             fps,
             candidate_mp4,
             token,
+        )
+        del current_video
+
+        current_audio = _render_one_final_audio_segment(
+            data_path,
+            segments,
+            candidate_index,
+            audio_vae,
+            fps,
+            int(seam_shift),
+            progress=progress,
         )
 
         # Save candidate's already decoded/corrected render in .h3cache.
@@ -2514,7 +2670,6 @@ def _export_live_candidate_preview(
             f"{token}_candidate_full",
         )
 
-        last_frame = current_video[-1:].detach().cpu().clone()
         total_frames = int(manifest.get("final_frame_count", 0))
 
         _LOG.info(
@@ -2532,7 +2687,6 @@ def _export_live_candidate_preview(
 
         return (
             preview_path,
-            last_frame,
             total_frames,
             int(seam_shift),
             None if candidate_index == 0 else int(candidate_index),
@@ -2549,7 +2703,7 @@ def _export_live_candidate_preview(
 
 
 
-def _restore_cached_preview_without_decode(owner_id, final_id):
+def _restore_cached_preview_without_decode(owner_id, final_id, generation_mode="ref2va"):
     """
     Rebuild the current full preview using ONLY already cached decoded MP4 blobs.
 
@@ -2560,7 +2714,12 @@ def _restore_cached_preview_without_decode(owner_id, final_id):
     owner = _safe_name(owner_id)
     final = _safe_name(final_id)
 
-    data_path, manifest_path = _chain_paths(f"extender_{owner}")
+    if str(generation_mode or "ref2va").lower() == "fl2va":
+        from .fl2va_engine import cache_owner_id
+        cache_owner = cache_owner_id(owner_id)
+    else:
+        cache_owner = f"extender_{owner}"
+    data_path, manifest_path = _chain_paths(cache_owner)
     if not data_path.exists() or not manifest_path.exists():
         return None
 
@@ -2680,7 +2839,13 @@ if web is not None and PromptServer is not None and getattr(PromptServer, "insta
             return web.json_response({"ok": False, "error": "Missing owner/final/clip id."}, status=400)
         try:
             idx = int(clip_index)
-            data_path, manifest_path = _chain_paths(f"extender_{_safe_name(owner_id)}")
+            generation_mode = str(request.query.get("mode") or "ref2va").lower()
+            if generation_mode == "fl2va":
+                from .fl2va_engine import cache_owner_id
+                cache_owner = cache_owner_id(owner_id)
+            else:
+                cache_owner = f"extender_{_safe_name(owner_id)}"
+            data_path, manifest_path = _chain_paths(cache_owner)
             manifest = _load_manifest_from_paths(data_path, manifest_path)
             if manifest is None:
                 return web.json_response({"ok": False, "error": "No cached H3 sequence found."}, status=404)
@@ -2713,7 +2878,13 @@ if web is not None and PromptServer is not None and getattr(PromptServer, "insta
             idx = int(body.get("clip_index"))
             if not owner_id:
                 return web.json_response({"ok": False, "error": "Missing owner id."}, status=400)
-            data_path, manifest_path = _chain_paths(f"extender_{_safe_name(owner_id)}")
+            generation_mode = str(body.get("generation_mode") or "ref2va").lower()
+            if generation_mode == "fl2va":
+                from .fl2va_engine import cache_owner_id
+                cache_owner = cache_owner_id(owner_id)
+            else:
+                cache_owner = f"extender_{_safe_name(owner_id)}"
+            data_path, manifest_path = _chain_paths(cache_owner)
             manifest = _load_manifest_from_paths(data_path, manifest_path)
             if manifest is None:
                 return web.json_response({"ok": False, "error": "No cached H3 sequence found."}, status=404)
@@ -2777,7 +2948,13 @@ if web is not None and PromptServer is not None and getattr(PromptServer, "insta
             color_timeline = None
             if owner_id:
                 try:
-                    data_path, manifest_path = _chain_paths(f"extender_{_safe_name(owner_id)}")
+                    generation_mode = str(body.get("generation_mode") or "ref2va").lower()
+                    if generation_mode == "fl2va":
+                        from .fl2va_engine import cache_owner_id
+                        cache_owner = cache_owner_id(owner_id)
+                    else:
+                        cache_owner = f"extender_{_safe_name(owner_id)}"
+                    data_path, manifest_path = _chain_paths(cache_owner)
                     manifest = _load_manifest_from_paths(data_path, manifest_path)
                     if manifest is not None:
                         color_timeline = _color_timeline(
@@ -2809,9 +2986,13 @@ if web is not None and PromptServer is not None and getattr(PromptServer, "insta
             return web.json_response({"found": False, "reason": "missing_id"})
 
         try:
-            data_path, manifest_path = _chain_paths(
-                f"extender_{_safe_name(owner_id)}"
-            )
+            generation_mode = str(request.query.get("mode") or "ref2va").lower()
+            if generation_mode == "fl2va":
+                from .fl2va_engine import cache_owner_id
+                cache_owner = cache_owner_id(owner_id)
+            else:
+                cache_owner = f"extender_{_safe_name(owner_id)}"
+            data_path, manifest_path = _chain_paths(cache_owner)
             if not data_path.exists() or not manifest_path.exists():
                 return web.json_response({"found": False})
 
@@ -2820,14 +3001,26 @@ if web is not None and PromptServer is not None and getattr(PromptServer, "insta
                 return web.json_response({"found": False})
 
             segments = [dict(x) for x in manifest.get("segments", [])]
-            validated_count = _validated_prefix_count(segments)
+            is_fl2va = str(manifest.get("sequence_mode") or generation_mode).lower() == "fl2va"
+            validated_count = (
+                sum(bool(x.get("validated", False)) for x in segments)
+                if is_fl2va else _validated_prefix_count(segments)
+            )
             geometry = manifest.get("geometry") if isinstance(manifest.get("geometry"), dict) else {}
             resolved_width = int(geometry.get("video_w", 0) or 0) * 16
             resolved_height = int(geometry.get("video_h", 0) or 0) * 16
+            continuity_signatures = {}
+            if is_fl2va:
+                from .fl2va_engine import continuity_signatures_for_segments
+                continuity_signatures = continuity_signatures_for_segments(data_path, segments)
             return web.json_response({
                 "found": True,
+                "generation_mode": "fl2va" if is_fl2va else "ref2va",
                 "cached_count": int(len(segments)),
                 "validated_count": int(validated_count),
+                "cached_clip_ids": [str(x.get("clip_id")) for x in segments if str(x.get("clip_id") or "")],
+                "validated_clip_ids": [str(x.get("clip_id")) for x in segments if str(x.get("clip_id") or "") and bool(x.get("validated", False))],
+                "continuity_signatures": continuity_signatures,
                 "frame_count": int(manifest.get("final_frame_count", 0)),
                 "resolved_width": int(resolved_width),
                 "resolved_height": int(resolved_height),
@@ -2851,7 +3044,8 @@ if web is not None and PromptServer is not None and getattr(PromptServer, "insta
             return web.json_response({"found": False, "reason": "missing_id"})
 
         try:
-            restored = _restore_cached_preview_without_decode(owner_id, final_id)
+            generation_mode = str(request.query.get("mode") or "ref2va").lower()
+            restored = _restore_cached_preview_without_decode(owner_id, final_id, generation_mode)
             if restored is None:
                 return web.json_response({"found": False})
 
@@ -2860,9 +3054,12 @@ if web is not None and PromptServer is not None and getattr(PromptServer, "insta
                 restored["fps"],
                 "temp",
             )
-            data_path, manifest_path = _chain_paths(
-                f"extender_{_safe_name(owner_id)}"
-            )
+            if generation_mode == "fl2va":
+                from .fl2va_engine import cache_owner_id
+                cache_owner = cache_owner_id(owner_id)
+            else:
+                cache_owner = f"extender_{_safe_name(owner_id)}"
+            data_path, manifest_path = _chain_paths(cache_owner)
             manifest = _load_manifest_from_paths(data_path, manifest_path)
             color_timeline = _color_timeline(
                 manifest.get("segments", []) if manifest else [],
@@ -2893,6 +3090,9 @@ class MiniMaxH3MotionContextDiskFinalDecode:
                 "cache": (CACHE_TYPE,),
                 "vae": ("VAE",),
                 "audio_vae": ("VAE",),
+                # Compatibility-only input. The frontend hides it and export()
+                # ignores its value; keeping its original position prevents old
+                # workflow widgets_values arrays from shifting every later field.
                 "fps": ("FLOAT", {"default": 24.0, "min": 1.0, "max": 240.0, "step": 0.001}),
                 "filename_prefix": ("STRING", {"default": "MiniMax_H3_cached"}),
                 "output_directory": ("STRING", {"default": ""}),
@@ -2927,13 +3127,23 @@ class MiniMaxH3MotionContextDiskFinalDecode:
         unique_id=None,
     ):
         data_path, manifest_path, manifest = _load_manifest(cache)
-        if abs(float(manifest["fps"]) - float(fps)) > 1e-6:
-            raise ValueError(
-                f"Disk Final Decode fps is {manifest['fps']}, export requested {fps}."
-            )
+        # FPS is cache metadata, never a user choice. The compatibility widget
+        # value above is deliberately ignored so old workflows keep their widget
+        # positions without being able to alter H3 timing.
+        fps = float(manifest.get("fps", FPS))
+        if not math.isfinite(fps) or fps <= 0.0:
+            raise ValueError(f"Disk Final Decode: invalid cached fps {fps!r}.")
         segments = [dict(x) for x in manifest.get("segments", [])]
         if not segments:
             raise ValueError("Disk Final Decode: empty cache.")
+        if str(manifest.get("sequence_mode") or "ref2va").lower() == "fl2va":
+            from .fl2va_engine import export_fl2va_final
+            return export_fl2va_final(
+                cache=cache, vae=vae, audio_vae=audio_vae, fps=fps,
+                filename_prefix=filename_prefix, output_directory=output_directory,
+                codec=codec, crf=crf, preset=preset, audio_bitrate=audio_bitrate,
+                unique_id=unique_id,
+            )
         color_timeline = _color_timeline(segments, float(fps))
 
         ffmpeg = _find_ffmpeg()
@@ -2955,7 +3165,6 @@ class MiniMaxH3MotionContextDiskFinalDecode:
             progress = _FinalDecodeNativeProgress(unique_id, total=6)
             (
                 preview_path,
-                last_frame,
                 preview_frames,
                 seam_shift,
                 previous_clip,
@@ -3022,7 +3231,6 @@ class MiniMaxH3MotionContextDiskFinalDecode:
         )
         seam_shifts = {}
         written_frames = 0
-        last_frame = None
         video_proc = None
         video_log_f = None
 
@@ -3056,12 +3264,13 @@ class MiniMaxH3MotionContextDiskFinalDecode:
                 )
                 _write_image_frames(video_proc, decoded)
                 written_frames = int(decoded.shape[0])
-                last_frame = decoded[-1:].detach().cpu().clone()
                 del decoded, v
             else:
                 for i in range(1, len(segments)):
                     chain, meta = _build_pair_video(data_path, segments[i - 1], segments[i])
                     decoded, previous_raw, current_raw, shift = _decode_pair_video(vae, chain, meta)
+                    # Free the latent pair before the RGB seam correction.
+                    del chain
                     progress.advance()
                     seam_shifts[i] = int(shift)
 
@@ -3073,13 +3282,11 @@ class MiniMaxH3MotionContextDiskFinalDecode:
                         # First pair supplies clip 1 exactly once.
                         _write_image_frames(video_proc, previous_raw)
                         written_frames += int(previous_raw.shape[0])
-                        last_frame = previous_raw[-1:].detach().cpu().clone()
 
                     current_out = _correct_current_segment(previous_raw, current_raw)
                     _write_image_frames(video_proc, current_out)
                     written_frames += int(current_out.shape[0])
-                    last_frame = current_out[-1:].detach().cpu().clone()
-                    del current_out, previous_raw, current_raw, decoded, chain
+                    del current_out, previous_raw, current_raw, decoded
 
             if video_proc is None or video_log_f is None:
                 raise RuntimeError("Disk Final Decode: encoder never started.")

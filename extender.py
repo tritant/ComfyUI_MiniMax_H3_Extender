@@ -55,6 +55,8 @@ from .motion_context_disk import (
     _decoded_audio_cache_end,
     _decoded_preview_cache_path,
     _decoded_preview_video_cache_path,
+    _latest_preview_temp_path,
+    PREVIEW_AUDIO_MODE,
     _ensure_cache_root,
     _safe_name,
     _write_json_atomic,
@@ -63,9 +65,28 @@ from .motion_context_disk import (
     _load_manifest_from_paths,
     _manifest_for_first,
     _truncate_chain,
+    _final_frame_count,
+)
+from .fl2va_engine import (
+    normalize_mode as _normalize_generation_mode,
+    cache_owner_id as _fl2va_cache_owner_id,
+    make_fl2va_conditioning,
+    sync_fl2va_manifest,
+    cached_fl2va_ids,
+    store_fl2va_segment,
+    set_fl2va_validation,
+    fl2va_cache_state,
+    resolve_fl2va_previous_frame,
+    drop_fl2va_cached_ids,
+    fl2va_last_frame_path,
+    fl2va_continuity_meta,
+    continuity_signatures_for_segments,
+    compact_fl2va_cache,
+    fl2va_project_continuity_files,
+    install_fl2va_project_continuity,
 )
 
-BUILD = "minimax-h3-extender-v14.79-dynamic-per-clip-loras"
+BUILD = "minimax-h3-extender-v2.0.0"
 FPS = 24
 AUDIO_LATENT_FPS = 40
 CANVAS_MULTIPLE = 32
@@ -77,6 +98,21 @@ MAX_STANDALONE_AUDIO_REFS = 3
 MAX_REF_VIDEO_FRAMES = 362
 MAX_MIXED_REF_ITEMS = 12
 MIN_REF_AUDIO_SECONDS = 2.0
+
+
+class _LazyUnconnected:
+    """Sentinel used to distinguish an empty optional socket from a lazy input.
+
+    ComfyUI passes ``None`` for a connected lazy input that has not been
+    evaluated yet. An omitted optional socket never reaches the method, so its
+    default value can safely use this distinct sentinel.
+    """
+
+    def __repr__(self):
+        return "<unconnected>"
+
+
+_LAZY_UNCONNECTED = _LazyUnconnected()
 MAX_REF_AUDIO_SECONDS = 15.0
 MAX_CLIPS = 512
 DEFAULT_DURATION = 10.0
@@ -1079,6 +1115,8 @@ def _prepare_shared_refs(
     ref_video_audios=None,
     standalone_audio_count=0,
     frame_count=None,
+    cached_image_blocks=None,
+    cached_video_blocks=None,
 ):
     """Encode shared H3 Ref2VA image/video refs and paired soundtracks.
 
@@ -1126,7 +1164,7 @@ def _prepare_shared_refs(
     active_video_slots = []
 
     # Official Ref2VA presentation order starts with images.
-    for slot, ref in active_images:
+    for image_index, (slot, ref) in enumerate(active_images):
         img = _load_reference_tensor(ref) if isinstance(ref, dict) else ref
         h, w = int(img.shape[1]), int(img.shape[2])
         if ref_image_size == "match":
@@ -1144,7 +1182,19 @@ def _prepare_shared_refs(
         )
 
         resized = _resize(img[:1], tw, th)
-        z = vae.encode(resized)
+        cached_block = (
+            cached_image_blocks[image_index]
+            if cached_image_blocks is not None and image_index < len(cached_image_blocks)
+            else None
+        )
+        if (
+            isinstance(cached_block, dict)
+            and cached_block.get("kind") == "image"
+            and cached_block.get("latent") is not None
+        ):
+            z = cached_block.get("latent")
+        else:
+            z = vae.encode(resized)
         ref_items.append({"type": "image", "data": resized})
         active_picture_slots.append(int(slot))
         ref_blocks.append(
@@ -1160,7 +1210,7 @@ def _prepare_shared_refs(
     target_frames = int(frame_count) if frame_count is not None else MAX_REF_VIDEO_FRAMES
     target_frames = max(5, min(target_frames, MAX_REF_VIDEO_FRAMES))
     total_ref_video_frames = 0
-    for slot, video_frames, source_fps, soundtrack in active_videos:
+    for video_index, (slot, video_frames, source_fps, soundtrack) in enumerate(active_videos):
         frames_24 = _resample_ref_video_to_h3_fps(video_frames, source_fps, f"ref_video_{slot}")
         if int(frames_24.shape[0]) < int(2 * FPS):
             raise ValueError(
@@ -1191,25 +1241,47 @@ def _prepare_shared_refs(
                 "MiniMax H3 Extender: total effective reference-video duration exceeds MiniMax H3's 15-second limit."
             )
 
-        z = vae.encode(frames)
+        cached_block = (
+            cached_video_blocks[video_index]
+            if cached_video_blocks is not None and video_index < len(cached_video_blocks)
+            else None
+        )
+        if (
+            isinstance(cached_block, dict)
+            and str(cached_block.get("kind") or "").startswith("video")
+            and cached_block.get("latent") is not None
+        ):
+            z = cached_block.get("latent")
+        else:
+            z = vae.encode(frames)
+
         audio_latent = None
         ref_audio_t = 0
         if soundtrack is not None:
-            # The official node encodes the entire soundtrack. The Extender is
-            # safer: crop it to the effective aligned reference-video duration
-            # before Audio-VAE encoding, which also fixes long Load-Video audio.
-            soundtrack = _slice_ref_audio(
-                soundtrack,
-                0.0,
-                n / float(FPS),
-                f"ref_video_audio_{slot}",
-                require_full=False,
-            )
-            if _audio_duration_seconds(soundtrack) + 1e-6 < MIN_REF_AUDIO_SECONDS:
-                raise ValueError(
-                    f"MiniMax H3 Extender: ref_video_audio_{slot} is shorter than {MIN_REF_AUDIO_SECONDS:.0f}s after pairing with ref_video_{slot}."
+            if (
+                isinstance(cached_block, dict)
+                and str(cached_block.get("kind") or "") == "video_audio"
+                and cached_block.get("audio_latent") is not None
+                and int(cached_block.get("ref_audio_t", 0) or 0) > 0
+            ):
+                audio_latent = cached_block.get("audio_latent")
+                ref_audio_t = int(cached_block.get("ref_audio_t", 0) or 0)
+            else:
+                # The official node encodes the entire soundtrack. The Extender is
+                # safer: crop it to the effective aligned reference-video duration
+                # before Audio-VAE encoding, which also fixes long Load-Video audio.
+                soundtrack = _slice_ref_audio(
+                    soundtrack,
+                    0.0,
+                    n / float(FPS),
+                    f"ref_video_audio_{slot}",
+                    require_full=False,
                 )
-            audio_latent, ref_audio_t = _encode_ref_audio(audio_vae, soundtrack)
+                if _audio_duration_seconds(soundtrack) + 1e-6 < MIN_REF_AUDIO_SECONDS:
+                    raise ValueError(
+                        f"MiniMax H3 Extender: ref_video_audio_{slot} is shorter than {MIN_REF_AUDIO_SECONDS:.0f}s after pairing with ref_video_{slot}."
+                    )
+                audio_latent, ref_audio_t = _encode_ref_audio(audio_vae, soundtrack)
             # The soundtrack gets its own <Audio j> label immediately before its video.
             ref_items.append({"type": "audio"})
 
@@ -1537,10 +1609,13 @@ def _default_clip(index: int = 0):
         "validated": False,
         "color_adjustment": _normalize_color_adjustment(),
         "loras": [],
+        "first_frame": None,
+        "last_frame": None,
+        "first_source": "manual",
     }
 
 
-def _parse_clips_json(value: str):
+def _parse_clips_json(value: str, generation_mode="ref2va"):
     try:
         payload = json.loads(value or "{}")
     except Exception as exc:
@@ -1590,17 +1665,26 @@ def _parse_clips_json(value: str):
                 "validated": bool(raw.get("validated", False)),
                 "color_adjustment": _normalize_color_adjustment(raw.get("color_adjustment")),
                 "loras": _normalize_clip_loras(raw.get("loras"), legacy=raw.get("lora")),
+                "first_frame": _normalize_ref_descriptor(raw.get("first_frame")),
+                "last_frame": _normalize_ref_descriptor(raw.get("last_frame")),
+                "first_source": (
+                    "previous_clip"
+                    if str(raw.get("first_source") or "manual").lower().strip() == "previous_clip" and i > 0
+                    else "manual"
+                ),
             }
         )
 
-    # Validation must always be a continuous prefix. Anything after the first
-    # unvalidated clip depends on a clip that is not frozen yet.
-    found_open = False
-    for clip in out:
-        if found_open:
-            clip["validated"] = False
-        elif not clip["validated"]:
-            found_open = True
+    # Ref2VA + Motion Context is causal, so validation must remain a continuous
+    # prefix. FL2VA plans are independent and deliberately keep per-card
+    # validation without forcing downstream cards open.
+    if _normalize_generation_mode(generation_mode) == "ref2va":
+        found_open = False
+        for clip in out:
+            if found_open:
+                clip["validated"] = False
+            elif not clip["validated"]:
+                found_open = True
 
     return out
 
@@ -1621,8 +1705,10 @@ def _prompt_pack_signature_from_state(value):
     return signature
 
 
-def _state_json(clips, prompt_pack_signature=""):
+def _state_json(clips, prompt_pack_signature="", generation_mode=None):
     payload = {"version": 1, "clips": clips}
+    if generation_mode is not None:
+        payload["generation_mode"] = _normalize_generation_mode(generation_mode)
     signature = str(prompt_pack_signature or "").lower().strip()
     if len(signature) == 64 and all(ch in "0123456789abcdef" for ch in signature):
         payload["prompt_pack_signature"] = signature
@@ -1816,6 +1902,19 @@ def _cleanup_project_downloads():
         pass
 
 
+def _generation_mode_from_project_payload(project_payload):
+    extender = project_payload.get("extender", {}) if isinstance(project_payload, dict) else {}
+    if not isinstance(extender, dict):
+        return "ref2va"
+    value = extender.get("generation_mode")
+    if value is None:
+        settings = extender.get("settings", {})
+        if isinstance(settings, dict):
+            value = settings.get("generation_mode")
+    # Backward compatibility: every project created before FL2VA existed is Ref2VA.
+    return _normalize_generation_mode(value or "ref2va")
+
+
 def _prompt_pack_signature_from_project_payload(project_payload):
     extender = project_payload.get("extender", {}) if isinstance(project_payload, dict) else {}
     raw = extender.get("clips_json")
@@ -1827,6 +1926,7 @@ def _prompt_pack_signature_from_project_payload(project_payload):
 
 def _clips_from_project_payload(project_payload):
     extender = project_payload.get("extender", {}) if isinstance(project_payload, dict) else {}
+    generation_mode = _generation_mode_from_project_payload(project_payload)
     raw = extender.get("clips_json")
     if not isinstance(raw, str) or not raw.strip():
         settings = extender.get("settings", {}) if isinstance(extender, dict) else {}
@@ -1837,7 +1937,35 @@ def _clips_from_project_payload(project_payload):
             raw = json.dumps({"version": 1, "clips": clips}, ensure_ascii=False)
     if not isinstance(raw, str) or not raw.strip():
         raw = _state_json([_default_clip(0)])
-    return _parse_clips_json(raw)
+    return _parse_clips_json(raw, generation_mode)
+
+
+def _write_clips_to_project_payload(project_payload, clips, generation_mode=None):
+    mode = _normalize_generation_mode(generation_mode or _generation_mode_from_project_payload(project_payload))
+    signature = _prompt_pack_signature_from_project_payload(project_payload)
+    raw = _state_json(clips, signature, mode)
+    extender = project_payload.setdefault("extender", {})
+    extender["generation_mode"] = mode
+    extender["clips_json"] = raw
+    extender["clips"] = copy.deepcopy(clips)
+    settings = extender.setdefault("settings", {})
+    if isinstance(settings, dict):
+        settings["generation_mode"] = mode
+        settings["clips_json"] = raw
+    return raw
+
+
+def _fl2va_frame_entries(project_payload):
+    if _generation_mode_from_project_payload(project_payload) != "fl2va":
+        return []
+    clips = _clips_from_project_payload(project_payload)
+    entries = []
+    for index, cfg in enumerate(clips, start=1):
+        for kind in ("first", "last"):
+            ref = cfg.get(f"{kind}_frame")
+            if isinstance(ref, dict) and _ref_id_is_safe(ref.get("id")):
+                entries.append((index, kind, ref))
+    return entries
 
 
 def _project_cache_snapshot(owner_id, project_payload):
@@ -1848,7 +1976,13 @@ def _project_cache_snapshot(owner_id, project_payload):
     generation starts concurrently, extra bytes appended after that boundary are
     intentionally excluded from the project.
     """
-    data_path, manifest_path = _chain_paths(f"extender_{_safe_name(owner_id)}")
+    generation_mode = _generation_mode_from_project_payload(project_payload)
+    cache_owner = (
+        _fl2va_cache_owner_id(owner_id)
+        if generation_mode == "fl2va"
+        else f"extender_{_safe_name(owner_id)}"
+    )
+    data_path, manifest_path = _chain_paths(cache_owner)
     if not data_path.exists() or not manifest_path.exists():
         return None
 
@@ -1864,12 +1998,29 @@ def _project_cache_snapshot(owner_id, project_payload):
         clips = _clips_from_project_payload(project_payload)
     except Exception:
         clips = []
-    for i, desc in enumerate(segments):
-        desc["validated"] = bool(i < len(clips) and clips[i].get("validated", False))
+    if generation_mode == "fl2va":
+        order_by_id = {str(c.get("id")): i for i, c in enumerate(clips)}
+        valid_by_id = {str(c.get("id")): bool(c.get("validated", False)) for c in clips}
+        segments = [
+            desc for desc in segments
+            if str(desc.get("clip_id") or "") in order_by_id
+        ]
+        segments.sort(key=lambda x: order_by_id[str(x.get("clip_id"))])
+        for i, desc in enumerate(segments):
+            desc["index"] = i
+            desc["trim_frames"] = 0
+            desc["validated"] = bool(valid_by_id.get(str(desc.get("clip_id") or ""), False))
+        manifest["final_frame_count"] = _final_frame_count(segments)
+    else:
+        for i, desc in enumerate(segments):
+            desc["validated"] = bool(i < len(clips) and clips[i].get("validated", False))
     manifest["segments"] = segments
 
     if segments:
-        data_limit = int(segments[-1].get("segment_end", 0))
+        # FL2VA random-access replacement is append-only, so the logically last
+        # card is not necessarily the latest blob in the file. Snapshot through
+        # the largest referenced end offset.
+        data_limit = max(int(x.get("segment_end", 0) or 0) for x in segments)
     else:
         data_limit = int(_DATA_START)
     if data_limit < int(_DATA_START):
@@ -1896,11 +2047,52 @@ def _project_cache_snapshot(owner_id, project_payload):
     else:
         audio_limit = 0
 
+    # Save the exact full preview currently shown by the connected Final Decode
+    # when it is known to match this cache snapshot.  Ref2VA Full Batch publishes
+    # its neutral preview to ComfyUI temp but historically did not maintain
+    # chain.preview.mp4, so portable projects could contain all latents/audio yet
+    # have no decoded video that can be restored without running VideoVAE again.
+    #
+    # The browser only supplies the Final Decode id + the clip/frame counts it
+    # actually displayed.  The backend resolves the preview path itself and uses
+    # it only when those counts exactly match the manifest snapshot, preventing a
+    # stale preview from another render/project being embedded accidentally.
+    preview_path = _decoded_preview_cache_path(data_path)
+    preview_is_full = False
+    final_meta = project_payload.get("final_decode")
+    if isinstance(final_meta, dict):
+        preview_meta = final_meta.get("preview")
+        final_id = str(final_meta.get("node_id") or "").strip()
+        if final_id and isinstance(preview_meta, dict) and bool(preview_meta.get("available", False)):
+            try:
+                shown_clips = int(preview_meta.get("clip_count", 0) or 0)
+                shown_frames = int(preview_meta.get("frame_count", 0) or 0)
+            except Exception:
+                shown_clips = 0
+                shown_frames = 0
+            expected_frames = int(manifest.get("final_frame_count", 0) or 0)
+            if shown_clips == len(segments) and shown_frames == expected_frames and shown_frames > 0:
+                candidate = _latest_preview_temp_path(final_id)
+                if candidate is not None and candidate.exists() and candidate.is_file() and candidate.stat().st_size > 0:
+                    preview_path = candidate
+                    preview_is_full = True
+
+    if preview_is_full:
+        # This is a snapshot-only manifest mutation; the live cache is untouched.
+        # It tells the loader that cache/chain.preview.mp4 represents the complete
+        # current timeline, including an unvalidated Clip-by-Clip tail candidate.
+        manifest["preview_committed_count"] = int(len(segments))
+        manifest["preview_audio_mode"] = PREVIEW_AUDIO_MODE
+        manifest["preview_portable_full"] = True
+    else:
+        manifest.pop("preview_portable_full", None)
+
     return {
         "data_path": data_path,
         "manifest_path": manifest_path,
         "audio_path": audio_path,
-        "preview_path": _decoded_preview_cache_path(data_path),
+        "preview_path": preview_path,
+        "preview_is_full": bool(preview_is_full),
         "manifest": manifest,
         "data_limit": data_limit,
         "audio_limit": int(audio_limit),
@@ -1926,6 +2118,12 @@ def _zip_write_prefix(zf, arcname, source_path, byte_limit):
 
 def _build_project_archive(owner_id, requested_name, project_payload, output_path):
     project_payload = copy.deepcopy(project_payload)
+    generation_mode = _generation_mode_from_project_payload(project_payload)
+    extender_meta = project_payload.setdefault("extender", {})
+    extender_meta["generation_mode"] = generation_mode
+    settings_meta = extender_meta.setdefault("settings", {})
+    if isinstance(settings_meta, dict):
+        settings_meta["generation_mode"] = generation_mode
     refs = _refs_from_project_payload(project_payload)
     refs = _write_refs_to_project_payload(project_payload, refs)
 
@@ -1964,7 +2162,53 @@ def _build_project_archive(owner_id, requested_name, project_payload, output_pat
             source_ref_files.append((index, source_id, source_path))
     _write_refs_to_project_payload(project_payload, refs)
 
+    frame_files = []
+    frame_source_files = []
+    for clip_index, kind, ref in _fl2va_frame_entries(project_payload):
+        path = _ref_path(ref.get("id"))
+        if not path.exists():
+            raise FileNotFoundError(
+                f"MiniMax H3 Extender Project: FL2VA clip {clip_index} {kind} frame is missing from the internal store."
+            )
+        width, height = _validate_reference_file(path)
+        ref["width"] = int(width)
+        ref["height"] = int(height)
+        ref["size_bytes"] = int(path.stat().st_size)
+        frame_files.append((clip_index, kind, ref, path))
+
+        # FL2VA keyframes use the same non-destructive image editor as internal
+        # references. Preserve their immutable source pixels too, so Reset still
+        # means the original image after a portable .ext Save/Load.
+        source_id = str(ref.get("source_id") or ref.get("id") or "").lower().strip()
+        if source_id != str(ref.get("id") or "").lower().strip():
+            source_path = _ref_path(source_id)
+            if not source_path.exists():
+                raise FileNotFoundError(
+                    f"MiniMax H3 Extender Project: original source for FL2VA clip {clip_index} {kind} frame is missing."
+                )
+            _validate_reference_file(source_path)
+            frame_source_files.append((clip_index, kind, source_id, source_path))
+
+    # FL2VA random-access editing is append-only for speed. Save Project is the
+    # natural point to force compaction so both the live cache and portable .ext
+    # contain only currently referenced latent/PCM blobs.
+    if generation_mode == "fl2va":
+        try:
+            compact_fl2va_cache(owner_id, force=True)
+        except Exception as exc:
+            # Save Project must remain reliable even if Windows temporarily has
+            # an mmap handle open on the cache. In that rare case the archive is
+            # still correct; it may simply include unreclaimed stale bytes.
+            print(f"[WARNING] MiniMax H3 Extender: FL2VA Save Project compaction skipped: {exc}")
+
     snapshot = _project_cache_snapshot(owner_id, project_payload)
+    continuity_files = (
+        fl2va_project_continuity_files(
+            snapshot["data_path"], snapshot["manifest"].get("segments", [])
+        )
+        if generation_mode == "fl2va" and snapshot is not None
+        else []
+    )
 
     if snapshot is not None:
         cache_resolution = _resolution_from_manifest(snapshot.get("manifest"))
@@ -1984,18 +2228,31 @@ def _build_project_archive(owner_id, requested_name, project_payload, output_pat
         "cache_version": CACHE_VERSION,
         "source_owner_id": str(owner_id),
         "project_name": Path(_project_filename(requested_name)).stem,
+        "generation_mode": generation_mode,
         "project": project_payload,
         "references": {
             "count": int(len(ref_files)),
             "embedded": True,
             "original_sources": int(len(source_ref_files)),
+            "fl2va_frames": int(len(frame_files)),
+            "fl2va_original_sources": int(len(frame_source_files)),
         },
         "cache": {
             "present": snapshot is not None,
             "clip_count": int(len(snapshot["manifest"].get("segments", []))) if snapshot else 0,
             "frame_count": int(snapshot["manifest"].get("final_frame_count", 0)) if snapshot else 0,
             "has_committed_preview": bool(snapshot and snapshot["preview_path"].exists()),
+            "has_portable_full_preview": bool(snapshot and snapshot.get("preview_is_full", False)),
             "has_decoded_audio_cache": bool(snapshot and int(snapshot.get("audio_limit", 0)) > 0),
+            "fl2va_continuity": [
+                {
+                    "clip_id": str(item["clip_id"]),
+                    "signature": str(item.get("signature") or ""),
+                    "png": f"cache/fl2va_continuity/{index:04d}.png",
+                    "meta": f"cache/fl2va_continuity/{index:04d}.json",
+                }
+                for index, item in enumerate(continuity_files, start=1)
+            ],
         },
     }
 
@@ -2020,6 +2277,29 @@ def _build_project_archive(owner_id, requested_name, project_payload, output_pat
                 source_path,
                 arcname=f"refs/original_ref_{index}.png",
                 compress_type=zipfile.ZIP_STORED,
+            )
+        for clip_index, kind, ref, path in frame_files:
+            zf.write(
+                path,
+                arcname=f"fl2va/clip_{clip_index}_{kind}.png",
+                compress_type=zipfile.ZIP_STORED,
+            )
+        for clip_index, kind, source_id, source_path in frame_source_files:
+            zf.write(
+                source_path,
+                arcname=f"fl2va/original_clip_{clip_index}_{kind}.png",
+                compress_type=zipfile.ZIP_STORED,
+            )
+        for index, item in enumerate(continuity_files, start=1):
+            zf.write(
+                item["png_path"],
+                arcname=f"cache/fl2va_continuity/{index:04d}.png",
+                compress_type=zipfile.ZIP_STORED,
+            )
+            zf.write(
+                item["meta_path"],
+                arcname=f"cache/fl2va_continuity/{index:04d}.json",
+                compress_type=zipfile.ZIP_DEFLATED,
             )
 
         if snapshot is not None:
@@ -2073,11 +2353,14 @@ def _zip_copy_member(zf, member_name, destination):
         os.fsync(dst.fileno())
 
 
-def _replace_cache_transaction(owner_id, new_data=None, new_manifest=None, new_preview=None, new_audio=None):
-    target_data, target_manifest = _chain_paths(f"extender_{_safe_name(owner_id)}")
+def _replace_cache_transaction(owner_id, new_data=None, new_manifest=None, new_preview=None, new_audio=None, generation_mode="ref2va"):
+    mode = _normalize_generation_mode(generation_mode)
+    cache_owner = _fl2va_cache_owner_id(owner_id) if mode == "fl2va" else f"extender_{_safe_name(owner_id)}"
+    target_data, target_manifest = _chain_paths(cache_owner)
     target_preview = _decoded_preview_cache_path(target_data)
     target_preview_video = _decoded_preview_video_cache_path(target_data)
     target_audio = _decoded_audio_cache_path(target_data)
+    target_fl2va_video_dir = target_data.with_suffix(".fl2va.video")
     # The video-only preview prefix is derived and is intentionally not stored
     # in .ext. The decoded-audio cache is primary cache data and is restored
     # together with the latent chain when present.
@@ -2086,6 +2369,11 @@ def _replace_cache_transaction(owner_id, new_data=None, new_manifest=None, new_p
     token = uuid.uuid4().hex[:10]
 
     try:
+        # FL2VA per-plan decoded videos are a derived local speed cache, not part
+        # of the portable .ext payload. Never let files from the previously
+        # loaded project survive into a newly imported FL2VA latent cache.
+        if mode == "fl2va" and target_fl2va_video_dir.exists():
+            shutil.rmtree(target_fl2va_video_dir, ignore_errors=True)
         for target in targets:
             if target.exists():
                 backup = target.with_name(target.name + f".project_backup_{token}")
@@ -2127,6 +2415,7 @@ def _import_project_archive(owner_id, archive_path):
     new_manifest = work_root / "chain.json"
     new_audio = work_root / "chain.audio.h3cache"
     new_preview = work_root / "chain.preview.mp4"
+    continuity_restore = []
 
     try:
         with zipfile.ZipFile(archive_path, "r", allowZip64=True) as zf:
@@ -2158,6 +2447,10 @@ def _import_project_archive(owner_id, archive_path):
             project_payload = archive_meta.get("project", {})
             if not isinstance(project_payload, dict):
                 raise ValueError("MiniMax H3 Extender Project: invalid project metadata.")
+            generation_mode = _generation_mode_from_project_payload(project_payload)
+            # Archives created before FL2VA have no mode marker and are always Ref2VA.
+            project_payload.setdefault("extender", {})["generation_mode"] = generation_mode
+            project_payload["extender"].setdefault("settings", {})["generation_mode"] = generation_mode
             clips = _clips_from_project_payload(project_payload)
             project_prompt_pack_signature = _prompt_pack_signature_from_project_payload(project_payload)
 
@@ -2237,6 +2530,72 @@ def _import_project_archive(owner_id, archive_path):
                 imported_refs = _normalize_ref_descriptors(imported_refs)
             _write_refs_to_project_payload(project_payload, imported_refs)
 
+            if generation_mode == "fl2va":
+                for clip_index, cfg in enumerate(clips, start=1):
+                    for kind in ("first", "last"):
+                        key = f"{kind}_frame"
+                        saved = cfg.get(key)
+                        member = f"fl2va/clip_{clip_index}_{kind}.png"
+                        if saved is None:
+                            continue
+                        if member not in names:
+                            raise ValueError(
+                                f"MiniMax H3 Extender Project: embedded FL2VA clip {clip_index} {kind} frame is missing."
+                            )
+                        info = zf.getinfo(member)
+                        if int(info.file_size) > MAX_REF_UPLOAD_BYTES:
+                            raise ValueError(
+                                f"MiniMax H3 Extender Project: FL2VA clip {clip_index} {kind} frame exceeds the allowed image size."
+                            )
+                        extracted = work_root / f"fl2va_{clip_index}_{kind}.png"
+                        _zip_copy_member(zf, member, extracted)
+                        desc = _store_project_reference(
+                            extracted,
+                            (saved or {}).get("original_name") if isinstance(saved, dict) else f"clip_{clip_index}_{kind}.png",
+                        )
+                        if isinstance(saved, dict) and saved.get("id") and desc["id"] != saved.get("id"):
+                            raise ValueError(
+                                f"MiniMax H3 Extender Project: FL2VA clip {clip_index} {kind} frame failed its integrity check."
+                            )
+
+                        saved_source_id = (
+                            str(saved.get("source_id") or saved.get("id") or desc["id"]).lower().strip()
+                            if isinstance(saved, dict)
+                            else desc["id"]
+                        )
+                        source_member = f"fl2va/original_clip_{clip_index}_{kind}.png"
+                        if source_member in names:
+                            source_info = zf.getinfo(source_member)
+                            if int(source_info.file_size) > MAX_REF_UPLOAD_BYTES:
+                                raise ValueError(
+                                    f"MiniMax H3 Extender Project: original FL2VA clip {clip_index} {kind} frame exceeds the allowed image size."
+                                )
+                            source_extracted = work_root / f"original_fl2va_{clip_index}_{kind}.png"
+                            _zip_copy_member(zf, source_member, source_extracted)
+                            source_desc = _store_project_reference(
+                                source_extracted,
+                                (saved or {}).get("original_name") if isinstance(saved, dict) else f"clip_{clip_index}_{kind}.png",
+                            )
+                            if _ref_id_is_safe(saved_source_id) and source_desc["id"] != saved_source_id:
+                                raise ValueError(
+                                    f"MiniMax H3 Extender Project: original FL2VA clip {clip_index} {kind} frame failed its integrity check."
+                                )
+                            desc["source_id"] = source_desc["id"]
+                        else:
+                            desc["source_id"] = desc["id"]
+
+                        if isinstance(saved, dict) and desc["source_id"] != desc["id"]:
+                            for adjustment_key in ("saturation", "contrast", "brightness"):
+                                try:
+                                    desc[adjustment_key] = max(
+                                        0.0,
+                                        min(200.0, float(saved.get(adjustment_key, 100) or 100)),
+                                    )
+                                except Exception:
+                                    desc[adjustment_key] = 100.0
+                        cfg[key] = desc
+                _write_clips_to_project_payload(project_payload, clips, generation_mode)
+
             has_data = "cache/chain.h3cache" in names
             has_manifest = "cache/chain.json" in names
             if has_data != has_manifest:
@@ -2272,22 +2631,36 @@ def _import_project_archive(owner_id, archive_path):
                             "MiniMax H3 Extender Project: decoded audio cache is truncated."
                         )
 
-                # A hand-edited project may contain fewer cards than cached clips.
-                # Keep only the portable prefix represented by the saved UI state.
-                if len(imported_manifest.get("segments", [])) > len(clips):
+                # Ref2VA projects retain the portable sequential prefix. FL2VA
+                # projects use stable clip ids and therefore filter/reorder the
+                # manifest without rewriting the append-only latent bytes.
+                if generation_mode == "ref2va" and len(imported_manifest.get("segments", [])) > len(clips):
                     imported_manifest = _truncate_chain(
-                        new_data,
-                        new_manifest,
-                        imported_manifest,
-                        len(clips),
+                        new_data, new_manifest, imported_manifest, len(clips)
                     )
 
                 segments = [dict(x) for x in imported_manifest.get("segments", [])]
-                for i, desc in enumerate(segments):
-                    desc["validated"] = bool(i < len(clips) and clips[i].get("validated", False))
+                if generation_mode == "fl2va":
+                    order = {str(c.get("id")): i for i, c in enumerate(clips)}
+                    valid = {str(c.get("id")): bool(c.get("validated", False)) for c in clips}
+                    segments = [x for x in segments if str(x.get("clip_id") or "") in order]
+                    segments.sort(key=lambda x: order[str(x.get("clip_id"))])
+                    for i, desc in enumerate(segments):
+                        desc["index"] = i
+                        desc["trim_frames"] = 0
+                        desc["validated"] = bool(valid.get(str(desc.get("clip_id") or ""), False))
+                else:
+                    for i, desc in enumerate(segments):
+                        desc["validated"] = bool(i < len(clips) and clips[i].get("validated", False))
                 imported_manifest = dict(imported_manifest)
                 imported_manifest["segments"] = segments
-                imported_manifest["owner_id"] = f"extender_{_safe_name(owner_id)}"
+                imported_manifest["final_frame_count"] = _final_frame_count(segments)
+                imported_manifest["sequence_mode"] = generation_mode
+                imported_manifest["owner_id"] = (
+                    _fl2va_cache_owner_id(owner_id)
+                    if generation_mode == "fl2va"
+                    else f"extender_{_safe_name(owner_id)}"
+                )
                 imported_manifest["imported_at"] = time.time()
                 imported_manifest["updated_at"] = time.time()
                 _write_json_atomic(new_manifest, imported_manifest)
@@ -2301,24 +2674,95 @@ def _import_project_archive(owner_id, archive_path):
                         resolution["resolved_height"] = int(imported_resolution["height"])
                         resolution["source"] = "disk_cache"
 
-            cached_count = int(len(imported_manifest.get("segments", []))) if imported_manifest else 0
-            # A clip can only remain validated when its physical cached segment is
-            # present. Normalize the returned UI state accordingly.
-            for i in range(cached_count, len(clips)):
-                clips[i]["validated"] = False
-            found_open = False
-            for clip_cfg in clips:
-                if found_open:
-                    clip_cfg["validated"] = False
-                elif not clip_cfg["validated"]:
-                    found_open = True
+                # v14.97+ projects optionally preserve the tiny lossless FL2VA
+                # continuity PNG+JSON pairs. They are derived caches, but restoring
+                # them avoids a whole VideoVAE decode the first time Previous is
+                # used after loading a portable project.
+                if generation_mode == "fl2va":
+                    valid_ids = {
+                        str(x.get("clip_id") or "")
+                        for x in imported_manifest.get("segments", [])
+                        if str(x.get("clip_id") or "")
+                    }
+                    cache_meta = archive_meta.get("cache", {}) if isinstance(archive_meta.get("cache"), dict) else {}
+                    continuity_meta = cache_meta.get("fl2va_continuity", [])
+                    if isinstance(continuity_meta, list):
+                        for entry_index, entry in enumerate(continuity_meta, start=1):
+                            if not isinstance(entry, dict):
+                                continue
+                            clip_id = str(entry.get("clip_id") or "")
+                            if not clip_id or clip_id not in valid_ids:
+                                continue
+                            png_member = str(entry.get("png") or "")
+                            json_member = str(entry.get("meta") or "")
+                            if png_member not in names or json_member not in names:
+                                continue
+                            png_info = zf.getinfo(png_member)
+                            json_info = zf.getinfo(json_member)
+                            if int(png_info.file_size) > MAX_REF_UPLOAD_BYTES or int(json_info.file_size) > 256 * 1024:
+                                raise ValueError(
+                                    f"MiniMax H3 Extender Project: continuity cache for {clip_id} is unexpectedly large."
+                                )
+                            png_path = work_root / f"continuity_{entry_index:04d}.png"
+                            json_path = work_root / f"continuity_{entry_index:04d}.json"
+                            _zip_copy_member(zf, png_member, png_path)
+                            _zip_copy_member(zf, json_member, json_path)
 
-            normalized_clips_json = _state_json(clips, project_prompt_pack_signature)
+                            # Validate the optional derived cache *before* the
+                            # live project cache is replaced. Continuity signatures
+                            # intentionally keep the historical SHA256-of-PNG-bytes
+                            # scheme so v14.96 caches remain portable/compatible.
+                            try:
+                                continuity_json = json.loads(json_path.read_text(encoding="utf-8"))
+                                if (
+                                    int(continuity_json.get("version", 0) or 0) != 2
+                                    or str(continuity_json.get("algorithm") or "") != "best_of_last_6"
+                                ):
+                                    raise ValueError("unsupported continuity metadata")
+                                continuity_signature = str(continuity_json.get("signature") or "").lower().strip()
+                                archive_signature = str(entry.get("signature") or "").lower().strip()
+                                if not re.fullmatch(r"[0-9a-f]{64}", continuity_signature):
+                                    raise ValueError("invalid continuity signature")
+                                if archive_signature and archive_signature != continuity_signature:
+                                    raise ValueError("continuity signature mismatch")
+                                with Image.open(png_path) as continuity_image:
+                                    continuity_image.verify()
+                                if _hash_file(png_path) != continuity_signature:
+                                    raise ValueError("continuity image integrity mismatch")
+                            except Exception as exc:
+                                raise ValueError(
+                                    f"MiniMax H3 Extender Project: continuity cache for {clip_id} failed its integrity check."
+                                ) from exc
+                            continuity_restore.append((clip_id, png_path, json_path))
+
+            cached_count = int(len(imported_manifest.get("segments", []))) if imported_manifest else 0
+            # A clip can only remain validated when its physical cached segment is present.
+            if generation_mode == "fl2va":
+                cached_ids = {
+                    str(x.get("clip_id")) for x in (imported_manifest or {}).get("segments", [])
+                    if str(x.get("clip_id") or "")
+                }
+                for clip_cfg in clips:
+                    if str(clip_cfg.get("id")) not in cached_ids:
+                        clip_cfg["validated"] = False
+            else:
+                for i in range(cached_count, len(clips)):
+                    clips[i]["validated"] = False
+                found_open = False
+                for clip_cfg in clips:
+                    if found_open:
+                        clip_cfg["validated"] = False
+                    elif not clip_cfg["validated"]:
+                        found_open = True
+
+            normalized_clips_json = _state_json(clips, project_prompt_pack_signature, generation_mode)
             extender_payload = project_payload.setdefault("extender", {})
+            extender_payload["generation_mode"] = generation_mode
             extender_payload["clips_json"] = normalized_clips_json
             extender_payload["clips"] = clips
             settings = extender_payload.setdefault("settings", {})
             if isinstance(settings, dict):
+                settings["generation_mode"] = generation_mode
                 settings["clips_json"] = normalized_clips_json
 
             _replace_cache_transaction(
@@ -2327,14 +2771,40 @@ def _import_project_archive(owner_id, archive_path):
                 new_manifest if imported_manifest is not None else None,
                 new_preview if imported_manifest is not None and new_preview.exists() else None,
                 new_audio if imported_manifest is not None and new_audio.exists() else None,
+                generation_mode=generation_mode,
             )
+            if generation_mode == "fl2va" and imported_manifest is not None and continuity_restore:
+                target_data, _ = _chain_paths(_fl2va_cache_owner_id(owner_id))
+                for clip_id, png_path, json_path in continuity_restore:
+                    try:
+                        install_fl2va_project_continuity(
+                            target_data, clip_id, png_path, json_path
+                        )
+                    except Exception as exc:
+                        # Continuity sidecars are a derived speed cache. Their
+                        # failure must never invalidate a project whose primary
+                        # latent/PCM cache has already loaded successfully.
+                        print(
+                            f"[WARNING] MiniMax H3 Extender: could not restore FL2VA continuity cache "
+                            f"for {clip_id}: {exc}"
+                        )
+
+            loaded_continuity_signatures = {}
+            if generation_mode == "fl2va" and imported_manifest is not None:
+                target_data, _ = _chain_paths(_fl2va_cache_owner_id(owner_id))
+                loaded_continuity_signatures = continuity_signatures_for_segments(
+                    target_data, imported_manifest.get("segments", [])
+                )
 
             validated_count = 0
             if imported_manifest is not None:
-                for desc in imported_manifest.get("segments", []):
-                    if not bool(desc.get("validated", False)):
-                        break
-                    validated_count += 1
+                if generation_mode == "fl2va":
+                    validated_count = sum(bool(x.get("validated", False)) for x in imported_manifest.get("segments", []))
+                else:
+                    for desc in imported_manifest.get("segments", []):
+                        if not bool(desc.get("validated", False)):
+                            break
+                        validated_count += 1
 
             loaded_resolution = _resolution_from_manifest(imported_manifest)
             return {
@@ -2348,6 +2818,15 @@ def _import_project_archive(owner_id, archive_path):
                     "present": imported_manifest is not None,
                     "cached_count": cached_count,
                     "validated_count": int(validated_count),
+                    "cached_clip_ids": [
+                        str(x.get("clip_id")) for x in (imported_manifest or {}).get("segments", [])
+                        if str(x.get("clip_id") or "")
+                    ],
+                    "validated_clip_ids": [
+                        str(x.get("clip_id")) for x in (imported_manifest or {}).get("segments", [])
+                        if str(x.get("clip_id") or "") and bool(x.get("validated", False))
+                    ],
+                    "continuity_signatures": loaded_continuity_signatures,
                     "frame_count": int(imported_manifest.get("final_frame_count", 0)) if imported_manifest else 0,
                     "resolved_width": int(loaded_resolution["width"]) if loaded_resolution else 0,
                     "resolved_height": int(loaded_resolution["height"]) if loaded_resolution else 0,
@@ -2367,7 +2846,13 @@ class MiniMaxH3Extender:
         default_scheduler = "simple" if "simple" in scheduler_names else scheduler_names[0]
 
         required = {
-            "model": ("MODEL",),
+            "model": (
+                "MODEL",
+                {
+                    "lazy": True,
+                    "tooltip": "MiniMax H3 Ref2VA model. Evaluated only while MODE is REF2VA.",
+                },
+            ),
             "clip": ("CLIP",),
             "vae": ("VAE",),
             "run_mode": (["clip_by_clip", "full_batch"], {"default": "clip_by_clip"}),
@@ -2425,6 +2910,13 @@ class MiniMaxH3Extender:
                     "multiline": True,
                 },
             ),
+            # Appended after every legacy widget so old positional workflow
+            # arrays continue to map exactly as before. The frontend presents
+            # this as the REF2VA / FL2VA mode button.
+            "generation_mode": (
+                ["ref2va", "fl2va"],
+                {"default": "ref2va"},
+            ),
         }
 
         # Audio and video references remain external sockets. Image refs continue
@@ -2432,6 +2924,14 @@ class MiniMaxH3Extender:
         # optional import path that writes external IMAGEs into those same
         # stable slots.
         optional = {
+            "fl2va_model": (
+                "MODEL",
+                {
+                    "forceInput": True,
+                    "lazy": True,
+                    "tooltip": "Optional MiniMax H3 FL2VA model. Evaluated only while MODE is FL2VA.",
+                },
+            ),
             "audio_vae": ("VAE", {"forceInput": True}),
             "ref_audio": (
                 "AUDIO",
@@ -2559,6 +3059,378 @@ class MiniMaxH3Extender:
     CATEGORY = "MiniMax H3"
     OUTPUT_NODE = False
 
+    @classmethod
+    def check_lazy_status(
+        cls,
+        generation_mode="ref2va",
+        model=_LAZY_UNCONNECTED,
+        fl2va_model=_LAZY_UNCONNECTED,
+        **_,
+    ):
+        """Evaluate only the H3 checkpoint required by the active mode.
+
+        Ref2VA and FL2VA are separate ~23 GB checkpoints. Without lazy model
+        inputs ComfyUI resolves both upstream loaders before ``extend`` runs,
+        even though only one model is sampled. The mode widget is non-lazy, so
+        it is already available here and can select the sole dependency.
+        """
+        mode = _normalize_generation_mode(generation_mode)
+        name = "fl2va_model" if mode == "fl2va" else "model"
+        value = fl2va_model if mode == "fl2va" else model
+
+        # Optional FL2VA socket may genuinely be empty. In that case do not
+        # request the inactive Ref2VA model as a fallback: execution will emit
+        # the existing clear "fl2va_model required" error instead.
+        if value is _LAZY_UNCONNECTED:
+            return []
+        return [name] if value is None else []
+
+    def _extend_fl2va(
+        self,
+        *,
+        owner,
+        clips,
+        active_prompt_pack_signature,
+        prompt_pack_imported,
+        external_prompt_pack,
+        model,
+        fl2va_model,
+        clip,
+        vae,
+        run_mode,
+        width,
+        height,
+        steps,
+        sampler_name,
+        scheduler,
+        denoise,
+        resolution_mode,
+        megapixels,
+    ):
+        if fl2va_model is None:
+            raise ValueError(
+                "MiniMax H3 Extender: FL2VA mode requires the fl2va_model input."
+            )
+
+        clip_ids = [str(cfg.get("id") or f"clip_{i + 1}") for i, cfg in enumerate(clips)]
+        data_path, manifest_path, manifest = sync_fl2va_manifest(owner, FPS, clip_ids)
+
+        # FL2VA Auto resolution uses the first available card keyframe as its
+        # aspect-ratio guide. Internal Ref2VA references remain untouched and are
+        # simply irrelevant in this mode.
+        frame_guides = []
+        for cfg in clips:
+            if cfg.get("first_frame") is not None:
+                frame_guides.append(cfg.get("first_frame"))
+            elif cfg.get("last_frame") is not None:
+                frame_guides.append(cfg.get("last_frame"))
+        requested_resolution = _resolve_generation_resolution(
+            resolution_mode, megapixels, width, height, frame_guides
+        )
+        resolution = dict(requested_resolution)
+        resolution["requested_width"] = int(requested_resolution["width"])
+        resolution["requested_height"] = int(requested_resolution["height"])
+        resolution["cache_reset"] = False
+        resolved_width = int(resolution["width"])
+        resolved_height = int(resolution["height"])
+
+        cache_resolution = _resolution_from_manifest(manifest)
+        previous_cache_resolution = None
+        if manifest.get("segments") and cache_resolution is not None:
+            if (
+                int(cache_resolution["width"]) != resolved_width
+                or int(cache_resolution["height"]) != resolved_height
+            ):
+                previous_cache_resolution = dict(cache_resolution)
+                manifest = _truncate_chain(data_path, manifest_path, manifest, 0)
+                manifest = dict(manifest)
+                manifest["sequence_mode"] = "fl2va"
+                manifest["updated_at"] = time.time()
+                _write_json_atomic(manifest_path, manifest)
+                for cfg in clips:
+                    cfg["validated"] = False
+                resolution["cache_reset"] = True
+
+        if prompt_pack_imported and external_prompt_pack is not None:
+            imported_json = _state_json(
+                clips, active_prompt_pack_signature, "fl2va"
+            )
+            _send_extender_prompt_pack_import(
+                owner,
+                imported_json,
+                len(external_prompt_pack.get("prompts") or []),
+                external_prompt_pack.get("source") or "External prompt pack",
+            )
+
+        # Re-sync after a possible geometry reset. The manifest follows stable
+        # card ids, which is what makes insert/remove/reorder independent of the
+        # physical append-only latent file.
+        data_path, manifest_path, manifest = sync_fl2va_manifest(owner, FPS, clip_ids)
+        cached_ids = cached_fl2va_ids(manifest)
+        generated = []
+        statuses = []
+        previous_handle = None
+
+        def _dependent_indices(after_index):
+            out = []
+            for dep_i in range(int(after_index) + 1, len(clips)):
+                if str(clips[dep_i].get("first_source") or "manual") != "previous_clip":
+                    break
+                out.append(dep_i)
+            return out
+
+        def _drop_stale_indices(indices):
+            nonlocal data_path, manifest_path, manifest, cached_ids
+            unique = sorted({int(x) for x in indices if 0 <= int(x) < len(clips)})
+            if not unique:
+                return
+            stale_ids = []
+            for dep_i in unique:
+                clips[dep_i]["validated"] = False
+                stale_ids.append(clip_ids[dep_i])
+            data_path, manifest_path, manifest = drop_fl2va_cached_ids(
+                owner, FPS, clip_ids, stale_ids
+            )
+            cached_ids = cached_fl2va_ids(manifest)
+
+        for i, cfg in enumerate(clips):
+            clip_id = clip_ids[i]
+            first_source = (
+                "previous_clip"
+                if str(cfg.get("first_source") or "manual").lower().strip() == "previous_clip" and i > 0
+                else "manual"
+            )
+            cfg["first_source"] = first_source
+            current_desc = next(
+                (dict(x) for x in manifest.get("segments", []) if str(x.get("clip_id") or "") == clip_id),
+                None,
+            )
+            cached = clip_id in cached_ids
+
+            first_frame = None
+            dependency_meta = {"first_source": first_source}
+            if first_source == "previous_clip":
+                previous_clip_id = clip_ids[i - 1]
+                first_frame, previous_signature = resolve_fl2va_previous_frame(
+                    owner, FPS, clip_ids, previous_clip_id, vae
+                )
+                dependency_meta.update({
+                    "previous_clip_id": previous_clip_id,
+                    "previous_frame_signature": previous_signature,
+                })
+
+            # A cached plan linked to the previous final frame is valid only while
+            # it still points to the same predecessor and the same generated pixels.
+            # This also catches insert/remove/reorder operations across saved workflows.
+            stale_dependency = False
+            if cached and current_desc is not None:
+                stored_source = str(current_desc.get("first_source") or "manual")
+                if stored_source != first_source:
+                    stale_dependency = True
+                elif first_source == "previous_clip":
+                    stale_dependency = (
+                        str(current_desc.get("previous_clip_id") or "") != str(dependency_meta["previous_clip_id"])
+                        or str(current_desc.get("previous_frame_signature") or "") != str(dependency_meta["previous_frame_signature"])
+                    )
+            if stale_dependency:
+                _drop_stale_indices([i] + _dependent_indices(i))
+                current_desc = None
+                cached = False
+
+            if bool(cfg.get("validated")) and cached:
+                if first_frame is not None:
+                    del first_frame
+                continue
+            if bool(cfg.get("validated")) and not cached:
+                cfg["validated"] = False
+
+            _send_extender_progress(
+                owner, i, len(clips), "preparing",
+                f"Preparing FL2VA clip {i + 1}/{len(clips)}",
+            )
+            frame_count = _duration_to_frames(cfg["duration"])
+            first_desc = cfg.get("first_frame")
+            last_desc = cfg.get("last_frame")
+            if first_source == "manual":
+                first_frame = _load_reference_tensor(first_desc) if first_desc is not None else None
+            last_frame = _load_reference_tensor(last_desc) if last_desc is not None else None
+
+            clip_model, clip_text_encoder = _apply_per_clip_loras(
+                self, fl2va_model, clip, cfg.get("loras"), i
+            )
+            positive, latent = make_fl2va_conditioning(
+                clip_text_encoder,
+                vae,
+                cfg.get("prompt", ""),
+                resolved_width,
+                resolved_height,
+                frame_count,
+                first_frame=first_frame,
+                last_frame=last_frame,
+            )
+
+            _send_extender_progress(
+                owner, i, len(clips), "sampling",
+                f"Rendering FL2VA clip {i + 1}/{len(clips)}",
+            )
+            sampled = _sample_h3(
+                clip_model, positive, latent, cfg["seed"],
+                str(sampler_name), str(scheduler), int(steps), float(denoise),
+            )
+            (
+                previous_handle,
+                _proxy,
+                manifest,
+                cache_status,
+                _cache_mb,
+            ) = store_fl2va_segment(
+                owner,
+                float(FPS),
+                clip_ids,
+                i,
+                clip_id,
+                sampled,
+                validated=False,
+                run_mode=str(run_mode),
+                dependency_meta=dependency_meta,
+            )
+            statuses.append(cache_status)
+            cached_ids.add(clip_id)
+            generated.append(i)
+            cfg["validated"] = False
+
+            # Rerendering an upstream plan changes the real image used by every
+            # consecutive Previous-linked follower. Their latent caches are now
+            # stale, while the first following manual plan remains independent.
+            dependent = _dependent_indices(i)
+            if dependent:
+                _drop_stale_indices(dependent)
+
+            _send_extender_progress(
+                owner, i, len(clips), "complete",
+                f"FL2VA clip {i + 1}/{len(clips)} complete",
+            )
+            del sampled, positive, latent, clip_model, clip_text_encoder
+            if first_frame is not None:
+                del first_frame
+            if last_frame is not None:
+                del last_frame
+
+            if str(run_mode) == "clip_by_clip":
+                break
+
+        validation_by_id = {
+            clip_ids[i]: bool(cfg.get("validated", False))
+            for i, cfg in enumerate(clips)
+        }
+        previous_handle, final_manifest = set_fl2va_validation(
+            owner, FPS, clip_ids, validation_by_id, run_mode=str(run_mode)
+        )
+
+        # Keep per-plan color metadata aligned by stable clip id.
+        color_segments = [dict(x) for x in final_manifest.get("segments", [])]
+        clip_by_id = {clip_ids[i]: clips[i] for i in range(len(clips))}
+        color_changed = False
+        for idx, desc in enumerate(color_segments):
+            cfg = clip_by_id.get(str(desc.get("clip_id") or ""))
+            if cfg is None:
+                continue
+            wanted = _normalize_color_adjustment(cfg.get("color_adjustment"))
+            if desc.get("color_adjustment") != wanted:
+                desc["color_adjustment"] = wanted
+                color_segments[idx] = desc
+                color_changed = True
+        if color_changed:
+            final_manifest = dict(final_manifest)
+            final_manifest["segments"] = color_segments
+            final_manifest["updated_at"] = time.time()
+            _write_json_atomic(manifest_path, final_manifest)
+
+        cached_ids = cached_fl2va_ids(final_manifest)
+        validated_ids = {
+            str(x.get("clip_id"))
+            for x in final_manifest.get("segments", [])
+            if bool(x.get("validated", False)) and str(x.get("clip_id") or "")
+        }
+        cached_count = len(cached_ids)
+        validated_count = len(validated_ids)
+        continuity_signatures = continuity_signatures_for_segments(
+            data_path, final_manifest.get("segments", [])
+        )
+        normalized_json = _state_json(
+            clips, active_prompt_pack_signature, "fl2va"
+        )
+
+        if resolution.get("mode") == "auto_from_ref" and frame_guides:
+            resolution_text = (
+                f"{resolved_width}x{resolved_height} from FL keyframe "
+                f"@ {float(resolution['megapixels']):.2f}MP"
+            )
+        elif resolution.get("fallback"):
+            resolution_text = f"{resolved_width}x{resolved_height} manual fallback (no FL keyframe)"
+        else:
+            resolution_text = f"{resolved_width}x{resolved_height} manual"
+        if resolution.get("cache_reset") and previous_cache_resolution:
+            resolution_text += (
+                f" | resolution changed from "
+                f"{int(previous_cache_resolution['width'])}x{int(previous_cache_resolution['height'])}: FL cache restarted"
+            )
+
+        status = (
+            f"FL2VA {str(run_mode)} | {resolution_text} | "
+            f"cached {cached_count}/{len(clips)} | validated {validated_count} | "
+            + (
+                "generated " + ",".join(str(i + 1) for i in generated)
+                if generated else "disk only"
+            )
+        )
+        cache_mb = _cache_size_mb(data_path, manifest_path)
+        final_cache_resolution = _resolution_from_manifest(final_manifest)
+
+        _send_extender_progress(owner, -1, len(clips), "idle", status)
+        ui_state = {
+            "generation_mode": "fl2va",
+            "clips_json": normalized_json,
+            "clip_count": len(clips),
+            "cached_count": cached_count,
+            "validated_count": validated_count,
+            "cached_clip_ids": sorted(cached_ids),
+            "validated_clip_ids": sorted(validated_ids),
+            "continuity_signatures": continuity_signatures,
+            "generated": [i + 1 for i in generated],
+            "status": status,
+            "resolved_width": resolved_width,
+            "resolved_height": resolved_height,
+            "resolution_mode": str(resolution.get("mode") or "manual"),
+            "resolution_guide": "fl_keyframe" if frame_guides else "",
+            "resolution_fallback": bool(resolution.get("fallback", False)),
+            "megapixels": float(resolution.get("megapixels", megapixels)),
+            "cache_width": int(final_cache_resolution["width"]) if final_cache_resolution else 0,
+            "cache_height": int(final_cache_resolution["height"]) if final_cache_resolution else 0,
+            "resolution_cache_reset": bool(resolution.get("cache_reset", False)),
+            "reference_count": 0,
+            "reference_video_count": 0,
+            "reference_video_audio_count": 0,
+            "reference_audio_count": 0,
+            "prompt_pack_connected": external_prompt_pack is not None,
+            "prompt_pack_imported": bool(prompt_pack_imported),
+            "prompt_pack_count": int(len(external_prompt_pack.get("prompts") or [])) if external_prompt_pack is not None else 0,
+            "prompt_pack_signature": str(active_prompt_pack_signature or ""),
+            "per_clip_lora_count": int(sum(len(cfg.get("loras") or []) for cfg in clips)),
+            "build": BUILD,
+        }
+        return {
+            "ui": {"h3_extender_state": [ui_state]},
+            "result": (
+                previous_handle,
+                int(len(clips)),
+                int(validated_count),
+                status,
+                float(cache_mb),
+                BUILD,
+            ),
+        }
+
     def extend(
         self,
         model,
@@ -2578,13 +3450,15 @@ class MiniMaxH3Extender:
         resolution_mode="auto_from_ref",
         megapixels=DEFAULT_MEGAPIXELS,
         refs_json=None,
+        generation_mode="ref2va",
         prompt_pack=None,
         ref_pack=None,
         unique_id=None,
         **kwargs,
     ):
+        generation_mode = _normalize_generation_mode(generation_mode)
         stored_prompt_pack_signature = _prompt_pack_signature_from_state(clips_json)
-        clips = _parse_clips_json(clips_json)
+        clips = _parse_clips_json(clips_json, generation_mode)
         external_prompt_pack = _normalize_external_prompt_pack(prompt_pack)
         clips, active_prompt_pack_signature, prompt_pack_imported, _prompt_pack_count_changed = (
             _sync_clips_from_prompt_pack(
@@ -2596,6 +3470,29 @@ class MiniMaxH3Extender:
         owner = str(unique_id if unique_id is not None else "h3_extender")
         if external_prompt_pack is None:
             active_prompt_pack_signature = ""
+
+        if generation_mode == "fl2va":
+            return self._extend_fl2va(
+                owner=owner,
+                clips=clips,
+                active_prompt_pack_signature=active_prompt_pack_signature,
+                prompt_pack_imported=prompt_pack_imported,
+                external_prompt_pack=external_prompt_pack,
+                model=model,
+                fl2va_model=kwargs.get("fl2va_model"),
+                clip=clip,
+                vae=vae,
+                run_mode=run_mode,
+                width=width,
+                height=height,
+                steps=steps,
+                sampler_name=sampler_name,
+                scheduler=scheduler,
+                denoise=denoise,
+                resolution_mode=resolution_mode,
+                megapixels=megapixels,
+            )
+
         data_path, manifest_path, manifest = _manifest_for_extender(owner, FPS)
 
         # If cards were removed, trim the physical cache immediately.
@@ -2683,7 +3580,7 @@ class MiniMaxH3Extender:
                 pass
 
         if prompt_pack_imported and external_prompt_pack is not None:
-            imported_json = _state_json(clips, active_prompt_pack_signature)
+            imported_json = _state_json(clips, active_prompt_pack_signature, "ref2va")
             _send_extender_prompt_pack_import(
                 owner,
                 imported_json,
@@ -2730,6 +3627,12 @@ class MiniMaxH3Extender:
         active_picture_slots = None
         active_video_slots = None
         prepared_ref_frame_count = None
+        # Keep image VAE blocks once (duration-independent) and at most two
+        # duration-specific video/audio latent block sets. Returning to a recent
+        # duration therefore avoids expensive VAE re-encoding without retaining
+        # the much larger Qwen RGB presentation frames for every duration.
+        prepared_image_blocks = None
+        prepared_video_blocks_by_frame_count = {}
 
         disk_join = MiniMaxH3MotionContextDiskJoin()
         motion = MiniMaxH3MotionContextRAM()
@@ -2806,6 +3709,7 @@ class MiniMaxH3Extender:
                 or (active_ref_video_count and prepared_ref_frame_count != frame_count)
             )
             if needs_ref_prepare:
+                cached_video_blocks = prepared_video_blocks_by_frame_count.get(int(frame_count))
                 ref_items, ref_blocks, active_picture_slots, active_video_slots = _prepare_shared_refs(
                     vae,
                     audio_vae,
@@ -2818,7 +3722,22 @@ class MiniMaxH3Extender:
                     ref_video_audios=ref_video_audios,
                     standalone_audio_count=0,
                     frame_count=frame_count,
+                    cached_image_blocks=prepared_image_blocks,
+                    cached_video_blocks=cached_video_blocks,
                 )
+                image_block_count = len(active_picture_slots or [])
+                if prepared_image_blocks is None:
+                    prepared_image_blocks = list((ref_blocks or [])[:image_block_count])
+                if active_ref_video_count:
+                    # Refresh insertion order on a cache hit: this is a real
+                    # two-entry LRU, not just a FIFO. The common 5s/10s/5s
+                    # pattern therefore keeps both useful duration blocks.
+                    duration_key = int(frame_count)
+                    prepared_video_blocks_by_frame_count.pop(duration_key, None)
+                    prepared_video_blocks_by_frame_count[duration_key] = list((ref_blocks or [])[image_block_count:])
+                    while len(prepared_video_blocks_by_frame_count) > 2:
+                        oldest_key = next(iter(prepared_video_blocks_by_frame_count))
+                        prepared_video_blocks_by_frame_count.pop(oldest_key, None)
                 prepared_ref_frame_count = frame_count
 
             clip_ref_items = list(ref_items or [])
@@ -2963,7 +3882,7 @@ class MiniMaxH3Extender:
             else:
                 break
 
-        normalized_json = _state_json(clips, active_prompt_pack_signature)
+        normalized_json = _state_json(clips, active_prompt_pack_signature, generation_mode)
         if resolution.get("mode") == "auto_from_ref" and resolution.get("guide_ref") is not None:
             resolution_text = (
                 f"{resolved_width}x{resolved_height} from ref_{int(resolution['guide_ref'])} "
@@ -3014,6 +3933,7 @@ class MiniMaxH3Extender:
         )
 
         ui_state = {
+            "generation_mode": "ref2va",
             "clips_json": normalized_json,
             "clip_count": len(clips),
             "cached_count": cached_count,
@@ -3184,6 +4104,52 @@ if getattr(PromptServer, "instance", None) is not None:
                 "Cache-Control": "public, max-age=31536000, immutable",
             },
         )
+
+    @PromptServer.instance.routes.get("/h3_extender/fl2va/continuity_meta")
+    async def h3_extender_fl2va_continuity_meta(request):
+        """Return the tiny continuity signature without opening/hash-reading the PNG."""
+        owner_id = str(request.query.get("owner_id") or "").strip()
+        clip_id = str(request.query.get("clip_id") or "").strip()
+        if not owner_id or not clip_id:
+            return web.json_response({"found": False, "reason": "missing_id"}, status=400)
+        meta = fl2va_continuity_meta(owner_id, clip_id)
+        if not meta:
+            return web.json_response({"found": False})
+        return web.json_response({
+            "found": True,
+            "signature": str(meta.get("signature") or ""),
+            "frame_index": int(meta.get("frame_index", -1)),
+            "frame_count": int(meta.get("frame_count", 0)),
+        })
+
+    @PromptServer.instance.routes.get("/h3_extender/fl2va/last_frame")
+    async def h3_extender_fl2va_last_frame(request):
+        """Serve an already decoded FL2VA continuity frame with signature caching."""
+        owner_id = str(request.query.get("owner_id") or "").strip()
+        clip_id = str(request.query.get("clip_id") or "").strip()
+        if not owner_id or not clip_id:
+            return web.Response(status=400, text="Missing owner_id or clip_id.")
+        path = fl2va_last_frame_path(owner_id, clip_id)
+        meta = fl2va_continuity_meta(owner_id, clip_id)
+        if not path.exists() or path.stat().st_size <= 0 or not meta:
+            return web.Response(
+                status=404, text="FL2VA continuity frame not decoded yet.",
+                headers={"Cache-Control": "no-store, max-age=0"},
+            )
+        signature = str(meta.get("signature") or "")
+        requested_version = str(request.query.get("v") or "")
+        immutable = bool(signature and requested_version == signature)
+        headers = {
+            "Content-Type": "image/png",
+            "Cache-Control": (
+                "public, max-age=31536000, immutable"
+                if immutable
+                else "public, max-age=0, must-revalidate"
+            ),
+        }
+        if signature:
+            headers["ETag"] = f'"{signature}"'
+        return web.FileResponse(path, headers=headers)
 
     @PromptServer.instance.routes.post("/h3_extender/project/prepare_save")
     async def h3_extender_project_prepare_save(request):
