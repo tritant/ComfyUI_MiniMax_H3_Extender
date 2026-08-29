@@ -6,6 +6,20 @@ The node combines **Ref2VA conditioning, Motion Context, disk caching, multi-cli
 
 ---
 
+## 🚀 MiniMax H3 Extender 2.0.0
+
+Version **2.0.0** is now available!
+
+This release introduces **FL2VA support**
+
+It also includes major **speed and memory optimizations**, with reduced RAM/VRAM usage, faster continuity handling, smoother preview behavior, and improved performance on longer projects.
+
+Project save/load, preview restoration, clip continuity, and overall stability have also been improved.
+
+**MiniMax H3 Extender 2.0.0** is now the new base for the project.
+
+Thanks to everyone testing, reporting issues, and helping improve the extension ❤️
+
 ## 🎛️ New — Per-Clip LoRAs
 
 Each clip card can now use its own LoRA.
