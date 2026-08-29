@@ -20,6 +20,8 @@ Project save/load, preview restoration, clip continuity, and overall stability h
 
 Thanks to everyone testing, reporting issues, and helping improve the extension ❤️
 
+---
+
 ## 🎛️ New — Per-Clip LoRAs
 
 Each clip card can now use its own LoRA.
@@ -202,6 +204,8 @@ Loading a project restores the clip settings and color correction state, allowin
 ---
 
 https://github.com/user-attachments/assets/a18cc6a5-2340-474e-9d3b-b784cd41584a
+
+<img width="1836" height="945" alt="Capture d&#39;écran 2026-08-29 141350" src="https://github.com/user-attachments/assets/490497ef-93a0-4442-89be-fc5589491c2f" />
 
 
 <img width="2307" height="1028" alt="image" src="https://github.com/user-attachments/assets/c1126ae8-2d4b-416c-a8c2-b839cd4c6b15" />
