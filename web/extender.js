@@ -18,9 +18,13 @@ const BOTTOM_PAD = 16;
 // Leave an empty gutter under each card so an overlay horizontal scrollbar
 // never covers the Validated/footer row.
 const CARD_SCROLLBAR_SPACE = 24;
-const CARD_MIN_HEIGHT = 405;
-const NODES2_CARDS_MIN_HEIGHT = CARD_MIN_HEIGHT + CARD_SCROLLBAR_SPACE;
+// Cards keep the same compact structure in both modes. FL2VA keyframes live
+// in the shared media strip above the cards; dynamic LoRA rows are the only
+// per-card controls that increase vertical content.
+const CARD_MIN_HEIGHT_REF2VA = 455;
+const CARD_MIN_HEIGHT_FL2VA = 455;
 const REF_SLOT_WIDTH = 96;
+const FL2VA_FRAME_SLOT_WIDTH = 145;
 const REF_THUMB_HEIGHT = 96;
 // Reserve the scrollbar inside the existing reference section only.
 // Do not grow the DOM widget or alter card sizing/layout for this.
@@ -29,6 +33,37 @@ const REF_SECTION_HEIGHT = 160;
 const MAX_IMAGE_REFS = 9;
 const MAX_RESOLUTION = 4096;
 const DEFAULT_MEGAPIXELS = 0.40;
+
+function maxSelectedLoraRows(state) {
+    let maxRows = 0;
+    for (const clip of state?.clips || []) {
+        const rows = Array.isArray(clip?.loras)
+            ? clip.loras.filter((cfg) => String(cfg?.name || "").trim()).length
+            : (String(clip?.lora?.name || "").trim() ? 1 : 0);
+        maxRows = Math.max(maxRows, rows);
+    }
+    return maxRows;
+}
+
+function cardMinHeightForState(state) {
+    const fl2va = String(state?.generation_mode || "ref2va") === "fl2va";
+    const base = fl2va ? CARD_MIN_HEIGHT_FL2VA : CARD_MIN_HEIGHT_REF2VA;
+    // One empty Add-LoRA selector is already included in the base height.
+    // Each selected LoRA adds one full row above it.
+    return base + maxSelectedLoraRows(state) * 46;
+}
+
+function uiMinHeightForState(state) {
+    // Both modes own the same media strip above the cards: Ref2VA shows the
+    // nine internal references, FL2VA shows each plan's First/Last frames.
+    // Keeping one fixed strip height also prevents mode switches from pulling
+    // the DOM widget upward into the native widgets in Nodes 2.0.
+    return Math.max(UI_MIN_HEIGHT, 55 + REF_SECTION_HEIGHT + cardMinHeightForState(state) + CARD_SCROLLBAR_SPACE);
+}
+
+function nodes2MinHeightForState(state) {
+    return Math.max(NODES2_MIN_HEIGHT, uiMinHeightForState(state) + NODES2_TOP_GAP);
+}
 
 const PROJECT_WIDGETS = [
     "run_mode",
@@ -45,10 +80,10 @@ const PROJECT_WIDGETS = [
     "resolution_mode",
     "megapixels",
     "refs_json",
+    "generation_mode",
 ];
 
 const FINAL_PROJECT_WIDGETS = [
-    "fps",
     "filename_prefix",
     "output_directory",
     "codec",
@@ -515,44 +550,236 @@ function newClip(index) {
         validated: false,
         color_adjustment: normalizeColorAdjustment(),
         loras: [],
+        first_frame: null,
+        last_frame: null,
+        first_source: "manual",
     };
+}
+
+function normalizeClipList(rawClips) {
+    const clips = Array.isArray(rawClips) && rawClips.length ? rawClips : [newClip(0)];
+    return clips.map((c, i) => ({
+        id: String(c?.id || `clip_${i + 1}`),
+        name: String(c?.name || ""),
+        prompt: String(c?.prompt || ""),
+        seed: Math.max(0, Math.min(Number.MAX_SAFE_INTEGER, Number(c?.seed || 0))),
+        seed_mode: ["randomize", "fixed", "increment", "decrement"].includes(String(c?.seed_mode))
+            ? String(c.seed_mode)
+            : "randomize",
+        duration: Math.max(0.25, Math.min(150, Number(c?.duration || 10))),
+        validated: Boolean(c?.validated),
+        color_adjustment: normalizeColorAdjustment(c?.color_adjustment),
+        loras: normalizeClipLoras(c?.loras, c?.lora),
+        first_frame: normalizeRefDescriptor(c?.first_frame),
+        last_frame: normalizeRefDescriptor(c?.last_frame),
+        first_source: (i > 0 && String(c?.first_source || "manual") === "previous_clip")
+            ? "previous_clip"
+            : "manual",
+    }));
+}
+
+function blankModeClips() {
+    return [newClip(0)];
+}
+
+function ensureModeClipState(state) {
+    if (!state || typeof state !== "object") return state;
+    const activeMode = String(state.generation_mode || "ref2va") === "fl2va" ? "fl2va" : "ref2va";
+    if (!state.mode_clips || typeof state.mode_clips !== "object") state.mode_clips = {};
+    if (!Array.isArray(state.mode_clips.ref2va) || !state.mode_clips.ref2va.length) {
+        state.mode_clips.ref2va = activeMode === "ref2va" && Array.isArray(state.clips) && state.clips.length
+            ? state.clips
+            : blankModeClips();
+    }
+    if (!Array.isArray(state.mode_clips.fl2va) || !state.mode_clips.fl2va.length) {
+        state.mode_clips.fl2va = activeMode === "fl2va" && Array.isArray(state.clips) && state.clips.length
+            ? state.clips
+            : blankModeClips();
+    }
+    state.mode_clips[activeMode] = Array.isArray(state.clips) && state.clips.length
+        ? state.clips
+        : state.mode_clips[activeMode];
+    state.clips = state.mode_clips[activeMode];
+    return state;
+}
+
+function activateModeState(state, mode) {
+    ensureModeClipState(state);
+    const current = String(state.generation_mode || "ref2va") === "fl2va" ? "fl2va" : "ref2va";
+    const next = String(mode || "ref2va") === "fl2va" ? "fl2va" : "ref2va";
+    state.mode_clips[current] = state.clips;
+    state.generation_mode = next;
+    if (!Array.isArray(state.mode_clips[next]) || !state.mode_clips[next].length) {
+        state.mode_clips[next] = blankModeClips();
+    }
+    state.clips = state.mode_clips[next];
+    return state;
 }
 
 function parseState(raw) {
     try {
         const p = JSON.parse(raw || "{}");
-        const clips = Array.isArray(p) ? p : p?.clips;
-        if (Array.isArray(clips) && clips.length) {
-            return {
-                version: 1,
-                load_token: String(p?.project_load_token || ""),
-                prompt_pack_signature: String(p?.prompt_pack_signature || ""),
-                clips: clips.map((c, i) => ({
-                    id: String(c?.id || `clip_${i + 1}`),
-                    name: String(c?.name || ""),
-                    prompt: String(c?.prompt || ""),
-                    seed: Math.max(0, Math.min(Number.MAX_SAFE_INTEGER, Number(c?.seed || 0))),
-                    seed_mode: ["randomize", "fixed", "increment", "decrement"].includes(String(c?.seed_mode))
-                        ? String(c.seed_mode)
-                        : "randomize",
-                    duration: Math.max(0.25, Math.min(150, Number(c?.duration || 10))),
-                    validated: Boolean(c?.validated),
-                    color_adjustment: normalizeColorAdjustment(c?.color_adjustment),
-                    loras: normalizeClipLoras(c?.loras, c?.lora),
-                })),
-            };
-        }
+        const legacyArray = Array.isArray(p);
+        const payload = legacyArray ? { clips: p } : (p && typeof p === "object" ? p : {});
+        const generationMode = String(payload?.generation_mode || "ref2va") === "fl2va" ? "fl2va" : "ref2va";
+        const rawActive = Array.isArray(payload?.clips) && payload.clips.length ? payload.clips : null;
+        const savedModes = payload?.mode_clips && typeof payload.mode_clips === "object"
+            ? payload.mode_clips
+            : {};
+
+        // `clips` is always the authoritative active-mode payload sent to the
+        // backend. `mode_clips` is frontend/workflow state only and keeps the
+        // inactive mode completely independent while switching REF2VA <-> FL2VA.
+        const ref2vaClips = generationMode === "ref2va" && rawActive
+            ? normalizeClipList(rawActive)
+            : (Array.isArray(savedModes?.ref2va) && savedModes.ref2va.length
+                ? normalizeClipList(savedModes.ref2va)
+                : blankModeClips());
+        const fl2vaClips = generationMode === "fl2va" && rawActive
+            ? normalizeClipList(rawActive)
+            : (Array.isArray(savedModes?.fl2va) && savedModes.fl2va.length
+                ? normalizeClipList(savedModes.fl2va)
+                : blankModeClips());
+        const activeClips = generationMode === "fl2va" ? fl2vaClips : ref2vaClips;
+
+        return {
+            version: 2,
+            generation_mode: generationMode,
+            load_token: String(payload?.project_load_token || ""),
+            prompt_pack_signature: String(payload?.prompt_pack_signature || ""),
+            clips: activeClips,
+            mode_clips: {
+                ref2va: ref2vaClips,
+                fl2va: fl2vaClips,
+            },
+        };
     } catch (_) {}
-    return { version: 1, load_token: "", prompt_pack_signature: "", clips: [newClip(0)] };
+    const ref2vaClips = blankModeClips();
+    return {
+        version: 2,
+        generation_mode: "ref2va",
+        load_token: "",
+        prompt_pack_signature: "",
+        clips: ref2vaClips,
+        mode_clips: { ref2va: ref2vaClips, fl2va: blankModeClips() },
+    };
 }
 
 function serializeState(state) {
-    const payload = { version: 1, clips: state.clips };
+    ensureModeClipState(state);
+    const mode = state?.generation_mode === "fl2va" ? "fl2va" : "ref2va";
+    state.mode_clips[mode] = state.clips;
+    const payload = {
+        version: 2,
+        generation_mode: mode,
+        clips: state.clips,
+        mode_clips: {
+            ref2va: state.mode_clips.ref2va,
+            fl2va: state.mode_clips.fl2va,
+        },
+    };
     if (state?.load_token) payload.project_load_token = String(state.load_token);
-    if (state?.prompt_pack_signature) {
-        payload.prompt_pack_signature = String(state.prompt_pack_signature);
-    }
+    if (state?.prompt_pack_signature) payload.prompt_pack_signature = String(state.prompt_pack_signature);
     return JSON.stringify(payload);
+}
+
+function configuredClipsStateJson(info, fallback = "") {
+    // During an in-browser refresh Nodes 2.0 may call onConfigure before the
+    // native widget objects have received their restored values. The serialized
+    // node payload is already available in info.widgets_values, so recover the
+    // clips state directly from there instead of racing the Vue widget restore.
+    const values = Array.isArray(info?.widgets_values) ? info.widgets_values : [];
+    let legacyCandidate = "";
+    for (const value of values) {
+        if (typeof value !== "string") continue;
+        const text = value.trim();
+        if (!text || (text[0] !== "{" && text[0] !== "[")) continue;
+        try {
+            const parsed = JSON.parse(text);
+            if (Array.isArray(parsed)) {
+                // Pre-v14 state was a bare clip array. Keep it only as a fallback
+                // because refs_json is an object and modern clips_json is stronger.
+                if (parsed.length && parsed.some((item) => item && typeof item === "object" && (
+                    Object.prototype.hasOwnProperty.call(item, "prompt") ||
+                    Object.prototype.hasOwnProperty.call(item, "duration") ||
+                    Object.prototype.hasOwnProperty.call(item, "validated")
+                ))) legacyCandidate = text;
+                continue;
+            }
+            if (!parsed || typeof parsed !== "object") continue;
+            if (
+                Object.prototype.hasOwnProperty.call(parsed, "generation_mode") ||
+                Object.prototype.hasOwnProperty.call(parsed, "mode_clips") ||
+                Array.isArray(parsed.clips)
+            ) {
+                return text;
+            }
+        } catch (_) {}
+    }
+    return legacyCandidate || String(fallback || "");
+}
+
+function replaceConfiguredClipsStateJson(info, raw) {
+    if (!Array.isArray(info?.widgets_values) || typeof raw !== "string") return false;
+    const values = info.widgets_values;
+    for (let i = 0; i < values.length; i++) {
+        const value = values[i];
+        if (typeof value !== "string") continue;
+        const text = value.trim();
+        if (!text || (text[0] !== "{" && text[0] !== "[")) continue;
+        try {
+            const parsed = JSON.parse(text);
+            const isClipState = Array.isArray(parsed)
+                ? parsed.some((item) => item && typeof item === "object" && (
+                    Object.prototype.hasOwnProperty.call(item, "prompt") ||
+                    Object.prototype.hasOwnProperty.call(item, "duration") ||
+                    Object.prototype.hasOwnProperty.call(item, "validated")
+                ))
+                : Boolean(parsed && typeof parsed === "object" && (
+                    Object.prototype.hasOwnProperty.call(parsed, "generation_mode") ||
+                    Object.prototype.hasOwnProperty.call(parsed, "mode_clips") ||
+                    Array.isArray(parsed.clips)
+                ));
+            if (isClipState) {
+                values[i] = raw;
+                return true;
+            }
+        } catch (_) {}
+    }
+    return false;
+}
+
+function serializeProjectState(state) {
+    // Portable .ext projects intentionally remain single-mode. This preserves
+    // the existing archive/cache contract and avoids embedding inactive FL2VA
+    // frames in a Ref2VA project (or vice versa). Old projects without a mode
+    // marker are still interpreted as Ref2VA by the backend.
+    ensureModeClipState(state);
+    const mode = state?.generation_mode === "fl2va" ? "fl2va" : "ref2va";
+    const payload = { version: 2, generation_mode: mode, clips: state.clips };
+    if (state?.load_token) payload.project_load_token = String(state.load_token);
+    if (state?.prompt_pack_signature) payload.prompt_pack_signature = String(state.prompt_pack_signature);
+    return JSON.stringify(payload);
+}
+
+function mergeActiveStateJson(runtime, raw, explicitMode = null) {
+    const incoming = parseState(raw);
+    if (!runtime?.state) return incoming;
+    ensureModeClipState(runtime.state);
+    const mode = String(explicitMode || incoming.generation_mode || runtime.state.generation_mode || "ref2va") === "fl2va"
+        ? "fl2va"
+        : "ref2va";
+    const incomingClips = incoming.generation_mode === mode
+        ? incoming.clips
+        : incoming.mode_clips?.[mode];
+    runtime.state.mode_clips[mode] = Array.isArray(incomingClips) && incomingClips.length
+        ? incomingClips
+        : blankModeClips();
+    runtime.state.generation_mode = mode;
+    runtime.state.clips = runtime.state.mode_clips[mode];
+    runtime.state.load_token = incoming.load_token || runtime.state.load_token || "";
+    runtime.state.prompt_pack_signature = incoming.prompt_pack_signature || "";
+    return runtime.state;
 }
 
 async function refreshLoraNames(node, runtime) {
@@ -579,6 +806,9 @@ async function refreshLoraNames(node, runtime) {
 }
 
 function validatedPrefixFromState(state) {
+    if (state?.generation_mode === "fl2va") {
+        return (state?.clips || []).filter((clip) => Boolean(clip?.validated)).length;
+    }
     let count = 0;
     for (const clip of state?.clips || []) {
         if (!clip?.validated) break;
@@ -594,6 +824,7 @@ async function restoreCacheState(node, runtime) {
     try {
         const params = new URLSearchParams();
         params.set("owner_id", String(node.id));
+        params.set("mode", String(runtime.state?.generation_mode || getWidget(node, "generation_mode")?.value || "ref2va"));
         const response = await fetch(
             api.apiURL("/h3_extender/cache_state?" + params.toString())
         );
@@ -610,6 +841,23 @@ async function restoreCacheState(node, runtime) {
 
         runtime.cachedCount = Number(payload.cached_count || 0);
         runtime.validatedCount = Number(payload.validated_count || 0);
+        runtime.cachedClipIds = new Set(Array.isArray(payload.cached_clip_ids) ? payload.cached_clip_ids.map(String) : []);
+        runtime.validatedClipIds = new Set(Array.isArray(payload.validated_clip_ids) ? payload.validated_clip_ids.map(String) : []);
+        runtime.continuitySignatures = new Map(
+            Object.entries(payload?.continuity_signatures || {}).map(([key, value]) => [String(key), String(value || "")]).filter(([, value]) => Boolean(value))
+        );
+        const activeMode = String(runtime.state?.generation_mode || "ref2va") === "fl2va" ? "fl2va" : "ref2va";
+        if (activeMode === "fl2va") {
+            for (const clip of runtime.state?.clips || []) {
+                clip.validated = runtime.validatedClipIds.has(String(clip.id));
+            }
+        } else {
+            for (let i = 0; i < (runtime.state?.clips || []).length; i++) {
+                runtime.state.clips[i].validated = i < runtime.validatedCount;
+            }
+        }
+        snapshotModeValidation(runtime, activeMode);
+        runtime.jsonWidget.value = serializeState(runtime.state);
         const restoredW = Number(payload.resolved_width || 0);
         const restoredH = Number(payload.resolved_height || 0);
         if (restoredW > 0 && restoredH > 0) {
@@ -692,6 +940,24 @@ function currentGuideRefNumber(runtime) {
     return null;
 }
 
+function dimensionsFromFl2vaKeyframe(runtime) {
+    for (const clip of runtime?.state?.clips || []) {
+        for (const key of ["first_frame", "last_frame"]) {
+            const ref = normalizeRefDescriptor(clip?.[key]);
+            const width = Number(ref?.width || 0);
+            const height = Number(ref?.height || 0);
+            if (width > 0 && height > 0) return { width, height };
+        }
+    }
+    return null;
+}
+
+function hasAutoResolutionGuide(runtime) {
+    return runtime?.state?.generation_mode === "fl2va"
+        ? Boolean(dimensionsFromFl2vaKeyframe(runtime))
+        : currentGuideRefNumber(runtime) != null;
+}
+
 function dimensionsFromInternalRef(runtime, refNumber) {
     const index = Number(refNumber) - 1;
     if (!runtime || !Number.isInteger(index) || index < 0 || index >= MAX_IMAGE_REFS) return null;
@@ -739,9 +1005,10 @@ function syncResolutionMirror(node, runtime) {
         return;
     }
 
-    const guideRef = currentGuideRefNumber(runtime);
-    if (guideRef == null) {
-        // Auto without a reference is deliberately the editable Manual fallback.
+    const flGuide = runtime.state?.generation_mode === "fl2va" ? dimensionsFromFl2vaKeyframe(runtime) : null;
+    const guideRef = runtime.state?.generation_mode === "fl2va" ? null : currentGuideRefNumber(runtime);
+    if (!flGuide && guideRef == null) {
+        // Auto without an applicable keyframe/reference is the editable Manual fallback.
         if (runtime.manualWidth > 0 && runtime.manualHeight > 0) {
             setResolutionMirrorValues(node, runtime, runtime.manualWidth, runtime.manualHeight);
         }
@@ -749,7 +1016,7 @@ function syncResolutionMirror(node, runtime) {
         return;
     }
 
-    let source = dimensionsFromInternalRef(runtime, guideRef);
+    let source = flGuide || dimensionsFromInternalRef(runtime, guideRef);
     const executedGuide = /^ref_(\d+)$/.exec(String(runtime.resolutionGuide || ""));
     if (!source && executedGuide && Number(executedGuide[1]) === Number(guideRef)) {
         if (runtime.guideSourceWidth > 0 && runtime.guideSourceHeight > 0) {
@@ -806,10 +1073,8 @@ function wrapResolutionWidgetCallbacks(node, runtime) {
     wrap(widthWidget, (value) => {
         if (runtime.applyingResolutionMirror) return;
         const mode = String(modeWidget?.value || "auto_from_ref");
-        if (mode === "manual" || currentGuideRefNumber(runtime) == null) {
-            // A loaded .ext is forced to its exact archived geometry only at
-            // load time. The first explicit resolution edit releases that
-            // one-shot project state immediately.
+        if (mode === "manual" || !hasAutoResolutionGuide(runtime)) {
+            // Manual edits update the independent fallback geometry.
             runtime.projectResolutionLoaded = false;
             rememberManualResolution(
                 node,
@@ -825,7 +1090,7 @@ function wrapResolutionWidgetCallbacks(node, runtime) {
     wrap(heightWidget, (value) => {
         if (runtime.applyingResolutionMirror) return;
         const mode = String(modeWidget?.value || "auto_from_ref");
-        if (mode === "manual" || currentGuideRefNumber(runtime) == null) {
+        if (mode === "manual" || !hasAutoResolutionGuide(runtime)) {
             runtime.projectResolutionLoaded = false;
             rememberManualResolution(
                 node,
@@ -852,13 +1117,9 @@ function wrapResolutionWidgetCallbacks(node, runtime) {
         requestAnimationFrame(() => syncResolutionAndInvalidate(node, runtime));
     });
     wrap(mpWidget, () => {
-        // Load Project deliberately enters Manual at the archived width/height
-        // so simply pressing Queue cannot invalidate the imported cache. But
-        // megapixels is an Auto-only control: if the user edits it after a
-        // project load, that is an explicit request to choose a new resolution.
-        // Re-enter Auto immediately instead of leaving the MP widget apparently
-        // ineffective. The backend will then restart the incompatible cache on
-        // the next generation, exactly like any other live resolution change.
+        // Compatibility guard for older runtimes that may still carry the
+        // one-shot projectResolutionLoaded flag. Megapixels is an Auto-only
+        // control, so an explicit edit releases that legacy lock.
         if (runtime.projectResolutionLoaded) {
             runtime.projectResolutionLoaded = false;
             setWidgetValue(node, "resolution_mode", "auto_from_ref");
@@ -886,10 +1147,15 @@ function wrapResolutionWidgetCallbacks(node, runtime) {
 function hideNativeWidget(node, widget) {
     if (!widget) return;
 
-    // LiteGraph / Nodes 1.0: remove the logical footprint but keep the widget
-    // itself intact so its normal workflow serialization continues to work.
-    // Do NOT use canvasOnly/hidden here: Vue does not reliably honour those
-    // flags for native widgets, while the pre-emptive CSS above does.
+    // Modern Nodes 2.0 renders native widgets from its own widget store. Merely
+    // giving a widget a zero layout size is not enough: the control can remain
+    // visible while the following DOM widget is laid out in the same row, which
+    // causes the overlap seen with the hidden generation_mode combo. Mark the
+    // widget hidden as well, while keeping it alive for normal serialization.
+    widget.hidden = true;
+
+    // LiteGraph / Nodes 1.0: also remove the logical footprint but keep the
+    // widget itself intact so workflow serialization continues to work.
     widget.computeSize = () => [0, -4];
     widget.computeLayoutSize = () => ({
         minWidth: 0,
@@ -915,6 +1181,49 @@ function hideNativeWidget(node, widget) {
             }
         };
     }
+}
+
+
+function setNativeWidgetVisibility(node, widget, visible) {
+    if (!widget) return;
+    if (!Object.prototype.hasOwnProperty.call(widget, "__h3OriginalComputeSize")) {
+        widget.__h3OriginalComputeSize = widget.computeSize;
+        widget.__h3OriginalComputeLayoutSize = widget.computeLayoutSize;
+    }
+
+    widget.hidden = !visible;
+    if (visible) {
+        if (widget.__h3OriginalComputeSize !== undefined) widget.computeSize = widget.__h3OriginalComputeSize;
+        else delete widget.computeSize;
+        if (widget.__h3OriginalComputeLayoutSize !== undefined) widget.computeLayoutSize = widget.__h3OriginalComputeLayoutSize;
+        else delete widget.computeLayoutSize;
+        const inputEl = widget.inputEl;
+        if (inputEl) {
+            inputEl.style.display = "";
+            if (inputEl.parentElement) inputEl.parentElement.style.display = "";
+        }
+    } else {
+        widget.computeSize = () => [0, -4];
+        widget.computeLayoutSize = () => ({
+            minWidth: 0,
+            minHeight: 0,
+            maxWidth: 0,
+            maxHeight: 0,
+        });
+        const inputEl = widget.inputEl;
+        if (inputEl) {
+            inputEl.style.display = "none";
+            if (inputEl.parentElement) inputEl.parentElement.style.display = "none";
+        }
+    }
+    node?.graph?.setDirtyCanvas(true, true);
+}
+
+function syncModeSpecificNativeWidgets(node, runtime, fl2vaMode) {
+    // Motion Context controls have no meaning in FL2VA. Hide them only in that
+    // mode while keeping their values intact for the independent Ref2VA state.
+    setNativeWidgetVisibility(node, runtime?.contextLengthWidget, !fl2vaMode);
+    setNativeWidgetVisibility(node, runtime?.audioContextLengthWidget, !fl2vaMode);
 }
 
 function domWidgetRenderMode(element) {
@@ -1018,7 +1327,10 @@ function cardStatus(runtime, clip, index) {
         return "rendering";
     }
 
-    const cached = index < Number(runtime.cachedCount || 0);
+    const fl2va = runtime.state?.generation_mode === "fl2va";
+    const cached = fl2va
+        ? runtime.cachedClipIds?.has(String(clip.id))
+        : index < Number(runtime.cachedCount || 0);
     if (clip.validated && cached) return "validated";
     const firstOpen = runtime.state.clips.findIndex((c) => !c.validated);
     if (index === firstOpen) return cached ? "candidate" : "current";
@@ -1026,7 +1338,27 @@ function cardStatus(runtime, clip, index) {
     return "future";
 }
 
+function snapshotModeValidation(runtime, mode = null) {
+    if (!runtime?.state) return;
+    if (!runtime.modeValidationState) runtime.modeValidationState = {};
+    const key = String(mode || runtime.state.generation_mode || "ref2va") === "fl2va" ? "fl2va" : "ref2va";
+    runtime.modeValidationState[key] = new Map(
+        (runtime.state.clips || []).map((clip) => [String(clip.id), Boolean(clip.validated)])
+    );
+}
+
+function restoreModeValidation(runtime, mode) {
+    const key = String(mode || "ref2va") === "fl2va" ? "fl2va" : "ref2va";
+    const saved = runtime?.modeValidationState?.[key];
+    if (!(saved instanceof Map)) return false;
+    for (const clip of runtime.state?.clips || []) {
+        clip.validated = Boolean(saved.get(String(clip.id)));
+    }
+    return true;
+}
+
 function updateHidden(node, runtime) {
+    snapshotModeValidation(runtime);
     const raw = serializeState(runtime.state);
     runtime.jsonWidget.value = raw;
     node.graph?.setDirtyCanvas(true, true);
@@ -1057,8 +1389,17 @@ function handleReferenceChange(node, runtime, message = "Image references change
     }
 }
 
-function openReferenceEditor(node, runtime, slotIndex, ref) {
+function openReferenceEditor(node, runtime, slotIndex, ref, target = null) {
     if (!ref?.id || !node || !runtime) return;
+    const isFrame = Boolean(target && ["first", "last"].includes(String(target.kind)));
+    const frameClipIndex = isFrame ? Number(target.clipIndex) : -1;
+    const frameKind = isFrame ? String(target.kind) : "";
+    const frameLabel = isFrame
+        ? `Clip ${frameClipIndex + 1} ${frameKind === "first" ? "First frame" : "Last frame"}`
+        : `Ref ${slotIndex + 1}`;
+    const defaultName = isFrame
+        ? `clip_${frameClipIndex + 1}_${frameKind}.png`
+        : `ref_${slotIndex + 1}.png`;
     if (projectBusy(runtime) || runtime.refBusy || runtime.projectOperationBusy) {
         alert("Wait for the current clip generation to finish before editing a reference image.");
         return;
@@ -1098,13 +1439,13 @@ function openReferenceEditor(node, runtime, slotIndex, ref) {
     header.style.borderBottom = "1px solid rgba(255,255,255,.12)";
 
     const title = document.createElement("div");
-    title.textContent = `Reference Editor — Ref ${slotIndex + 1}`;
+    title.textContent = `Reference Editor — ${frameLabel}`;
     title.style.fontWeight = "650";
     title.style.fontSize = "13px";
     title.style.overflow = "hidden";
     title.style.textOverflow = "ellipsis";
     title.style.whiteSpace = "nowrap";
-    title.title = ref.original_name || `Ref ${slotIndex + 1}`;
+    title.title = ref.original_name || frameLabel;
 
     const closeButton = document.createElement("button");
     closeButton.textContent = "×";
@@ -1318,7 +1659,7 @@ function openReferenceEditor(node, runtime, slotIndex, ref) {
         reset.disabled = true;
         cancel.disabled = true;
         runtime.refBusy = true;
-        runtime.statusText = `Applying Ref ${slotIndex + 1} adjustments…`;
+        runtime.statusText = `Applying ${frameLabel} adjustments…`;
         render(node, runtime);
         try {
             const response = await fetch(api.apiURL("/h3_extender/ref/edit"), {
@@ -1327,7 +1668,7 @@ function openReferenceEditor(node, runtime, slotIndex, ref) {
                 body: JSON.stringify({
                     ref_id: ref.id,
                     source_id: ref.source_id || ref.id,
-                    original_name: ref.original_name || `ref_${slotIndex + 1}.png`,
+                    original_name: ref.original_name || defaultName,
                     saturation: numericValue(saturation),
                     contrast: numericValue(contrast),
                     brightness: numericValue(brightness),
@@ -1341,18 +1682,29 @@ function openReferenceEditor(node, runtime, slotIndex, ref) {
             const newRef = normalizeRefDescriptor(payload.ref);
             if (!newRef) throw new Error("The backend returned invalid reference metadata.");
 
-            const current = runtime.refsState.refs[slotIndex];
+            const current = isFrame
+                ? runtime.state?.clips?.[frameClipIndex]?.[`${frameKind}_frame`]
+                : runtime.refsState.refs[slotIndex];
             if (!current || String(current.id) !== String(ref.id)) {
-                throw new Error(`Ref ${slotIndex + 1} changed while the editor was open.`);
+                throw new Error(`${frameLabel} changed while the editor was open.`);
             }
 
-            runtime.refsState.refs[slotIndex] = newRef;
-            if (sameRefContent(ref, newRef)) {
-                updateRefsHidden(node, runtime);
-                runtime.statusText = `Ref ${slotIndex + 1} unchanged`;
+            if (isFrame) {
+                runtime.state.clips[frameClipIndex][`${frameKind}_frame`] = newRef;
+                updateHidden(node, runtime);
+                runtime.statusText = sameRefContent(ref, newRef)
+                    ? `${frameLabel} unchanged`
+                    : `${frameLabel} adjusted | validations unchanged`;
                 render(node, runtime);
             } else {
-                handleReferenceChange(node, runtime, `Ref ${slotIndex + 1} adjusted`);
+                runtime.refsState.refs[slotIndex] = newRef;
+                if (sameRefContent(ref, newRef)) {
+                    updateRefsHidden(node, runtime);
+                    runtime.statusText = `Ref ${slotIndex + 1} unchanged`;
+                    render(node, runtime);
+                } else {
+                    handleReferenceChange(node, runtime, `Ref ${slotIndex + 1} adjusted`);
+                }
             }
             close();
         } catch (error) {
@@ -1414,6 +1766,51 @@ async function uploadReference(node, runtime, slotIndex, file) {
         runtime.refBusy = false;
         render(node, runtime);
     }
+}
+
+async function uploadClipFrame(node, runtime, clipIndex, kind, file) {
+    if (!node || !runtime || !file) return;
+    const clip = runtime.state?.clips?.[clipIndex];
+    if (!clip || !["first", "last"].includes(kind)) return;
+    if (projectBusy(runtime)) {
+        alert("Wait for the current clip generation to finish before changing an FL2VA keyframe.");
+        return;
+    }
+    runtime.refBusy = true;
+    runtime.statusText = `Loading Clip ${clipIndex + 1} ${kind} frame: ${file.name}…`;
+    render(node, runtime);
+    try {
+        const form = new FormData();
+        form.append("ref_file", file, file.name);
+        const response = await fetch(api.apiURL("/h3_extender/ref/upload"), { method: "POST", body: form });
+        const payload = await response.json().catch(() => ({}));
+        if (!response.ok || !payload?.ok || !payload?.ref) {
+            throw new Error(payload?.error || `FL2VA frame upload failed (${response.status}).`);
+        }
+        const ref = normalizeRefDescriptor(payload.ref);
+        if (!ref) throw new Error("The backend returned invalid FL2VA frame metadata.");
+        clip[`${kind}_frame`] = ref;
+        if (kind === "first" && String(clip.first_source || "manual") === "previous_clip") {
+            clip.first_source = "manual";
+            invalidateFl2vaPlanAndFollowers(runtime, clipIndex, true);
+        }
+        updateHidden(node, runtime);
+        runtime.statusText = `Clip ${clipIndex + 1} ${kind} frame loaded`;
+    } catch (error) {
+        runtime.statusText = "FL2VA frame load failed";
+        alert(String(error?.message || error));
+    } finally {
+        runtime.refBusy = false;
+        render(node, runtime);
+    }
+}
+
+function removeClipFrame(node, runtime, clipIndex, kind) {
+    const clip = runtime?.state?.clips?.[clipIndex];
+    if (!clip || !["first", "last"].includes(kind)) return;
+    clip[`${kind}_frame`] = null;
+    updateHidden(node, runtime);
+    render(node, runtime);
 }
 
 function removeReference(node, runtime, slotIndex) {
@@ -1489,6 +1886,7 @@ async function openClipColorEditor(node, runtime, clipIndex) {
     params.set("owner_id", String(node.id));
     params.set("final_id", String(finalNode.id));
     params.set("clip_index", String(clipIndex));
+    params.set("mode", String(runtime.state?.generation_mode || "ref2va"));
 
     let payload;
     try {
@@ -1681,6 +2079,7 @@ async function openClipColorEditor(node, runtime, clipIndex) {
                 body: JSON.stringify({
                     owner_id: String(node.id),
                     clip_index: Number(clipIndex),
+                    generation_mode: String(runtime.state?.generation_mode || "ref2va"),
                     adjustment: normalizeColorAdjustment(adjustment),
                 }),
             });
@@ -1774,6 +2173,10 @@ function collectProjectPayload(node, runtime) {
     updateRefsHidden(node, runtime);
     const finalNode = connectedFinalDecode(node);
     const settings = collectWidgetValues(node, PROJECT_WIDGETS);
+    // A portable .ext archive represents the currently selected generation
+    // mode only. Workflow serialization keeps both independent card timelines,
+    // but the project archive must not retain dangling inactive FL2VA frame ids.
+    settings.clips_json = serializeProjectState(runtime.state);
     // In Auto mode the visible width/height widgets are mirrors of the active
     // derived resolution. Preserve the user's Manual fallback separately so a
     // later Auto -> Manual switch restores what they actually entered.
@@ -1783,6 +2186,7 @@ function collectProjectPayload(node, runtime) {
         schema_version: 2,
         extender: {
             class_name: TARGET,
+            generation_mode: String(runtime.state?.generation_mode || getWidget(node, "generation_mode")?.value || "ref2va"),
             node_title: String(node?.title || "MiniMax H3 Extender"),
             settings,
             resolution: {
@@ -1795,7 +2199,7 @@ function collectProjectPayload(node, runtime) {
                 guide_ref: String(runtime.resolutionGuide || ""),
                 fallback: Boolean(runtime.resolutionFallback),
             },
-            clips_json: serializeState(runtime.state),
+            clips_json: serializeProjectState(runtime.state),
             clips: runtime.state.clips.map((clip) => ({ ...clip })),
             refs_json: serializeRefsState(runtime.refsState),
             references: runtime.refsState.refs.map((ref) => ref ? { ...ref } : null),
@@ -1803,7 +2207,18 @@ function collectProjectPayload(node, runtime) {
         },
         final_decode: finalNode ? {
             class_name: FINAL_TARGET,
+            node_id: String(finalNode.id),
             settings: collectWidgetValues(finalNode, FINAL_PROJECT_WIDGETS),
+            preview: (() => {
+                const previewState = finalNode.__h3LivePreview;
+                const previewMeta = previewState?.currentPreviewMeta || {};
+                const info = previewState?.currentVideoInfo;
+                return {
+                    available: Boolean(info?.filename),
+                    clip_count: Number(previewMeta.clip_count || 0),
+                    frame_count: Number(previewMeta.frame_count || 0),
+                };
+            })(),
         } : null,
     };
 }
@@ -1828,30 +2243,41 @@ function applyProjectPayload(node, runtime, projectPayload) {
         }
     }
 
-    // v14.24 and older .ext projects did not know about automatic resolution.
-    // Preserve their exact behavior instead of silently deriving a new size.
-    if (!Object.prototype.hasOwnProperty.call(settings, "resolution_mode")) {
-        setWidgetValue(node, "resolution_mode", "manual");
-    }
+    const projectMode = String(extender?.generation_mode || settings?.generation_mode || "ref2va") === "fl2va" ? "fl2va" : "ref2va";
+    setWidgetValue(node, "generation_mode", projectMode);
 
     const savedResolution = extender?.resolution;
+    const hasSavedMode =
+        Object.prototype.hasOwnProperty.call(settings, "resolution_mode")
+        || (savedResolution && Object.prototype.hasOwnProperty.call(savedResolution, "mode"));
+    // v14.24 and older .ext projects did not know about automatic resolution.
+    // Preserve their exact historical Manual behavior. Newer projects restore
+    // the mode that was actually saved instead of forcing every imported cache
+    // into Manual.
+    const savedMode = hasSavedMode && String(savedResolution?.mode || settings?.resolution_mode || "") === "auto_from_ref"
+        ? "auto_from_ref"
+        : "manual";
+    setWidgetValue(node, "resolution_mode", savedMode);
+
     const savedManualW = Number(savedResolution?.manual_width || settings?.width || 0);
     const savedManualH = Number(savedResolution?.manual_height || settings?.height || 0);
     rememberManualResolution(node, runtime, savedManualW, savedManualH);
+    runtime.resolutionGuide = String(savedResolution?.guide_ref || "");
+    runtime.resolutionFallback = Boolean(savedResolution?.fallback);
+
     const savedW = Number(savedResolution?.resolved_width || 0);
     const savedH = Number(savedResolution?.resolved_height || 0);
     if (savedW > 0 && savedH > 0) {
         runtime.expectedResolution = { width: savedW, height: savedH };
-        // Loading a portable project is the one place where the archived
-        // geometry is authoritative. Put that exact size in Manual mode so the
-        // imported latent cache can continue unchanged. The user can switch
-        // back to Auto or edit width/height afterwards; doing so starts a new
-        // cache at the newly requested resolution.
-        setWidgetValue(node, "width", savedW);
-        setWidgetValue(node, "height", savedH);
-        setWidgetValue(node, "resolution_mode", "manual");
-        rememberManualResolution(node, runtime, savedW, savedH);
-        runtime.projectResolutionLoaded = true;
+        runtime.resolvedWidth = savedW;
+        runtime.resolvedHeight = savedH;
+        // The imported cache geometry is authoritative, but its UI mode is not
+        // changed. Auto projects therefore reopen as Auto while keeping the
+        // exact archived resolved size until the next genuine resolution
+        // change. The separate Manual fallback above is left untouched.
+        setResolutionMirrorValues(node, runtime, savedW, savedH);
+        runtime.resolutionMirrorActive = savedMode === "auto_from_ref" && !runtime.resolutionFallback;
+        runtime.projectResolutionLoaded = false;
     }
 
     const rawRefs =
@@ -1867,6 +2293,7 @@ function applyProjectPayload(node, runtime, projectPayload) {
         || JSON.stringify({ version: 1, clips: extender?.clips || [] })
     );
     runtime.state = parseState(rawClips);
+    activateModeState(runtime.state, projectMode);
     // Loading a project mutates the disk cache outside ComfyUI's executor. A
     // one-shot token forces the Extender input hash to change even if every
     // visible setting happens to match the workflow that was previously run.
@@ -1991,16 +2418,25 @@ async function loadProjectFile(node, runtime, file) {
         applyProjectPayload(node, runtime, payload.project || {});
         runtime.cachedCount = Number(payload?.cache?.cached_count || 0);
         runtime.validatedCount = Number(payload?.cache?.validated_count || 0);
+        runtime.cachedClipIds = new Set(Array.isArray(payload?.cache?.cached_clip_ids) ? payload.cache.cached_clip_ids.map(String) : []);
+        runtime.validatedClipIds = new Set(Array.isArray(payload?.cache?.validated_clip_ids) ? payload.cache.validated_clip_ids.map(String) : []);
+        runtime.continuitySignatures = new Map(
+            Object.entries(payload?.cache?.continuity_signatures || {}).map(([key, value]) => [String(key), String(value || "")]).filter(([, value]) => Boolean(value))
+        );
         const loadedW = Number(payload?.cache?.resolved_width || runtime.expectedResolution?.width || 0);
         const loadedH = Number(payload?.cache?.resolved_height || runtime.expectedResolution?.height || 0);
         if (loadedW > 0 && loadedH > 0) {
             runtime.expectedResolution = { width: loadedW, height: loadedH };
-            setWidgetValue(node, "width", loadedW);
-            setWidgetValue(node, "height", loadedH);
-            setWidgetValue(node, "resolution_mode", "manual");
-            rememberManualResolution(node, runtime, loadedW, loadedH);
-            runtime.resolutionMirrorActive = false;
-            runtime.projectResolutionLoaded = true;
+            runtime.resolvedWidth = loadedW;
+            runtime.resolvedHeight = loadedH;
+            // applyProjectPayload already restored the saved Auto/Manual mode
+            // and the independent Manual fallback. Only mirror the exact cache
+            // geometry returned by the backend here; never force Auto projects
+            // back to Manual.
+            setResolutionMirrorValues(node, runtime, loadedW, loadedH);
+            const loadedMode = String(getWidget(node, "resolution_mode")?.value || "manual");
+            runtime.resolutionMirrorActive = loadedMode === "auto_from_ref" && !runtime.resolutionFallback;
+            runtime.projectResolutionLoaded = false;
             runtime.resolutionInvalidated = false;
         }
         runtime.cacheStateRestored = true;
@@ -2173,12 +2609,314 @@ function renderReferences(node, runtime) {
     }
 }
 
+
+
+function fl2vaPreviousFrameUrl(node, runtime, previousClipId) {
+    const clipId = String(previousClipId || "");
+    const params = new URLSearchParams();
+    params.set("owner_id", String(node?.id ?? ""));
+    params.set("clip_id", clipId);
+    // A known content signature gives the PNG a stable immutable URL. While the
+    // Final Decode has not produced metadata yet, use one stable revalidated URL
+    // instead of Date.now() cache-busting every UI render.
+    const signature = String(runtime?.continuitySignatures?.get(clipId) || "current");
+    params.set("v", signature);
+    return api.apiURL("/h3_extender/fl2va/last_frame?" + params.toString());
+}
+
+async function refreshFl2vaContinuitySignature(node, runtime, clipId) {
+    clipId = String(clipId || "");
+    if (!clipId || !runtime || runtime.continuitySignatures?.has(clipId)) return;
+    if (runtime.continuitySignatureRequests?.has(clipId)) return;
+    runtime.continuitySignatureRequests?.add(clipId);
+    try {
+        const params = new URLSearchParams();
+        params.set("owner_id", String(node?.id ?? ""));
+        params.set("clip_id", clipId);
+        const response = await fetch(
+            api.apiURL("/h3_extender/fl2va/continuity_meta?" + params.toString()),
+            { cache: "no-store" },
+        );
+        if (!response.ok) return;
+        const payload = await response.json().catch(() => ({}));
+        const signature = String(payload?.signature || "");
+        if (payload?.found && signature) {
+            runtime.continuitySignatures.set(clipId, signature);
+            render(node, runtime);
+        }
+    } catch (_) {
+        // The sidecar may legitimately not exist until Final Decode has run.
+    } finally {
+        runtime.continuitySignatureRequests?.delete(clipId);
+    }
+}
+
+function invalidateFl2vaPlanAndFollowers(runtime, startIndex, includeStart = true) {
+    const clips = runtime?.state?.clips || [];
+    let i = Math.max(0, Number(startIndex) || 0);
+    if (!includeStart) i += 1;
+    let touched = 0;
+    for (; i < clips.length; i++) {
+        if (i > startIndex && String(clips[i]?.first_source || "manual") !== "previous_clip") break;
+        const clip = clips[i];
+        clip.validated = false;
+        runtime.validatedClipIds?.delete(String(clip.id));
+        runtime.cachedClipIds?.delete(String(clip.id));
+        runtime.continuitySignatures?.delete(String(clip.id));
+        touched++;
+    }
+    if (touched) {
+        runtime.validatedCount = runtime.validatedClipIds?.size || 0;
+        runtime.cachedCount = runtime.cachedClipIds?.size || 0;
+    }
+    return touched;
+}
+
+function healFirstPlanPreviousSource(runtime) {
+    const first = runtime?.state?.clips?.[0];
+    if (!first || String(first.first_source || "manual") !== "previous_clip") return false;
+    first.first_source = "manual";
+    first.validated = false;
+    runtime.validatedClipIds?.delete(String(first.id));
+    runtime.cachedClipIds?.delete(String(first.id));
+    return true;
+}
+
+function renderFl2vaFrames(node, runtime) {
+    const row = runtime?.refsRow;
+    if (!row) return;
+    row.replaceChildren();
+
+    // Keep the FL2VA keyframes horizontally aligned with the clip cards below.
+    // One fixed-width group represents one card, and the First/Last thumbnails
+    // are centered inside that group. The cards use the same CARD_WIDTH and 9px
+    // inter-card gap, so scrolling the media strip reads naturally as a plan row.
+    for (let clipIndex = 0; clipIndex < (runtime.state?.clips || []).length; clipIndex++) {
+        const clip = runtime.state.clips[clipIndex];
+        const group = document.createElement("div");
+        group.style.flex = `0 0 ${CARD_WIDTH}px`;
+        group.style.width = `${CARD_WIDTH}px`;
+        group.style.minWidth = `${CARD_WIDTH}px`;
+        group.style.boxSizing = "border-box";
+        group.style.display = "flex";
+        group.style.justifyContent = "center";
+        group.style.alignItems = "flex-start";
+        group.style.gap = "7px";
+
+        for (const kind of ["first", "last"]) {
+            const key = `${kind}_frame`;
+            const label = kind === "first" ? "First" : "Last";
+            const ref = normalizeRefDescriptor(clip?.[key]);
+            clip[key] = ref;
+
+            const slot = document.createElement("div");
+            slot.style.flex = `0 0 ${FL2VA_FRAME_SLOT_WIDTH}px`;
+            slot.style.width = `${FL2VA_FRAME_SLOT_WIDTH}px`;
+            slot.style.minWidth = `${FL2VA_FRAME_SLOT_WIDTH}px`;
+            slot.style.boxSizing = "border-box";
+            slot.style.position = "relative";
+
+            const usingPrevious = kind === "first" && clipIndex > 0 && String(clip.first_source || "manual") === "previous_clip";
+            const controls = document.createElement("div");
+            controls.style.display = "flex";
+            controls.style.gap = "3px";
+            controls.style.width = "100%";
+
+            const load = document.createElement("button");
+            load.textContent = usingPrevious
+                ? "Manual"
+                : (ref ? `Replace ${label}` : `Load ${label}`);
+            load.title = usingPrevious
+                ? `Load a manual Clip ${clipIndex + 1} First frame and leave Previous mode`
+                : (ref
+                    ? `Replace Clip ${clipIndex + 1} ${label} frame: ${ref.original_name || "keyframe"}`
+                    : `Load Clip ${clipIndex + 1} ${label} frame`);
+            load.style.flex = "1 1 0";
+            load.style.minWidth = "0";
+            load.style.height = "23px";
+            load.style.padding = "2px 4px";
+            load.style.fontSize = "10px";
+            load.disabled = Boolean(runtime.refBusy || runtime.projectOperationBusy || projectBusy(runtime));
+            load.addEventListener("click", (event) => {
+                event.preventDefault();
+                if (load.disabled) return;
+                runtime.pendingFrameClip = clipIndex;
+                runtime.pendingFrameKind = kind;
+                runtime.frameFileInput?.click();
+            });
+            controls.appendChild(load);
+
+            if (kind === "first") {
+                const previous = document.createElement("button");
+                previous.type = "button";
+                previous.textContent = "⛓ Prev";
+                previous.title = clipIndex === 0
+                    ? "The first FL2VA plan has no previous generated frame"
+                    : (usingPrevious
+                        ? `Use the manual First frame instead of Clip ${clipIndex} selected pre-end continuity frame`
+                        : `Use Clip ${clipIndex} selected pre-end continuity frame as this plan's First frame`);
+                previous.style.flex = "0 0 49px";
+                previous.style.width = "49px";
+                previous.style.height = "23px";
+                previous.style.padding = "2px";
+                previous.style.fontSize = "9px";
+                previous.style.fontWeight = usingPrevious ? "700" : "400";
+                previous.style.background = usingPrevious ? "rgba(70,150,230,.42)" : "";
+                previous.disabled = clipIndex === 0 || Boolean(runtime.refBusy || runtime.projectOperationBusy || projectBusy(runtime));
+                previous.addEventListener("click", (event) => {
+                    event.preventDefault();
+                    event.stopPropagation();
+                    if (previous.disabled) return;
+                    clip.first_source = usingPrevious ? "manual" : "previous_clip";
+                    invalidateFl2vaPlanAndFollowers(runtime, clipIndex, true);
+                    runtime.statusText = clip.first_source === "previous_clip"
+                        ? `Clip ${clipIndex + 1} First → continuity frame of Clip ${clipIndex}`
+                        : `Clip ${clipIndex + 1} First → manual`;
+                    updateHidden(node, runtime);
+                    render(node, runtime);
+                });
+                controls.appendChild(previous);
+            }
+            slot.appendChild(controls);
+
+            const thumb = document.createElement("div");
+            thumb.style.marginTop = "2px";
+            thumb.style.width = "100%";
+            thumb.style.height = `${REF_THUMB_HEIGHT}px`;
+            thumb.style.boxSizing = "border-box";
+            thumb.style.border = "1px solid rgba(255,255,255,.15)";
+            thumb.style.borderRadius = "6px";
+            thumb.style.background = "rgba(0,0,0,.24)";
+            thumb.style.display = "flex";
+            thumb.style.alignItems = "center";
+            thumb.style.justifyContent = "center";
+            thumb.style.position = "relative";
+            thumb.style.overflow = "hidden";
+
+            if (usingPrevious) {
+                const fallback = document.createElement("div");
+                fallback.textContent = `⛓ C${clipIndex} end`;
+                fallback.style.fontSize = "11px";
+                fallback.style.fontWeight = "700";
+                fallback.style.opacity = ".72";
+                fallback.style.textAlign = "center";
+                fallback.style.padding = "4px";
+                thumb.appendChild(fallback);
+
+                const img = document.createElement("img");
+                const previousClipId = String(runtime.state.clips[clipIndex - 1]?.id || "");
+                void refreshFl2vaContinuitySignature(node, runtime, previousClipId);
+                img.src = fl2vaPreviousFrameUrl(node, runtime, previousClipId);
+                img.alt = `Selected pre-end continuity frame of Clip ${clipIndex}`;
+                img.title = `Selected pre-end continuity frame of Clip ${clipIndex} — used automatically as this First frame`;
+                img.style.position = "absolute";
+                img.style.inset = "0";
+                img.style.width = "100%";
+                img.style.height = "100%";
+                img.style.objectFit = "contain";
+                img.draggable = false;
+                img.addEventListener("load", () => { fallback.style.display = "none"; });
+                img.addEventListener("error", () => { img.remove(); fallback.style.display = "block"; });
+                thumb.appendChild(img);
+            } else if (ref) {
+                const img = document.createElement("img");
+                img.src = refImageUrl(ref);
+                img.alt = ref.original_name || `Clip ${clipIndex + 1} ${label} frame`;
+                img.title = `${ref.original_name || `Clip ${clipIndex + 1} ${label} frame`} — double-click to edit`;
+                img.style.width = "100%";
+                img.style.height = "100%";
+                img.style.objectFit = "contain";
+                img.style.cursor = "pointer";
+                img.draggable = false;
+                img.addEventListener("dblclick", (event) => {
+                    event.preventDefault();
+                    event.stopPropagation();
+                    openReferenceEditor(node, runtime, -1, ref, { clipIndex, kind });
+                });
+                thumb.appendChild(img);
+
+                const remove = document.createElement("button");
+                remove.textContent = "×";
+                remove.title = `Remove Clip ${clipIndex + 1} ${label} frame`;
+                remove.style.position = "absolute";
+                remove.style.top = "3px";
+                remove.style.right = "3px";
+                remove.style.width = "20px";
+                remove.style.height = "20px";
+                remove.style.minWidth = "20px";
+                remove.style.padding = "0";
+                remove.style.lineHeight = "16px";
+                remove.style.borderRadius = "10px";
+                remove.style.background = "rgba(0,0,0,.68)";
+                remove.disabled = Boolean(runtime.refBusy || runtime.projectOperationBusy || projectBusy(runtime));
+                remove.addEventListener("click", (event) => {
+                    event.preventDefault();
+                    event.stopPropagation();
+                    if (remove.disabled) return;
+                    removeClipFrame(node, runtime, clipIndex, kind);
+                });
+                thumb.appendChild(remove);
+            } else {
+                const empty = document.createElement("div");
+                empty.textContent = "+";
+                empty.style.fontSize = "24px";
+                empty.style.opacity = ".55";
+                thumb.appendChild(empty);
+            }
+            slot.appendChild(thumb);
+
+            const meta = document.createElement("div");
+            meta.style.marginTop = "1px";
+            meta.style.fontSize = "9px";
+            meta.style.lineHeight = "9px";
+            meta.style.opacity = ".6";
+            meta.style.textAlign = "center";
+            meta.style.whiteSpace = "nowrap";
+            meta.style.overflow = "hidden";
+            meta.style.textOverflow = "ellipsis";
+            meta.textContent = usingPrevious
+                ? `← C${clipIndex} continuity`
+                : (ref && ref.width > 0 && ref.height > 0
+                    ? `${Math.trunc(ref.width)}×${Math.trunc(ref.height)}`
+                    : "empty");
+            meta.title = usingPrevious
+                ? `Selected pre-end continuity frame of Clip ${clipIndex}`
+                : (ref?.original_name || "");
+            slot.appendChild(meta);
+
+            group.appendChild(slot);
+        }
+        row.appendChild(group);
+    }
+}
+
+
+function renderMediaStrip(node, runtime, fl2vaMode) {
+    if (runtime?.refsHeader) {
+        runtime.refsHeader.textContent = fl2vaMode
+            ? "FL2VA FIRST / LAST FRAMES — double-click a thumbnail to edit"
+            : "REFERENCE IMAGES — double-click a thumbnail to edit";
+    }
+    if (runtime?.refsRow) runtime.refsRow.style.gap = fl2vaMode ? "9px" : "7px";
+    if (fl2vaMode) renderFl2vaFrames(node, runtime);
+    else renderReferences(node, runtime);
+}
+
 function render(node, runtime) {
     const { state, cards, counter, status } = runtime;
-    renderReferences(node, runtime);
     cards.replaceChildren();
 
-    counter.textContent = `${state.clips.length} clip${state.clips.length > 1 ? "s" : ""} • ${refCount(runtime)} ref${refCount(runtime) === 1 ? "" : "s"}`;
+    const fl2vaMode = state.generation_mode === "fl2va";
+    syncModeSpecificNativeWidgets(node, runtime, fl2vaMode);
+    renderMediaStrip(node, runtime, fl2vaMode);
+    if (runtime.modeButton) {
+        runtime.modeButton.textContent = fl2vaMode ? "MODE: FL2VA" : "MODE: REF2VA";
+    }
+    if (runtime.generationModeWidget) runtime.generationModeWidget.value = fl2vaMode ? "fl2va" : "ref2va";
+    if (runtime.refsSection) runtime.refsSection.style.display = "block";
+    counter.textContent = fl2vaMode
+        ? `${state.clips.length} plan${state.clips.length > 1 ? "s" : ""} • FL2VA`
+        : `${state.clips.length} clip${state.clips.length > 1 ? "s" : ""} • ${refCount(runtime)} ref${refCount(runtime) === 1 ? "" : "s"}`;
     status.textContent = runtime.statusText || "Ready";
 
     state.clips.forEach((clip, index) => {
@@ -2194,7 +2932,7 @@ function render(node, runtime) {
         card.style.border = "1px solid rgba(255,255,255,.13)";
         card.style.display = "flex";
         card.style.flexDirection = "column";
-        card.style.minHeight = `${CARD_MIN_HEIGHT}px`;
+        card.style.minHeight = `${cardMinHeightForState(state)}px`;
 
         const st = cardStatus(runtime, clip, index);
         if (st === "rendering") {
@@ -2252,7 +2990,9 @@ function render(node, runtime) {
         colorButton.type = "button";
         colorButton.textContent = "🎨";
         const colorBusy = ["preparing", "sampling", "complete"].includes(String(runtime.activePhase || ""));
-        const colorCached = index < Number(runtime.cachedCount || 0);
+        const colorCached = fl2vaMode
+            ? runtime.cachedClipIds?.has(String(clip.id))
+            : index < Number(runtime.cachedCount || 0);
         colorButton.title = colorBusy
             ? "Color editing is disabled while the Extender is rendering"
             : colorCached
@@ -2300,19 +3040,65 @@ function render(node, runtime) {
             st === "cached" ? "CACHE" : "○";
 
         head.append(title, name, colorWrap, badge);
+        if (fl2vaMode) {
+            const insertButton = document.createElement("button");
+            insertButton.type = "button";
+            insertButton.textContent = "+";
+            insertButton.title = "Insert a new independent FL2VA plan after this one";
+            insertButton.style.width = "24px";
+            insertButton.style.height = "22px";
+            insertButton.style.padding = "0";
+            insertButton.addEventListener("click", (e) => {
+                e.preventDefault();
+                state.clips.splice(index + 1, 0, newClip(index + 1));
+                // A former follower moved one position to the right. If it was
+                // linked to "Previous", its predecessor changed and its chain
+                // must be regenerated.
+                if (String(state.clips[index + 2]?.first_source || "manual") === "previous_clip") {
+                    invalidateFl2vaPlanAndFollowers(runtime, index + 2, true);
+                }
+                updateHidden(node, runtime);
+                render(node, runtime);
+            });
+            const deleteButton = document.createElement("button");
+            deleteButton.type = "button";
+            deleteButton.textContent = "×";
+            deleteButton.title = "Remove this FL2VA plan";
+            deleteButton.style.width = "24px";
+            deleteButton.style.height = "22px";
+            deleteButton.style.padding = "0";
+            deleteButton.disabled = state.clips.length <= 1;
+            deleteButton.addEventListener("click", (e) => {
+                e.preventDefault();
+                if (state.clips.length <= 1) return;
+                state.clips.splice(index, 1);
+                healFirstPlanPreviousSource(runtime);
+                if (String(state.clips[index]?.first_source || "manual") === "previous_clip") {
+                    invalidateFl2vaPlanAndFollowers(runtime, index, true);
+                }
+                updateHidden(node, runtime);
+                render(node, runtime);
+            });
+            head.append(insertButton, deleteButton);
+        }
         card.appendChild(head);
+
+        // FL2VA First/Last frames live in the shared media strip above the
+        // cards, replacing the Ref2VA reference-image strip. Cards therefore
+        // keep the same compact structure in both modes.
 
         card.appendChild(makeFieldLabel("Prompt"));
         const prompt = document.createElement("textarea");
         prompt.value = clip.prompt;
         prompt.spellcheck = false;
         prompt.style.width = "100%";
-        // The prompt area is the flexible part of each card. When the node is
-        // stretched vertically, extra height goes here instead of becoming an
-        // empty block below the card controls.
-        prompt.style.height = "190px";
-        prompt.style.minHeight = "190px";
-        prompt.style.flex = "1 1 190px";
+        // The prompt is the flexible section of the card. Keep a real minimum
+        // but allow it to absorb extra height without pushing controls on top
+        // of one another.
+        const promptMinHeight = 170;
+        prompt.style.height = `${promptMinHeight}px`;
+        prompt.style.minHeight = `${promptMinHeight}px`;
+        prompt.style.flex = `1 1 ${promptMinHeight}px`;
         prompt.style.resize = "vertical";
         prompt.style.boxSizing = "border-box";
         prompt.style.background = "rgba(0,0,0,.27)";
@@ -2525,16 +3311,21 @@ function render(node, runtime) {
         validated.type = "checkbox";
         validated.checked = clip.validated;
         validated.addEventListener("change", () => {
-            if (validated.checked) {
-                clip.validated = true;
+            if (fl2vaMode) {
+                // FL2VA plans are independent: validation is per card and never
+                // forces later plans open.
+                clip.validated = Boolean(validated.checked);
             } else {
-                invalidateFrom(state, index);
-            }
-            // A valid chain is necessarily a continuous validated prefix.
-            let open = false;
-            for (const c of state.clips) {
-                if (open) c.validated = false;
-                else if (!c.validated) open = true;
+                if (validated.checked) {
+                    clip.validated = true;
+                } else {
+                    invalidateFrom(state, index);
+                }
+                let open = false;
+                for (const c of state.clips) {
+                    if (open) c.validated = false;
+                    else if (!c.validated) open = true;
+                }
             }
             updateHidden(node, runtime);
             render(node, runtime);
@@ -2572,9 +3363,10 @@ function syncDomHeight(node, runtime, forceMin = false, retry = 0) {
     if (mode === "nodes2") {
         const currentH = Number(node.size?.[1] || 0);
         const y = Number(runtime.domWidget.last_y);
+        const nodes2MinH = nodes2MinHeightForState(runtime.state);
         const fallbackH = Number.isFinite(y) && y > 0
-            ? y + NODES2_MIN_HEIGHT + BOTTOM_PAD
-            : NODES2_MIN_HEIGHT + 180;
+            ? y + nodes2MinH + BOTTOM_PAD
+            : nodes2MinH + 180;
 
         // One-time recovery for workflows that were already saved with a
         // runaway height by an older build. This is not DOM-driven resizing;
@@ -2612,8 +3404,8 @@ function syncDomHeight(node, runtime, forceMin = false, retry = 0) {
         // remount the element until a page refresh. Keep a real intrinsic
         // minimum instead and let Vue stretch the row/child naturally.
         runtime.root.style.height = "auto";
-        runtime.root.style.minHeight = `${NODES2_MIN_HEIGHT}px`;
-        runtime.root.style.setProperty("--comfy-widget-min-height", `${NODES2_MIN_HEIGHT}px`);
+        runtime.root.style.minHeight = `${nodes2MinH}px`;
+        runtime.root.style.setProperty("--comfy-widget-min-height", `${nodes2MinH}px`);
         runtime.root.style.maxHeight = "none";
         runtime.root.style.flex = "1 1 auto";
         runtime.root.style.paddingTop = `${5 + NODES2_TOP_GAP}px`;
@@ -2626,7 +3418,7 @@ function syncDomHeight(node, runtime, forceMin = false, retry = 0) {
         // The horizontal scrollbar has reserved space below the cards. Give the
         // row enough intrinsic height for both the card and that gutter so the
         // top/bottom cannot be shaved off by grid rounding at certain zooms.
-        runtime.cards.style.minHeight = `${NODES2_CARDS_MIN_HEIGHT}px`;
+        runtime.cards.style.minHeight = `${cardMinHeightForState(runtime.state) + CARD_SCROLLBAR_SPACE}px`;
         return;
     }
 
@@ -2650,7 +3442,8 @@ function syncDomHeight(node, runtime, forceMin = false, retry = 0) {
     try {
         let w = Math.max(NODE_MIN_WIDTH, Number(node.size?.[0] || NODE_MIN_WIDTH));
         let h = Number(node.size?.[1] || 0);
-        const minNodeH = y + UI_MIN_HEIGHT + BOTTOM_PAD;
+        const uiMinH = uiMinHeightForState(runtime.state);
+        const minNodeH = y + uiMinH + BOTTOM_PAD;
         const returningFromNodes2 = runtime.lastRenderMode === "nodes2";
 
         if (returningFromNodes2) {
@@ -2680,7 +3473,7 @@ function syncDomHeight(node, runtime, forceMin = false, retry = 0) {
         }
 
         const actualH = Number(node.size?.[1] || h);
-        const available = Math.max(UI_MIN_HEIGHT, actualH - y - BOTTOM_PAD);
+        const available = Math.max(uiMinH, actualH - y - BOTTOM_PAD);
         runtime.root.style.height = `${available}px`;
         runtime.cards.style.height = `${Math.max(340, available - 55 - REF_SECTION_HEIGHT)}px`;
         runtime.cards.style.flex = "0 0 auto";
@@ -2707,22 +3500,35 @@ function buildUi(node) {
 
     const jsonWidget = getWidget(node, "clips_json");
     const refsWidget = getWidget(node, "refs_json");
-    if (!jsonWidget || !refsWidget) return null;
+    const generationModeWidget = getWidget(node, "generation_mode");
+    const contextLengthWidget = getWidget(node, "context_length");
+    const audioContextLengthWidget = getWidget(node, "audio_context_length");
+    if (!jsonWidget || !refsWidget || !generationModeWidget) return null;
     hideNativeWidget(node, jsonWidget);
     hideNativeWidget(node, refsWidget);
+    hideNativeWidget(node, generationModeWidget);
 
     const state = parseState(jsonWidget.value);
+    // clips_json is the durable source of truth for the active mode. On workflow
+    // startup the hidden native combo may still be at its schema default before
+    // ComfyUI restores widget values; letting that default win forced every saved
+    // FL2VA workflow to reopen as REF2VA. Old states without a mode marker already
+    // parse as REF2VA, so this remains backward compatible.
+    const persistedMode = state.generation_mode === "fl2va" ? "fl2va" : "ref2va";
+    generationModeWidget.value = persistedMode;
+    activateModeState(state, persistedMode);
     const refsState = parseRefsState(refsWidget.value);
 
     const root = document.createElement("div");
     root.style.width = "100%";
     root.style.minWidth = "0";
-    root.style.height = `${UI_MIN_HEIGHT}px`;
-    root.style.minHeight = `${UI_MIN_HEIGHT}px`;
+    const initialUiMinHeight = uiMinHeightForState(state);
+    root.style.height = `${initialUiMinHeight}px`;
+    root.style.minHeight = `${initialUiMinHeight}px`;
     // Official DOMWidgetImpl.computeLayoutSize() reads this CSS variable as a
     // fallback to getMinHeight. Keeping both makes the intrinsic contract clear
     // to current and slightly older Nodes 2.0 frontends.
-    root.style.setProperty("--comfy-widget-min-height", `${NODES2_MIN_HEIGHT}px`);
+    root.style.setProperty("--comfy-widget-min-height", `${nodes2MinHeightForState(state)}px`);
     root.style.boxSizing = "border-box";
     root.style.display = "flex";
     root.style.flexDirection = "column";
@@ -2735,6 +3541,29 @@ function buildUi(node) {
     toolbar.style.gap = "7px";
     toolbar.style.alignItems = "center";
     toolbar.style.marginBottom = "7px";
+
+    const modeButton = document.createElement("button");
+    modeButton.title = "Switch between Ref2VA + Motion Context and independent FL2VA plans";
+    modeButton.addEventListener("click", (e) => {
+        e.preventDefault();
+        if (projectBusy(runtime)) return;
+        const current = runtime.state.generation_mode === "fl2va" ? "fl2va" : "ref2va";
+        const next = current === "fl2va" ? "ref2va" : "fl2va";
+        // REF2VA and FL2VA own completely independent card timelines. Store the
+        // active array before switching and restore the other mode's array;
+        // edits, insertions and deletions in one mode never mutate the other.
+        activateModeState(runtime.state, next);
+        generationModeWidget.value = next;
+        runtime.cachedClipIds = new Set();
+        runtime.validatedClipIds = new Set();
+        runtime.cachedCount = 0;
+        runtime.validatedCount = 0;
+        runtime.cacheStateRestored = false;
+        updateHidden(node, runtime);
+        render(node, runtime);
+        restoreCacheState(node, runtime);
+        requestAnimationFrame(() => syncDomHeight(node, runtime, true));
+    });
 
     const add = document.createElement("button");
     add.textContent = "+ Add Clip";
@@ -2801,12 +3630,17 @@ function buildUi(node) {
     status.style.textOverflow = "ellipsis";
     status.style.maxWidth = "55%";
 
-    toolbar.append(add, remove, saveProjectButton, loadProjectButton, counter, status, projectFileInput);
+    toolbar.append(modeButton, add, remove, saveProjectButton, loadProjectButton, counter, status, projectFileInput);
 
     const refFileInput = document.createElement("input");
     refFileInput.type = "file";
     refFileInput.accept = "image/*,.png,.jpg,.jpeg,.webp,.bmp,.tif,.tiff";
     refFileInput.style.display = "none";
+
+    const frameFileInput = document.createElement("input");
+    frameFileInput.type = "file";
+    frameFileInput.accept = "image/*,.png,.jpg,.jpeg,.webp,.bmp,.tif,.tiff";
+    frameFileInput.style.display = "none";
 
     const refsSection = document.createElement("div");
     refsSection.style.height = `${REF_SECTION_HEIGHT}px`;
@@ -2850,10 +3684,10 @@ function buildUi(node) {
     cards.style.scrollbarGutter = "stable";
     cards.style.boxSizing = "border-box";
     cards.style.scrollBehavior = "smooth";
-    cards.style.height = `${UI_MIN_HEIGHT - 55 - REF_SECTION_HEIGHT}px`;
-    cards.style.minHeight = `${NODES2_CARDS_MIN_HEIGHT}px`;
+    cards.style.height = `${Math.max(340, initialUiMinHeight - 55 - REF_SECTION_HEIGHT)}px`;
+    cards.style.minHeight = `${cardMinHeightForState(state) + CARD_SCROLLBAR_SPACE}px`;
 
-    root.append(toolbar, refsSection, cards, refFileInput);
+    root.append(toolbar, refsSection, cards, refFileInput, frameFileInput);
 
     const restoredValidatedPrefix = validatedPrefixFromState(state);
     const runtime = {
@@ -2864,6 +3698,7 @@ function buildUi(node) {
         root,
         toolbar,
         refsSection,
+        refsHeader,
         refsRow,
         cards,
         counter,
@@ -2872,7 +3707,14 @@ function buildUi(node) {
         loadProjectButton,
         projectFileInput,
         refFileInput,
+        frameFileInput,
+        generationModeWidget,
+        contextLengthWidget,
+        audioContextLengthWidget,
+        modeButton,
         pendingRefSlot: -1,
+        pendingFrameClip: -1,
+        pendingFrameKind: "",
         refBusy: false,
         projectOperationBusy: false,
         projectName: String(node?.properties?.h3_project_name || ""),
@@ -2916,6 +3758,15 @@ function buildUi(node) {
         loraListLoading: false,
         loraListLoaded: false,
         loraListError: "",
+        cachedClipIds: new Set(),
+        validatedClipIds: new Set(),
+        continuitySignatures: new Map(),
+        continuitySignatureRequests: new Set(),
+        modeValidationState: {
+            [state.generation_mode === "fl2va" ? "fl2va" : "ref2va"]: new Map(
+                (state.clips || []).map((clip) => [String(clip.id), Boolean(clip.validated)])
+            ),
+        },
         ready: false,
     };
 
@@ -2929,6 +3780,18 @@ function buildUi(node) {
         }
     });
 
+    frameFileInput.addEventListener("change", async () => {
+        const file = frameFileInput.files?.[0];
+        const clipIndex = Number(runtime.pendingFrameClip);
+        const kind = String(runtime.pendingFrameKind || "");
+        frameFileInput.value = "";
+        runtime.pendingFrameClip = -1;
+        runtime.pendingFrameKind = "";
+        if (file && Number.isInteger(clipIndex) && clipIndex >= 0 && ["first", "last"].includes(kind)) {
+            await uploadClipFrame(node, runtime, clipIndex, kind, file);
+        }
+    });
+
     const domWidget = node.addDOMWidget("h3_extender_timeline", "timeline", root, {
         serialize: false,
         hideOnZoom: false,
@@ -2936,23 +3799,26 @@ function buildUi(node) {
         // Give Nodes 2.0 a little more intrinsic room, while keeping the old
         // Legacy minimum unchanged.
         getMinHeight: () =>
-            globalThis.LiteGraph?.vueNodesMode ? NODES2_MIN_HEIGHT : UI_MIN_HEIGHT,
+            globalThis.LiteGraph?.vueNodesMode
+                ? nodes2MinHeightForState(runtime.state)
+                : uiMinHeightForState(runtime.state),
         getHeight: () => runtime.domHeight,
         afterResize: (resizedNode) => {
             const mode = domWidgetRenderMode(root);
             if (mode === "nodes2") {
                 // Re-assert only intrinsic CSS. Never derive anything from
                 // node.size while Vue is resolving its grid.
+                const nodes2MinH = nodes2MinHeightForState(runtime.state);
                 root.style.height = "auto";
-                root.style.minHeight = `${NODES2_MIN_HEIGHT}px`;
-                root.style.setProperty("--comfy-widget-min-height", `${NODES2_MIN_HEIGHT}px`);
+                root.style.minHeight = `${nodes2MinH}px`;
+                root.style.setProperty("--comfy-widget-min-height", `${nodes2MinH}px`);
                 root.style.maxHeight = "none";
                 root.style.flex = "1 1 auto";
                 root.style.paddingTop = `${5 + NODES2_TOP_GAP}px`;
                 root.style.overflow = "visible";
                 cards.style.height = "auto";
                 cards.style.flex = "1 1 auto";
-                cards.style.minHeight = `${NODES2_CARDS_MIN_HEIGHT}px`;
+                cards.style.minHeight = `${cardMinHeightForState(runtime.state) + CARD_SCROLLBAR_SPACE}px`;
                 runtime.lastRenderMode = "nodes2";
             } else if (mode === "legacy") {
                 requestAnimationFrame(() => syncDomHeight(resizedNode, runtime, false));
@@ -2973,6 +3839,13 @@ function buildUi(node) {
     node.onConfigure = function (info) {
         if (oldConfigure) oldConfigure.apply(this, arguments);
 
+        // Keep a copy of the serialized clips_json from the configure payload.
+        // On a browser F5/Refresh, Nodes 2.0 can restore native widget.value a
+        // frame later than onConfigure; reading runtime.jsonWidget.value there
+        // would therefore see the schema default and incorrectly select Ref2VA.
+        const configuredStateRaw = configuredClipsStateJson(info, runtime.jsonWidget.value);
+        if (configuredStateRaw) runtime.jsonWidget.value = configuredStateRaw;
+
         // Workflow widget arrays are positional. The two v14.25 resolution
         // widgets were intentionally appended after clips_json so old values do
         // not shift. If this is an older workflow, force Manual to preserve its
@@ -2988,7 +3861,19 @@ function buildUi(node) {
         requestAnimationFrame(() => {
             const removedLegacyRefs = removeLegacyImageRefInputs(this);
             syncDynamicAVReferenceInputs(this);
-            runtime.state = parseState(runtime.jsonWidget.value);
+            // Use the captured configure payload, not the potentially late Vue
+            // widget restore. This makes F5/Refresh follow the same deterministic
+            // path as a full ComfyUI restart.
+            runtime.state = parseState(configuredStateRaw || runtime.jsonWidget.value);
+            runtime.jsonWidget.value = serializeState(runtime.state);
+            // Same startup rule as buildUi(): persisted card state owns the mode.
+            // This prevents the hidden native widget's transient default from
+            // switching a saved FL2VA workflow back to REF2VA during configure.
+            const persistedMode = runtime.state.generation_mode === "fl2va" ? "fl2va" : "ref2va";
+            const modeWidget = getWidget(this, "generation_mode");
+            if (modeWidget) modeWidget.value = persistedMode;
+            activateModeState(runtime.state, persistedMode);
+            snapshotModeValidation(runtime, runtime.state.generation_mode);
             runtime.refsState = parseRefsState(runtime.refsWidget.value);
             updateRefsHidden(this, runtime);
             const restoredValidatedPrefix = validatedPrefixFromState(runtime.state);
@@ -3010,6 +3895,24 @@ function buildUi(node) {
             syncResolutionMirror(this, runtime);
             syncDomHeight(this, runtime, true);
         });
+    };
+
+    const oldSerialize = node.onSerialize;
+    node.onSerialize = function (info) {
+        const result = oldSerialize ? oldSerialize.apply(this, arguments) : undefined;
+        // Flush the custom runtime state into the native serialized payload too.
+        // This is especially important for ComfyUI's in-browser refresh path,
+        // which can snapshot the graph without a backend execution in between.
+        // Do it after the previous hook so no older serializer can overwrite it.
+        if (runtime?.state) {
+            const raw = serializeState(runtime.state);
+            runtime.jsonWidget.value = raw;
+            if (runtime.generationModeWidget) {
+                runtime.generationModeWidget.value = runtime.state.generation_mode === "fl2va" ? "fl2va" : "ref2va";
+            }
+            replaceConfiguredClipsStateJson(info, raw);
+        }
+        return result;
     };
 
     requestAnimationFrame(() => {
@@ -3119,8 +4022,12 @@ app.registerExtension({
             const runtime = buildUi(node);
             if (!runtime || !detail?.clips_json) return;
 
-            runtime.jsonWidget.value = String(detail.clips_json);
-            runtime.state = parseState(detail.clips_json);
+            runtime.state = mergeActiveStateJson(
+                runtime,
+                detail.clips_json,
+                runtime.state?.generation_mode || "ref2va",
+            );
+            runtime.jsonWidget.value = serializeState(runtime.state);
             const count = Number(detail?.prompt_count || runtime.state.clips.length || 0);
             const source = String(detail?.source || "External prompt pack");
             runtime.statusText = `${source}: imported ${count} prompt${count === 1 ? "" : "s"} → ${count} clip${count === 1 ? "" : "s"}`;
@@ -3218,8 +4125,19 @@ app.registerExtension({
             if (!info) return;
 
             if (info.clips_json) {
-                runtime.jsonWidget.value = info.clips_json;
-                runtime.state = parseState(info.clips_json);
+                runtime.state = mergeActiveStateJson(
+                    runtime,
+                    info.clips_json,
+                    info.generation_mode || runtime.state?.generation_mode || "ref2va",
+                );
+                runtime.jsonWidget.value = serializeState(runtime.state);
+            }
+            if (info.generation_mode) {
+                activateModeState(
+                    runtime.state,
+                    String(info.generation_mode) === "fl2va" ? "fl2va" : "ref2va",
+                );
+                if (runtime.generationModeWidget) runtime.generationModeWidget.value = runtime.state.generation_mode;
             }
             if (info.refs_json) {
                 runtime.refsWidget.value = info.refs_json;
@@ -3245,6 +4163,12 @@ app.registerExtension({
 
             runtime.cachedCount = Number(info.cached_count || 0);
             runtime.validatedCount = Number(info.validated_count || 0);
+            runtime.cachedClipIds = new Set(Array.isArray(info.cached_clip_ids) ? info.cached_clip_ids.map(String) : []);
+            runtime.validatedClipIds = new Set(Array.isArray(info.validated_clip_ids) ? info.validated_clip_ids.map(String) : []);
+            runtime.continuitySignatures = new Map(
+                Object.entries(info?.continuity_signatures || {}).map(([key, value]) => [String(key), String(value || "")]).filter(([, value]) => Boolean(value))
+            );
+            snapshotModeValidation(runtime, runtime.state?.generation_mode);
             runtime.resolvedWidth = Number(info.resolved_width || 0);
             runtime.resolvedHeight = Number(info.resolved_height || 0);
             runtime.resolutionGuide = String(info.resolution_guide || "");

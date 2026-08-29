@@ -75,6 +75,23 @@ function getWidget(node, name) {
     return node?.widgets?.find((w) => w?.name === name);
 }
 
+function hideCompatibilityWidget(node, name) {
+    const widget = getWidget(node, name);
+    if (!widget || widget.__h3CompatibilityHidden) return;
+
+    // Keep the widget in node.widgets so legacy widgets_values arrays retain
+    // their original positional layout, but remove it from both legacy canvas
+    // layout and Nodes 2.0 DOM rendering. Its backend value is ignored.
+    widget.__h3CompatibilityHidden = true;
+    widget.hidden = true;
+    widget.computeSize = () => [0, -4];
+    try { widget.type = "converted-widget"; } catch (_) {}
+    for (const element of [widget.element, widget.inputEl, widget.domWidget?.element]) {
+        if (element?.style) element.style.display = "none";
+    }
+    node?.graph?.setDirtyCanvas(true, true);
+}
+
 function isFalseValue(value) {
     return value === false || value === 0 || value === "false";
 }
@@ -230,29 +247,117 @@ function syncPreviewColorFilter(state) {
 }
 
 
-function findUpstreamExtenderId(node) {
+function findUpstreamExtenderNode(node) {
     const graph = node?.graph || app.graph;
     if (!graph) return null;
-
     const cacheInput = (node.inputs || []).find((input) => input?.name === "cache");
     const linkId = cacheInput?.link;
     if (linkId == null) return null;
-
     const link = graph.links?.[linkId];
     if (!link) return null;
-
     const origin = graph.getNodeById?.(link.origin_id)
         || (graph._nodes || []).find((n) => String(n?.id) === String(link.origin_id));
     if (!origin) return null;
+    if (origin?.comfyClass === EXTENDER_TARGET || origin?.type === EXTENDER_TARGET) return origin;
+    return null;
+}
 
-    if (
-        origin?.comfyClass === EXTENDER_TARGET ||
-        origin?.type === EXTENDER_TARGET
-    ) {
-        return origin.id;
+function findUpstreamExtenderId(node) {
+    return findUpstreamExtenderNode(node)?.id ?? null;
+}
+
+function upstreamGenerationMode(node) {
+    const origin = findUpstreamExtenderNode(node);
+
+    // The Extender custom runtime owns the authoritative mode once its UI has
+    // been restored. Prefer it over the hidden native combo, whose default can
+    // transiently be Ref2VA during Nodes 2.0 workflow startup/refresh.
+    const runtimeMode = String(origin?.__h3Extender?.state?.generation_mode || "").toLowerCase();
+    if (runtimeMode === "fl2va" || runtimeMode === "ref2va") return runtimeMode;
+
+    // clips_json also persists the active mode. It gives us a second stable
+    // source before falling back to the native generation_mode widget.
+    const clipsWidget = (origin?.widgets || []).find((w) => w?.name === "clips_json");
+    if (typeof clipsWidget?.value === "string") {
+        try {
+            const parsed = JSON.parse(clipsWidget.value);
+            const persisted = String(parsed?.generation_mode || "").toLowerCase();
+            if (persisted === "fl2va" || persisted === "ref2va") return persisted;
+        } catch (_) {}
     }
 
-    return null;
+    const widget = (origin?.widgets || []).find((w) => w?.name === "generation_mode");
+    return String(widget?.value || "ref2va") === "fl2va" ? "fl2va" : "ref2va";
+}
+
+function loadPreviewSource(node, state, url) {
+    if (!state?.video) return;
+
+    const video = state.video;
+    const autoplayWidget = getWidget(node, "autoplay");
+    const rawAutoplay = autoplayWidget?.value;
+    const wantsAutoplay = rawAutoplay === true || rawAutoplay === 1 || String(rawAutoplay).toLowerCase() === "true";
+
+    // Always fetch enough media to paint frame 0 after workflow restore.
+    video.preload = "auto";
+    video.autoplay = wantsAutoplay;
+
+    // Each source load gets its own token so delayed media events from an older
+    // preview cannot pause/play the newly restored preview.
+    state.previewLoadToken = Number(state.previewLoadToken || 0) + 1;
+    const loadToken = state.previewLoadToken;
+
+    const paintPausedFrame = () => {
+        if (state.previewLoadToken !== loadToken) return;
+        try {
+            video.pause();
+            const target = Number.isFinite(video.duration) && video.duration > 0
+                ? Math.min(0.001, Math.max(0, video.duration / 100000))
+                : 0.001;
+            if (Math.abs(Number(video.currentTime || 0) - target) > 1e-6) {
+                video.currentTime = target;
+            }
+        } catch (_) {}
+    };
+
+    let autoplayStarted = false;
+    const tryAutoplay = () => {
+        if (!wantsAutoplay || autoplayStarted || state.previewLoadToken !== loadToken) return;
+        if (video.readyState < 2) return;
+        autoplayStarted = true;
+        // play() is intentionally attempted only once decoded data exists.
+        // Calling it immediately after assigning src can reject during a page
+        // restore even when autoplay is enabled for the site.
+        const playPromise = video.play();
+        if (playPromise?.catch) {
+            playPromise.catch(() => {
+                autoplayStarted = false;
+                // Keep a visible first frame if the browser itself blocks
+                // audible autoplay; a later canplay event gets one final try.
+                if (video.readyState >= 2) {
+                    const retry = () => {
+                        if (state.previewLoadToken !== loadToken || !wantsAutoplay || !video.paused) return;
+                        video.play().catch(() => {});
+                    };
+                    video.addEventListener("canplay", retry, { once: true });
+                }
+            });
+        }
+    };
+
+    video.addEventListener("loadeddata", () => {
+        if (state.previewLoadToken !== loadToken) return;
+        if (wantsAutoplay) tryAutoplay();
+        else paintPausedFrame();
+    }, { once: true });
+
+    video.addEventListener("canplay", () => {
+        if (state.previewLoadToken !== loadToken) return;
+        if (wantsAutoplay && video.paused) tryAutoplay();
+    }, { once: true });
+
+    video.src = url;
+    video.load();
 }
 
 async function restorePreviewOnLoad(node, state, attempt = 0) {
@@ -274,14 +379,25 @@ async function restorePreviewOnLoad(node, state, attempt = 0) {
         const params = new URLSearchParams();
         params.set("owner_id", String(ownerId));
         params.set("final_id", String(node.id));
+        params.set("mode", upstreamGenerationMode(node));
 
         const response = await fetch(
             api.apiURL("/h3_extender/restored_preview?" + params.toString())
         );
-        if (!response.ok) return;
+        if (!response.ok) {
+            if (attempt < 12) setTimeout(() => restorePreviewOnLoad(node, state, attempt + 1), 120);
+            return;
+        }
 
         const payload = await response.json();
-        if (!payload?.found || !payload?.video?.filename) return;
+        if (!payload?.found || !payload?.video?.filename) {
+            // During workflow restore the upstream Extender can finish restoring
+            // its FL/REF state a few frames after Final Decode. Retry briefly so
+            // we do not permanently miss the preview because the first request
+            // looked at the transient/default mode.
+            if (attempt < 12) setTimeout(() => restorePreviewOnLoad(node, state, attempt + 1), 120);
+            return;
+        }
         if (state.liveLoaded) return;
 
         const clips = Number(payload.clip_count || 0);
@@ -290,18 +406,15 @@ async function restorePreviewOnLoad(node, state, attempt = 0) {
             `RESTORED PREVIEW — ${clips} clip${clips === 1 ? "" : "s"} (${frames} frames)`;
 
         state.currentVideoInfo = { ...payload.video };
+        state.currentPreviewMeta = {
+            clip_count: clips,
+            frame_count: frames,
+            mode: "restored",
+        };
         state.currentFps = Number(payload.video?.frame_rate || state.currentFps || 24);
         state.colorTimeline = Array.isArray(payload.color_timeline) ? payload.color_timeline : [];
         state.saveButton.disabled = false;
-        state.video.src = mediaUrl(payload.video) + "&t=" + Date.now();
-        state.video.load();
-
-        // Browsers can block autoplay after a page reload. The preview is still
-        // immediately visible and ready; play() succeeds when policy allows it.
-        const autoplayWidget = getWidget(node, "autoplay");
-        if (autoplayWidget && autoplayWidget.value) {
-            state.video.play().catch(() => {});
-        }
+        loadPreviewSource(node, state, mediaUrl(payload.video) + "&t=" + Date.now());
         state.restoreLoaded = true;
 
         requestAnimationFrame(() => {
@@ -483,6 +596,7 @@ async function saveCurrentPreview(node, state) {
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({
                 owner_id: findUpstreamExtenderId(node),
+                generation_mode: upstreamGenerationMode(node),
                 filename: info.filename,
                 subfolder: info.subfolder || "",
                 type: info.type || "temp",
@@ -570,7 +684,7 @@ function makePlayer(node) {
     video.controls = true;
     video.loop = true;
     video.playsInline = true;
-    video.preload = "metadata";
+    video.preload = "auto";
     video.style.display = "block";
     video.style.width = "100%";
     video.style.height = `${PLAYER_MIN_HEIGHT - LABEL_HEIGHT - PREVIEW_HEADER_GAP - 4}px`;
@@ -591,6 +705,7 @@ function makePlayer(node) {
         video,
         widget: null,
         currentVideoInfo: null,
+        currentPreviewMeta: null,
         currentFps: 24,
         colorTimeline: [],
         saveInProgress: false,
@@ -680,6 +795,7 @@ function refreshImportedProjectPreview(ownerId) {
         state.restoreLoaded = false;
         state.restoreRequestRunning = false;
         state.currentVideoInfo = null;
+        state.currentPreviewMeta = null;
         state.colorTimeline = [];
         state.video.style.filter = "none";
         state.saveButton.disabled = true;
@@ -749,11 +865,13 @@ app.registerExtension({
                 : undefined;
 
             stripFinalDecodeOutputs(this);
+            hideCompatibilityWidget(this, "fps");
             const state = makePlayer(this);
 
             requestAnimationFrame(() => {
                 requestAnimationFrame(() => {
                     stripFinalDecodeOutputs(this);
+                    hideCompatibilityWidget(this, "fps");
                     syncPlayerToNode(this, state, true);
                     restorePreviewOnLoad(this, state);
                 });
@@ -771,9 +889,11 @@ app.registerExtension({
                 : undefined;
 
             stripFinalDecodeOutputs(this);
+            hideCompatibilityWidget(this, "fps");
             const state = makePlayer(this);
             requestAnimationFrame(() => {
                 stripFinalDecodeOutputs(this);
+                hideCompatibilityWidget(this, "fps");
                 restorePreviewOnLoad(this, state);
             });
             return r;
@@ -802,16 +922,15 @@ app.registerExtension({
             }
 
             state.currentVideoInfo = { ...info };
+            state.currentPreviewMeta = {
+                clip_count: Number(meta?.total_clips || 0),
+                frame_count: Number(meta?.preview_frames || 0),
+                mode: String(meta?.mode || ""),
+            };
             state.currentFps = Number(info.frame_rate || state.currentFps || 24);
             state.colorTimeline = Array.isArray(meta?.color_timeline) ? meta.color_timeline : [];
             state.saveButton.disabled = false;
-            state.video.src = mediaUrl(info) + "&t=" + Date.now();
-            state.video.load();
-            
-            const autoplayWidget = getWidget(this, "autoplay");
-            if (autoplayWidget && autoplayWidget.value) {
-                state.video.play().catch(() => {});
-            }
+            loadPreviewSource(this, state, mediaUrl(info) + "&t=" + Date.now());
 
             // Do not reset a node the user already enlarged.
             // Only enforce the minimum if necessary, then fit the player
