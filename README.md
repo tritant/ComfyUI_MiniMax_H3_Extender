@@ -6,6 +6,26 @@ The node combines **Ref2VA conditioning, Motion Context, disk caching, multi-cli
 
 ---
 
+## 🆕 News — Dynamic FL2VA Guides & Native VIDEO Output
+
+### 🎯 Dynamic Image Guides for FL2VA
+FL2VA clips can now use up to **3 independent image guides**, each placed at an exact `frame_idx`.
+
+This is based on ComfyUI's native **MiniMaxH3AddGuide** support introduced in PR [#15439](https://github.com/Comfy-Org/ComfyUI/pull/15439).
+
+You can now build a real visual timeline inside a single generation:
+
+`First → Guide 1 → Guide 2 → Guide 3 → Last`
+
+MiniMax H3 automatically generates the transitions between these visual anchors, opening the door to controlled transformations, pose changes, camera evolution, action staging and much more.
+
+### 🎬 Native VIDEO Output
+The **Final Decode / Preview** node now exposes a native ComfyUI `VIDEO` output.
+
+This makes it possible to connect the final result directly to compatible video nodes such as upscalers, post-processing pipelines and video encoders, without having to reload the generated MP4 manually.
+
+---
+
 ## 🚀 MiniMax H3 Extender 2.0.0
 
 Version **2.0.0** is now available!
