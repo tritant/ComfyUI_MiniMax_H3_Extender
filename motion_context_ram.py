@@ -36,7 +36,7 @@ AUDIO_HZ = 40.0
 FRAME_RESCALE = 5.0 / 3.0
 FRAME_PER_TOKEN = (1, 4, 4, 4, 4)
 
-BUILD = "motion-context-ram-v14.23-native-api-compat-only"
+BUILD = "motion-context-ram-v2.1.1-perf-pass"
 _LOG = logging.getLogger("minimax_h3_tail_from_latent.motion_context")
 
 
@@ -212,14 +212,18 @@ def _audio_tail_from_latent(context_latent, audio_frames):
     total_t = int(audio.shape[-1])
     source_frames = _pixel_frames(int(video.shape[2]))
 
-    # H3 rounds its 40 Hz audio latent grid upward. Keep the fractional
-    # overhang so the carried audio's END is placed at its true sample time.
-    overhang = total_t - FRAME_RESCALE * source_frames
-    if not (0.0 <= overhang < 1.0):
+    # H3 rounds its 40 Hz audio grid to the nearest latent step. The
+    # residual is therefore signed (normally -1/3, 0 or +1/3 step on the
+    # valid 17n+5 video grid). Preserve that phase so the carried audio END
+    # remains aligned with the exact source timeline.
+    ideal_t = FRAME_RESCALE * source_frames
+    expected_t = int(round(ideal_t))
+    overhang = total_t - ideal_t
+    if total_t != expected_t or not (-0.5 < overhang < 0.5):
         _LOG.warning(
             "MiniMax H3 Motion Context RAM: unexpected audio grid "
-            "(%d audio steps for %d frames); ignoring overhang.",
-            total_t, source_frames,
+            "(%d audio steps for %d frames; expected %d); ignoring phase offset.",
+            total_t, source_frames, expected_t,
         )
         overhang = 0.0
 
@@ -287,49 +291,8 @@ def _audio_exact_frames(audio, frames, fps=24.0):
     return {"waveform": waveform, "sample_rate": sr}
 
 
-def _audio_trim_head(audio, trim_frames, fps=24.0):
-    waveform = audio["waveform"]
-    sr = int(audio["sample_rate"])
-    cut = max(0, int(round(
-        float(trim_frames) / float(fps) * sr
-    )))
-    if cut >= waveform.shape[-1]:
-        raise ValueError(
-            "MiniMax H3 Motion Context Join: audio head trim would remove "
-            "the entire continued clip."
-        )
-    return {
-        "waveform": waveform[..., cut:],
-        "sample_rate": sr,
-    }
 
 
-def _concat_audio(a, b):
-    wa = a["waveform"]
-    wb = b["waveform"]
-    sra = int(a["sample_rate"])
-    srb = int(b["sample_rate"])
-
-    if sra != srb:
-        raise ValueError(
-            f"MiniMax H3 Motion Context Join: audio sample-rate mismatch "
-            f"{sra} vs {srb}."
-        )
-
-    if wa.shape[1] != wb.shape[1]:
-        if wa.shape[1] == 1:
-            wa = wa.repeat(1, wb.shape[1], 1)
-        elif wb.shape[1] == 1:
-            wb = wb.repeat(1, wa.shape[1], 1)
-        else:
-            raise ValueError(
-                "MiniMax H3 Motion Context Join: audio channel mismatch."
-            )
-
-    return {
-        "waveform": torch.cat([wa, wb], dim=-1),
-        "sample_rate": sra,
-    }
 
 
 def _luma_map(frames):
@@ -351,176 +314,8 @@ def _luma_stats(frames):
     )
 
 
-def _photometric_match_segment(images, seam_frame, detect_window=4, end_frame=None):
-    """
-    Two-stage seam photometric correction.
-
-    end_frame limits correction to one continuation segment. With end_frame=None
-    the validated legacy Join keeps its previous whole-remainder behavior.
-    """
-    n = int(images.shape[0])
-    seam = int(seam_frame)
-    seg_end = n if end_frame is None else max(seam, min(n, int(end_frame)))
-    if seam <= 0 or seam >= n or seg_end <= seam:
-        return images
-
-    win = max(1, int(detect_window))
-    a0 = max(0, seam - win)
-    a1 = seam
-    b0 = seam
-    b1 = min(seg_end, seam + win)
-    if a1 <= a0 or b1 <= b0:
-        return images
-
-    ref = images[a0:a1]
-    src = images[b0:b1]
-
-    ref_mean, ref_std, ref_med = _luma_stats(ref)
-    src_mean, src_std, src_med = _luma_stats(src)
-
-    if abs(ref_mean - src_mean) < 0.008 and abs(ref_med - src_med) < 0.012:
-        return images
-
-    eps = 1e-4
-    src_med_c = min(max(src_med, 0.05), 0.95)
-    ref_med_c = min(max(ref_med, 0.05), 0.95)
-
-    gamma_full = math.log(ref_med_c) / math.log(src_med_c)
-    gamma_full = float(max(0.88, min(1.15, gamma_full)))
-
-    src_y = _luma_map(src).detach().float()
-    src_y_gamma = src_y.clamp(eps, 1.0).pow(gamma_full)
-    gamma_mean = float(src_y_gamma.mean().item())
-    if gamma_mean <= eps:
-        return images
-
-    gain_full = ref_mean / gamma_mean
-    gain_full = float(max(0.88, min(1.12, gain_full)))
-
-    corrected_std = float(
-        (src_y_gamma * gain_full).std(unbiased=False).clamp_min(1e-5).item()
-    )
-    contrast_full = ref_std / corrected_std if corrected_std > eps else 1.0
-    contrast_full = float(max(0.92, min(1.08, contrast_full)))
-
-    global_strength = 0.55
-    out = images.clone()
-
-    # Vectorized global correction on this segment only.
-    segment = out[seam:seg_end]
-    rgb = segment[..., :3].float()
-    y = _luma_map(rgb)
-    y_full = y.clamp(eps, 1.0).pow(gamma_full)
-    y_full = (y_full - ref_mean) * contrast_full + ref_mean
-    y_full = y_full * gain_full
-    seam_full_mean = gamma_mean * gain_full
-    mean_offset = ref_mean - seam_full_mean
-    y_full = (y_full + mean_offset).clamp(0.0, 1.0)
-    delta = (y_full - y) * global_strength
-    out[seam:seg_end, ..., :3] = (
-        rgb + delta.unsqueeze(-1)
-    ).clamp(0.0, 1.0).to(segment.dtype)
-
-    # Local first-3-frame seam stabilization.
-    local_count = min(3, seg_end - seam)
-    if local_count > 0:
-        stable_start = min(seg_end, seam + local_count)
-        stable_end = min(seg_end, stable_start + 4)
-        if stable_end > stable_start:
-            stable_mean, _, _ = _luma_stats(out[stable_start:stable_end])
-        else:
-            stable_mean = ref_mean
-
-        local_mix = (0.10, 0.40, 0.75)
-        for j in range(local_count):
-            idx = seam + j
-            frame = out[idx]
-            rgb = frame[..., :3].float()
-            y = _luma_map(rgb)
-            current_mean = float(y.mean().item())
-            t = local_mix[j]
-            target_mean = ref_mean * (1.0 - t) + stable_mean * t
-            offset = max(-0.060, min(0.060, float(target_mean - current_mean)))
-            y_local = (y + offset).clamp(0.0, 1.0)
-            delta = y_local - y
-            frame_out = frame.clone()
-            frame_out[..., :3] = (
-                rgb + delta.unsqueeze(-1)
-            ).clamp(0.0, 1.0).to(frame.dtype)
-            out[idx] = frame_out
-
-    # Validated +3.5% stable continuation lift, vectorized.
-    tail_gain = 1.035
-    tail_start = seam + 3
-    if tail_start < seg_end:
-        tail = out[tail_start:seg_end]
-        rgb = tail[..., :3].float()
-        y = _luma_map(rgb)
-        y_lift = (y * tail_gain).clamp(0.0, 1.0)
-
-        count = int(tail.shape[0])
-        strength = torch.ones((count, 1, 1), device=y.device, dtype=y.dtype)
-        if count >= 1:
-            strength[0] = 1.0 / 3.0
-        if count >= 2:
-            strength[1] = 2.0 / 3.0
-
-        delta = (y_lift - y) * strength
-        out[tail_start:seg_end, ..., :3] = (
-            rgb + delta.unsqueeze(-1)
-        ).clamp(0.0, 1.0).to(tail.dtype)
-
-    return out
 
 
-def _declick_audio_seam(audio, seam_frame, fps=24.0, milliseconds=5.0):
-    """
-    Remove a hard sample discontinuity at the A/B audio seam without changing
-    duration or sync.
-
-    The first B sample is shifted so its slope continues from the last two A
-    samples, then that tiny correction decays to zero with a half-cosine over
-    a few milliseconds. No crossfade overlap, no time stretch, no resampling.
-    """
-    waveform = audio["waveform"]
-    sr = int(audio["sample_rate"])
-    seam = int(round(float(seam_frame) / float(fps) * sr))
-
-    if seam < 2 or seam >= int(waveform.shape[-1]):
-        return audio
-
-    n = int(round(float(milliseconds) * 0.001 * sr))
-    n = max(2, min(n, int(waveform.shape[-1]) - seam))
-    if n < 2:
-        return audio
-
-    w = waveform.clone()
-
-    prev2 = w[..., seam - 2]
-    prev1 = w[..., seam - 1]
-    first_b = w[..., seam]
-
-    # Continue A's instantaneous slope instead of forcing a zero slope.
-    target_first_b = prev1 + (prev1 - prev2)
-    correction = first_b - target_first_b
-
-    k = torch.arange(n, device=w.device, dtype=w.dtype)
-    decay = 0.5 * (
-        1.0 + torch.cos(
-            torch.tensor(math.pi, device=w.device, dtype=w.dtype)
-            * k / float(n - 1)
-        )
-    )
-
-    w[..., seam:seam + n] = (
-        w[..., seam:seam + n]
-        - correction.unsqueeze(-1) * decay
-    )
-
-    return {
-        "waveform": w,
-        "sample_rate": sr,
-    }
 
 
 def _pad_motion_context_block_to_target(block, target_video):
@@ -784,24 +579,15 @@ def _temporal_gray(frame, out_h=96):
     return y
 
 
-def _temporal_candidate_score(decoded, previous_frames, candidate_index):
-    """
-    Compare a candidate first B frame with a constant-velocity prediction from
-    the last three A frames. Moving regions receive extra weight, so a person
-    walking toward camera matters more than the static background.
-
-    Returns (score, jump_ratio). jump_ratio > 1 means the seam step is larger
-    than the recent A motion.
-    """
+def _temporal_history_descriptor(decoded, previous_frames):
+    """Precompute the invariant A-side descriptor for seam candidates."""
     seam = int(previous_frames)
-    ci = int(candidate_index)
-    if seam < 3 or ci < seam or ci >= int(decoded.shape[0]):
-        return float("inf"), float("inf")
+    if seam < 3:
+        return None
 
     a0 = _temporal_gray(decoded[seam - 3])
     a1 = _temporal_gray(decoded[seam - 2])
     a2 = _temporal_gray(decoded[seam - 1])
-    c = _temporal_gray(decoded[ci])
 
     v0 = a1 - a0
     v1 = a2 - a1
@@ -811,21 +597,35 @@ def _temporal_candidate_score(decoded, previous_frames, candidate_index):
     motion = v1.abs() + v0.abs() * 0.5
     motion_mean = motion.mean().clamp_min(1e-5)
     weight = 0.25 + (motion / motion_mean).clamp(max=4.0)
+    expected_norm = float(velocity.norm().item())
+    return a2, velocity, predicted, weight, expected_norm
+
+
+def _temporal_candidate_score(decoded, previous_frames, candidate_index, history=None):
+    """Score one B-start candidate against a precomputed A-side history."""
+    seam = int(previous_frames)
+    ci = int(candidate_index)
+    if seam < 3 or ci < seam or ci >= int(decoded.shape[0]):
+        return float("inf"), float("inf")
+
+    if history is None:
+        history = _temporal_history_descriptor(decoded, seam)
+    if history is None:
+        return float("inf"), float("inf")
+
+    a2, velocity, predicted, weight, expected_norm = history
+    c = _temporal_gray(decoded[ci])
 
     mse = float((((c - predicted) ** 2) * weight).mean().item())
 
     cross = c - a2
-    expected_norm = float(velocity.norm().item())
     cross_norm = float(cross.norm().item())
     jump_ratio = cross_norm / max(expected_norm, 1e-6)
 
     # Penalize both a forward jump and a near-duplicate/replay.
     mag_penalty = abs(math.log(max(jump_ratio, 1e-6)))
 
-    denom = max(
-        float(velocity.norm().item()) * float(cross.norm().item()),
-        1e-6,
-    )
+    denom = max(expected_norm * cross_norm, 1e-6)
     cosine = float(
         (velocity.flatten() * cross.flatten()).sum().item() / denom
     )
@@ -834,7 +634,6 @@ def _temporal_candidate_score(decoded, previous_frames, candidate_index):
 
     score = mse + 0.02 * mag_penalty + 0.02 * direction_penalty
     return float(score), float(jump_ratio)
-
 
 def _auto_early_seam_shift(decoded, previous_frames, warmup_frames, max_early=2):
     """
@@ -857,13 +656,17 @@ def _auto_early_seam_shift(decoded, previous_frames, warmup_frames, max_early=2)
     max_early = min(int(max_early), warm)
     offsets = [0] + [-i for i in range(1, max_early + 1)]
 
+    history = _temporal_history_descriptor(decoded, seam)
+    if history is None:
+        return 0
+
     results = {}
     for off in offsets:
         idx = nominal + off
         if idx < seam or idx >= int(decoded.shape[0]):
             continue
         results[off] = _temporal_candidate_score(
-            decoded, seam, idx
+            decoded, seam, idx, history=history
         )
 
     if 0 not in results:

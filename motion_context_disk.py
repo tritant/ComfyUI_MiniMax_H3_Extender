@@ -60,10 +60,40 @@ from .motion_context_ram import (
     _streams_from_latent,
 )
 
-BUILD = "motion-context-disk-v2.0.0"
+BUILD = "motion-context-disk-v2.3.1"
 PREVIEW_AUDIO_MODE = "pcm_single_aac_gain_chain_v3_entry_ramp"
 CACHE_VERSION = 12
 PREVIEW_ROTATION_SLOTS = 3
+
+
+def _video_output_from_path(path):
+    """Wrap a finished video file as a native ComfyUI VIDEO output.
+
+    The Final Decode already produced the persistent final container on disk.
+    This helper simply exposes that file to downstream video-aware nodes
+    (upscalers, transcoders, Save Video, etc.) without any second decode or
+    frame copy.
+    """
+    source = str(Path(path).resolve())
+    last_error = None
+    import_paths = (
+        ("comfy_api.latest._input_impl.video_types", "VideoFromFile"),
+        ("comfy_api.latest.input_impl.video_types", "VideoFromFile"),
+    )
+    for module_name, attr in import_paths:
+        try:
+            module = __import__(module_name, fromlist=[attr])
+            factory = getattr(module, attr)
+            return factory(source)
+        except Exception as exc:
+            last_error = exc
+            continue
+    raise RuntimeError(
+        "Disk Final Decode: native VIDEO output is unavailable in this ComfyUI "
+        f"build ({last_error}). Update ComfyUI core video support to use the "
+        "Final Decode VIDEO output."
+    )
+
 
 class _FinalDecodeNativeProgress:
     """Native ComfyUI progress bound to the *currently executing* Final Decode node.
@@ -218,11 +248,22 @@ def _ensure_audio_cache_file(path):
 
 
 def _write_json_atomic(path, payload):
+    """Durably replace one JSON file without sharing a fixed temp filename."""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(path.name + ".tmp")
-    tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    os.replace(tmp, path)
+    tmp = path.with_name(f"{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        data = json.dumps(payload, ensure_ascii=False, indent=2)
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    finally:
+        try:
+            tmp.unlink(missing_ok=True)
+        except Exception:
+            pass
 
 
 def _dtype_name(tensor):
@@ -904,9 +945,9 @@ def _decode_pair_video(vae, chain, meta):
 def _correct_current_segment(previous_raw, current_raw, chunk_frames=8):
     """Memory-bounded disk Final Decode seam correction.
 
-    This is mathematically equivalent to the disk path's former
-    ``torch.cat(previous_tail, current) -> _photometric_match_segment()``
-    correction, but it deliberately avoids allocating a second full RGB clip.
+    This is mathematically equivalent to the disk path's former full-buffer
+    photometric correction, but deliberately avoids allocating a second full
+    RGB clip.
 
     ``current_raw`` is a disposable view into the decoded seam-pair buffer, so
     the correction is applied in place.  Large per-frame operations are then
@@ -1344,7 +1385,8 @@ def _fit_audio_segment_to_cumulative(wave, target_total, written_total):
 
 def _write_audio_raw(file_obj, wave):
     x = wave[0].detach().float().transpose(0, 1).cpu().contiguous()
-    file_obj.write(x.numpy().astype("float32", copy=False).tobytes(order="C"))
+    raw = x.numpy().astype("float32", copy=False)
+    file_obj.write(memoryview(raw).cast("B"))
 
 
 def _mux_final(ffmpeg, temp_video, raw_audio, output_path, sr, channels, codec, audio_bitrate, log_path):
@@ -1685,6 +1727,85 @@ def _ffmetadata_escape(value):
     text = text.replace("\r", "")
     text = text.replace("\n", "\\\n")
     return text
+
+
+def _workflow_from_extra_pnginfo(extra_pnginfo):
+    """Return the serialized ComfyUI workflow carried by EXTRA_PNGINFO."""
+    if isinstance(extra_pnginfo, dict):
+        workflow = extra_pnginfo.get("workflow")
+        if workflow is not None:
+            return workflow
+    return None
+
+
+def _embed_final_metadata_in_place(source_path, workflow=None, prompt=None):
+    """Embed ComfyUI workflow/prompt metadata without re-encoding media streams.
+
+    Final H.264/H.265 exports are MP4 files.  The metadata is written through a
+    tiny ffmetadata sidecar and ffmpeg stream-copy remux, then atomically replaces
+    the original output.  Preview/cache files remain untouched.
+    """
+    source = Path(source_path).resolve()
+    if source.suffix.lower() != ".mp4":
+        return source
+    if not source.exists() or not source.is_file():
+        raise FileNotFoundError("H3 Final Decode: final MP4 was not found for metadata embedding.")
+
+    metadata = {}
+    if workflow is not None:
+        metadata["workflow"] = workflow
+    if prompt is not None:
+        metadata["prompt"] = prompt
+    if not metadata:
+        return source
+
+    ffmpeg = _find_ffmpeg()
+    root = _ensure_cache_root()
+    token = f"final_metadata_{uuid.uuid4().hex[:10]}"
+    metadata_path = root / f"_{token}.ffmeta"
+    log_path = root / f"_{token}.log"
+    temp_path = source.with_name(source.stem + f".metadata_{uuid.uuid4().hex[:8]}" + source.suffix)
+
+    try:
+        lines = [";FFMETADATA1"]
+        for key, value in metadata.items():
+            encoded = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+            lines.append(f"{key}={_ffmetadata_escape(encoded)}")
+        metadata_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+        cmd = [
+            ffmpeg,
+            "-y",
+            "-i", str(source),
+            "-f", "ffmetadata",
+            "-i", str(metadata_path),
+            "-map", "0",
+            # Keep ordinary source metadata and overlay the ComfyUI tags.
+            "-map_metadata", "0",
+            "-map_metadata", "1",
+            "-c", "copy",
+            "-movflags", "use_metadata_tags+faststart",
+            str(temp_path),
+        ]
+        with open(log_path, "wb") as log_f:
+            proc = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=log_f)
+        if proc.returncode != 0:
+            tail = ""
+            try:
+                tail = log_path.read_bytes()[-12000:].decode("utf-8", errors="replace")
+            except Exception:
+                pass
+            raise RuntimeError(
+                f"H3 Final Decode metadata embedding failed with ffmpeg code {proc.returncode}.\n{tail}"
+            )
+        os.replace(temp_path, source)
+        return source
+    finally:
+        for path in (metadata_path, log_path, temp_path):
+            try:
+                Path(path).unlink(missing_ok=True)
+            except Exception:
+                pass
 
 
 def _save_preview_with_metadata(source_path, workflow=None, prompt=None, color_timeline=None):
@@ -2727,6 +2848,15 @@ def _restore_cached_preview_without_decode(owner_id, final_id, generation_mode="
     if manifest is None:
         return None
 
+    requested_mode = "fl2va" if str(generation_mode or "ref2va").lower() == "fl2va" else "ref2va"
+    cached_mode = "fl2va" if str(manifest.get("sequence_mode") or "ref2va").lower() == "fl2va" else "ref2va"
+    if cached_mode != requested_mode:
+        _LOG.warning(
+            "H3 restore preview refused mode mismatch: requested=%s cached=%s owner=%s",
+            requested_mode, cached_mode, owner_id,
+        )
+        return None
+
     segments = [dict(x) for x in manifest.get("segments", [])]
     if not segments:
         return None
@@ -3102,11 +3232,15 @@ class MiniMaxH3MotionContextDiskFinalDecode:
                 "audio_bitrate": (["128k", "192k", "256k", "320k"], {"default": "192k"}),
                 "autoplay": ("BOOLEAN", {"default": True, "tooltip": "Auto-play the video preview when generating finishes or the node is loaded."}),
             },
-            "hidden": {"unique_id": "UNIQUE_ID"},
+            "hidden": {
+                "unique_id": "UNIQUE_ID",
+                "prompt": "PROMPT",
+                "extra_pnginfo": "EXTRA_PNGINFO",
+            },
         }
 
-    RETURN_TYPES = ()
-    RETURN_NAMES = ()
+    RETURN_TYPES = ("VIDEO",)
+    RETURN_NAMES = ("video",)
     FUNCTION = "export"
     CATEGORY = "MiniMax H3"
     OUTPUT_NODE = True
@@ -3125,6 +3259,8 @@ class MiniMaxH3MotionContextDiskFinalDecode:
         audio_bitrate,
         autoplay=True,
         unique_id=None,
+        prompt=None,
+        extra_pnginfo=None,
     ):
         data_path, manifest_path, manifest = _load_manifest(cache)
         # FPS is cache metadata, never a user choice. The compatibility widget
@@ -3133,6 +3269,7 @@ class MiniMaxH3MotionContextDiskFinalDecode:
         fps = float(manifest.get("fps", FPS))
         if not math.isfinite(fps) or fps <= 0.0:
             raise ValueError(f"Disk Final Decode: invalid cached fps {fps!r}.")
+        workflow = _workflow_from_extra_pnginfo(extra_pnginfo)
         segments = [dict(x) for x in manifest.get("segments", [])]
         if not segments:
             raise ValueError("Disk Final Decode: empty cache.")
@@ -3142,7 +3279,7 @@ class MiniMaxH3MotionContextDiskFinalDecode:
                 cache=cache, vae=vae, audio_vae=audio_vae, fps=fps,
                 filename_prefix=filename_prefix, output_directory=output_directory,
                 codec=codec, crf=crf, preset=preset, audio_bitrate=audio_bitrate,
-                unique_id=unique_id,
+                unique_id=unique_id, workflow=workflow, prompt=prompt,
             )
         color_timeline = _color_timeline(segments, float(fps))
 
@@ -3190,6 +3327,7 @@ class MiniMaxH3MotionContextDiskFinalDecode:
                 preview_path, out_dir, filename_prefix,
                 ffmpeg=ffmpeg, color_timeline=color_timeline,
             )
+            _embed_final_metadata_in_place(autosave_path, workflow=workflow, prompt=prompt)
             progress.advance()
 
             total_frames = int(manifest.get("final_frame_count", 0))
@@ -3219,7 +3357,7 @@ class MiniMaxH3MotionContextDiskFinalDecode:
                         "color_preview_baked": False,
                     }],
                 },
-                "result": (),
+                "result": (_video_output_from_path(autosave_path),),
             }
 
         extension = "mkv" if str(codec) == "FFV1 lossless" else "mp4"
@@ -3421,6 +3559,8 @@ class MiniMaxH3MotionContextDiskFinalDecode:
                 os.replace(color_temp, output_path)
                 progress.advance()
 
+            _embed_final_metadata_in_place(output_path, workflow=workflow, prompt=prompt)
+
             shifts_text = ",".join(
                 f"{i}:{int(seam_shifts.get(i, 0))}" for i in range(1, len(segments))
             )
@@ -3446,7 +3586,7 @@ class MiniMaxH3MotionContextDiskFinalDecode:
                         "color_preview_baked": False,
                     }],
                 },
-                "result": (),
+                "result": (_video_output_from_path(output_path),),
             }
 
         finally:

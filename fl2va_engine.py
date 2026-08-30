@@ -946,8 +946,20 @@ def make_fl2va_conditioning(
     frame_count: int,
     first_frame=None,
     last_frame=None,
+    guide_frames=None,
+    guide_frame=None,
+    guide_frame_idx: int = 0,
 ):
-    """Mirror ComfyUI's native MiniMaxH3ImageToVideo FL2VA conditioning."""
+    """Mirror native MiniMax H3 FL2VA + chained AddGuide image conditioning.
+
+    First/Last keep MiniMaxH3ImageToVideo semantics. ``guide_frames`` is an
+    ordered list of ``{"frame": IMAGE, "frame_idx": int}`` entries. Each one
+    mirrors a native MiniMaxH3AddGuide IMAGE invocation: cover-crop to the
+    target canvas, VAE encode, then append a keyframe to ``minimax_keyframes``
+    without retokenizing the prompt. Negative indices count backward from the
+    end. ``guide_frame``/``guide_frame_idx`` remain as a compatibility path for
+    callers created before dynamic guides.
+    """
     frame_count = _align_frame_count(frame_count)
     latent = _empty_av_latent(width, height, frame_count)
     images = []
@@ -973,6 +985,49 @@ def make_fl2va_conditioning(
         cond = node_helpers.conditioning_set_values(
             cond, {"minimax_keyframes": keyframes}
         )
+
+    normalized_guides = []
+    if isinstance(guide_frames, (list, tuple)):
+        normalized_guides.extend(guide_frames)
+    elif guide_frames is not None:
+        normalized_guides.append(guide_frames)
+    if not normalized_guides and guide_frame is not None:
+        normalized_guides.append({"frame": guide_frame, "frame_idx": guide_frame_idx})
+
+    for guide_number, guide_item in enumerate(normalized_guides, start=1):
+        if isinstance(guide_item, dict):
+            frame = guide_item.get("frame")
+            raw_value = guide_item.get("frame_idx", 0)
+        elif isinstance(guide_item, (list, tuple)) and len(guide_item) >= 2:
+            frame, raw_value = guide_item[0], guide_item[1]
+        else:
+            continue
+        if frame is None:
+            continue
+        try:
+            raw_idx = int(raw_value)
+        except Exception:
+            raw_idx = 0
+        resolved_idx = raw_idx if raw_idx >= 0 else int(frame_count) + raw_idx
+        if resolved_idx < 0 or resolved_idx >= int(frame_count):
+            raise ValueError(
+                f"FL2VA guide {guide_number} frame_idx {raw_idx} is outside the video's {int(frame_count)} frames."
+            )
+
+        # Chaining native AddGuide nodes is equivalent to appending every
+        # encoded keyframe to the existing conditioning in order.
+        guide = _resize(frame[:1], width, height, "center")
+        guide_keyframe = {
+            "resolved_frame_index": int(resolved_idx),
+            "latent": vae.encode(guide),
+        }
+        existing = list(cond[0][1].get("minimax_keyframes", []))
+        existing.append(guide_keyframe)
+        cond = node_helpers.conditioning_set_values(
+            cond, {"minimax_keyframes": existing}
+        )
+        del guide
+
     return cond, latent
 
 
@@ -1203,6 +1258,8 @@ def export_fl2va_final(
     preset,
     audio_bitrate,
     unique_id=None,
+    workflow=None,
+    prompt=None,
 ):
     """Decode FL2VA plans as independent hard cuts.
 
@@ -1303,6 +1360,7 @@ def export_fl2va_final(
             ffmpeg=ffmpeg,
             color_timeline=color_timeline,
         )
+        d._embed_final_metadata_in_place(autosave_path, workflow=workflow, prompt=prompt)
         progress.advance()
 
         item = d._comfy_media_item(preview_path, fps, "temp")
@@ -1320,7 +1378,7 @@ def export_fl2va_final(
                     "color_preview_baked": False,
                 }],
             },
-            "result": (),
+            "result": (d._video_output_from_path(autosave_path),),
         }
 
     # ------------------------------------------------------------------
@@ -1438,6 +1496,8 @@ def export_fl2va_final(
             )
             os.replace(color_temp, output_path)
 
+        d._embed_final_metadata_in_place(output_path, workflow=workflow, prompt=prompt)
+
         item = d._comfy_media_item(preview_path, fps, "temp")
         progress.finish()
         return {
@@ -1452,7 +1512,7 @@ def export_fl2va_final(
                     "color_preview_baked": False,
                 }],
             },
-            "result": (),
+            "result": (d._video_output_from_path(output_path),),
         }
     finally:
         if video_proc is not None:

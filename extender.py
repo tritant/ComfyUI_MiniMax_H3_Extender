@@ -86,7 +86,7 @@ from .fl2va_engine import (
     install_fl2va_project_continuity,
 )
 
-BUILD = "minimax-h3-extender-v2.0.0"
+BUILD = "minimax-h3-extender-v2.3.1"
 FPS = 24
 AUDIO_LATENT_FPS = 40
 CANVAS_MULTIPLE = 32
@@ -115,6 +115,7 @@ class _LazyUnconnected:
 _LAZY_UNCONNECTED = _LazyUnconnected()
 MAX_REF_AUDIO_SECONDS = 15.0
 MAX_CLIPS = 512
+MAX_FL2VA_GUIDES = 3
 DEFAULT_DURATION = 10.0
 DEFAULT_MEGAPIXELS = 0.40
 MAX_RESOLUTION = 4096
@@ -207,14 +208,6 @@ def _auto_resolution_from_dimensions(src_w: int, src_h: int, megapixels: float):
     return w, h
 
 
-def _auto_resolution_from_image(image, megapixels: float):
-    if image is None or getattr(image, "ndim", 0) < 4:
-        raise ValueError("MiniMax H3 Extender: invalid reference image for auto resolution.")
-    return _auto_resolution_from_dimensions(
-        int(image.shape[2]),
-        int(image.shape[1]),
-        megapixels,
-    )
 
 
 def _refs_root():
@@ -828,28 +821,77 @@ def _normalize_ref_video_fps(value, label: str):
     return fps
 
 
-def _resample_ref_video_to_h3_fps(video_frames, source_fps: float, label: str):
-    """Resample a reference-video IMAGE batch to H3's fixed 24 fps.
-
-    IMAGE batches do not carry timestamps/FPS metadata. The Extender therefore
-    accepts an explicit source FPS and resamples the batch so H3 sees the same
-    source duration at its required 24-fps cadence.
-    """
+def _ref_video_h3_frame_count(video_frames, source_fps: float, label: str):
+    """Return the H3 24-fps frame count without materializing a resampled batch."""
     fps = _normalize_ref_video_fps(source_fps, label)
     if not torch.is_tensor(video_frames) or video_frames.ndim != 4:
         raise ValueError(f"MiniMax H3 Extender: {label} must be an IMAGE batch [frames,H,W,C].")
-    if abs(fps - float(FPS)) < 1e-6 or int(video_frames.shape[0]) <= 1:
-        return video_frames
-
     source_count = int(video_frames.shape[0])
+    if abs(fps - float(FPS)) < 1e-6 or source_count <= 1:
+        return fps, source_count
     duration = source_count / fps
-    target_count = max(1, int(round(duration * float(FPS))))
-    idx = torch.round(
-        torch.arange(target_count, device=video_frames.device, dtype=torch.float32) * (fps / float(FPS))
-    ).to(torch.long)
-    idx = torch.clamp(idx, 0, source_count - 1)
+    return fps, max(1, int(round(duration * float(FPS))))
+
+
+def _take_ref_video_h3_frames(video_frames, source_fps: float, start: int, end: int):
+    """Materialize only the requested H3-frame window from a source video."""
+    start = max(0, int(start))
+    end = max(start, int(end))
+    if end <= start:
+        return video_frames[:0]
+    if abs(float(source_fps) - float(FPS)) < 1e-6 or int(video_frames.shape[0]) <= 1:
+        return video_frames[start:end]
+
+    positions = torch.arange(
+        start, end, device=video_frames.device, dtype=torch.float32
+    )
+    idx = torch.round(positions * (float(source_fps) / float(FPS))).to(torch.long)
+    idx = torch.clamp(idx, 0, int(video_frames.shape[0]) - 1)
     return video_frames.index_select(0, idx)
 
+
+def _resize_ref_video_h3_frames(
+    video_frames, source_fps: float, count: int, width: int, height: int, chunk_frames: int = 32
+):
+    """Resize a bounded H3 prefix without a full 24-fps intermediate tensor."""
+    count = max(0, int(count))
+    if count <= 0:
+        return video_frames[:0, :int(height), :int(width), :3]
+    chunk_frames = max(1, int(chunk_frames))
+    out = torch.empty(
+        (count, int(height), int(width), 3),
+        device=video_frames.device,
+        dtype=video_frames.dtype,
+    )
+    for start in range(0, count, chunk_frames):
+        end = min(count, start + chunk_frames)
+        source_chunk = _take_ref_video_h3_frames(video_frames, source_fps, start, end)
+        resized_chunk = _resize(source_chunk, width, height)
+        out[start:end].copy_(resized_chunk)
+        del source_chunk, resized_chunk
+    return out
+
+
+def _resize_ref_video_qwen_frames(
+    video_frames, source_fps: float, count: int, width: int, height: int
+):
+    """Resize only the half-second Qwen samples for a cached video latent."""
+    sample_step = max(1, FPS // 2)
+    target_positions = list(range(0, int(count), sample_step))
+    if not target_positions:
+        return video_frames[:0, :int(height), :int(width), :3], target_positions
+
+    if abs(float(source_fps) - float(FPS)) < 1e-6 or int(video_frames.shape[0]) <= 1:
+        selected = video_frames[target_positions]
+    else:
+        positions = torch.tensor(
+            target_positions, device=video_frames.device, dtype=torch.float32
+        )
+        idx = torch.round(positions * (float(source_fps) / float(FPS))).to(torch.long)
+        idx = torch.clamp(idx, 0, int(video_frames.shape[0]) - 1)
+        selected = video_frames.index_select(0, idx)
+    resized = _resize(selected, width, height)
+    return resized, target_positions
 
 def _audio_duration_seconds(audio):
     if not isinstance(audio, dict) or "waveform" not in audio:
@@ -1211,30 +1253,30 @@ def _prepare_shared_refs(
     target_frames = max(5, min(target_frames, MAX_REF_VIDEO_FRAMES))
     total_ref_video_frames = 0
     for video_index, (slot, video_frames, source_fps, soundtrack) in enumerate(active_videos):
-        frames_24 = _resample_ref_video_to_h3_fps(video_frames, source_fps, f"ref_video_{slot}")
-        if int(frames_24.shape[0]) < int(2 * FPS):
+        source_fps, full_h3_frames = _ref_video_h3_frame_count(
+            video_frames, source_fps, f"ref_video_{slot}"
+        )
+        if int(full_h3_frames) < int(2 * FPS):
             raise ValueError(
                 f"MiniMax H3 Extender: ref_video_{slot} is shorter than MiniMax H3's 2-second minimum at 24 fps."
             )
 
-        vh, vw = int(frames_24.shape[1]), int(frames_24.shape[2])
+        vh, vw = int(video_frames.shape[1]), int(video_frames.shape[2])
         cw, ch = _adapt_ref_video_canvas(vw, vh)
         if vw * vh < cw * ch:
             cw = max(CANVAS_MULTIPLE, round(vw / CANVAS_MULTIPLE) * CANVAS_MULTIPLE)
             ch = max(CANVAS_MULTIPLE, round(vh / CANVAS_MULTIPLE) * CANVAS_MULTIPLE)
 
-        frames = _resize(frames_24, cw, ch)
-        if int(frames.shape[0]) > target_frames:
-            frames = frames[:target_frames]
-
-        n = int(frames.shape[0])
+        # Crop to the requested clip duration and H3 17k+5 grid BEFORE any
+        # expensive Lanczos resize. This preserves the exact former prefix but
+        # never processes frames that will be discarded afterwards.
+        n = min(int(full_h3_frames), int(target_frames))
         while n >= 5 and n % 17 != 5:
             n -= 1
         if n < 5:
             raise ValueError(
                 f"MiniMax H3 Extender: ref_video_{slot} cannot be aligned to the H3 17k+5 frame grid."
             )
-        frames = frames[:n]
         total_ref_video_frames += n
         if total_ref_video_frames > MAX_REF_VIDEO_FRAMES:
             raise ValueError(
@@ -1246,14 +1288,30 @@ def _prepare_shared_refs(
             if cached_video_blocks is not None and video_index < len(cached_video_blocks)
             else None
         )
-        if (
+        latent_cached = (
             isinstance(cached_block, dict)
             and str(cached_block.get("kind") or "").startswith("video")
             and cached_block.get("latent") is not None
-        ):
+        )
+        if latent_cached:
             z = cached_block.get("latent")
+            # A cached VAE latent only needs the sparse Qwen presentation frames.
+            # Resize those samples directly instead of rebuilding all n RGB frames.
+            qwen_frames, sample_idx = _resize_ref_video_qwen_frames(
+                video_frames, source_fps, n, cw, ch
+            )
         else:
+            # VAE encoding needs the complete aligned RGB sequence. Build it in
+            # bounded chunks directly from the source cadence, avoiding a second
+            # full-size 24-fps intermediate batch.
+            frames = _resize_ref_video_h3_frames(
+                video_frames, source_fps, n, cw, ch, chunk_frames=32
+            )
             z = vae.encode(frames)
+            sample_step = max(1, FPS // 2)
+            sample_idx = list(range(0, n, sample_step))
+            qwen_frames = frames[sample_idx]
+            del frames
 
         audio_latent = None
         ref_audio_t = 0
@@ -1285,9 +1343,6 @@ def _prepare_shared_refs(
             # The soundtrack gets its own <Audio j> label immediately before its video.
             ref_items.append({"type": "audio"})
 
-        sample_step = max(1, FPS // 2)
-        sample_idx = list(range(0, int(frames.shape[0]), sample_step))
-        qwen_frames = frames[sample_idx]
         ref_items.append(
             {
                 "type": "video",
@@ -1611,9 +1666,36 @@ def _default_clip(index: int = 0):
         "loras": [],
         "first_frame": None,
         "last_frame": None,
+        "guides": [],
         "first_source": "manual",
     }
 
+
+
+def _normalize_fl2va_guides(raw_guides, legacy_frame=None, legacy_idx=0):
+    guides = []
+    source = raw_guides if isinstance(raw_guides, list) else None
+    if source is None:
+        legacy = _normalize_ref_descriptor(legacy_frame)
+        if legacy is not None:
+            source = [{"frame": legacy, "frame_idx": legacy_idx}]
+        else:
+            source = []
+
+    for raw in source[:MAX_FL2VA_GUIDES]:
+        raw = raw if isinstance(raw, dict) else {}
+        frame = _normalize_ref_descriptor(raw.get("frame", raw.get("guide_frame")))
+        if frame is None:
+            continue
+        try:
+            frame_idx = int(raw.get("frame_idx", raw.get("guide_frame_idx", 0)) or 0)
+        except Exception:
+            frame_idx = 0
+        guides.append({
+            "frame": frame,
+            "frame_idx": max(-9999, min(9999, frame_idx)),
+        })
+    return guides
 
 def _parse_clips_json(value: str, generation_mode="ref2va"):
     try:
@@ -1667,6 +1749,11 @@ def _parse_clips_json(value: str, generation_mode="ref2va"):
                 "loras": _normalize_clip_loras(raw.get("loras"), legacy=raw.get("lora")),
                 "first_frame": _normalize_ref_descriptor(raw.get("first_frame")),
                 "last_frame": _normalize_ref_descriptor(raw.get("last_frame")),
+                "guides": _normalize_fl2va_guides(
+                    raw.get("guides"),
+                    legacy_frame=raw.get("guide_frame"),
+                    legacy_idx=raw.get("guide_frame_idx", 0),
+                ),
                 "first_source": (
                     "previous_clip"
                     if str(raw.get("first_source") or "manual").lower().strip() == "previous_clip" and i > 0
@@ -1965,6 +2052,10 @@ def _fl2va_frame_entries(project_payload):
             ref = cfg.get(f"{kind}_frame")
             if isinstance(ref, dict) and _ref_id_is_safe(ref.get("id")):
                 entries.append((index, kind, ref))
+        for guide_index, guide in enumerate(cfg.get("guides") or [], start=1):
+            ref = guide.get("frame") if isinstance(guide, dict) else None
+            if isinstance(ref, dict) and _ref_id_is_safe(ref.get("id")):
+                entries.append((index, f"guide_{guide_index}", ref))
     return entries
 
 
@@ -2532,12 +2623,30 @@ def _import_project_archive(owner_id, archive_path):
 
             if generation_mode == "fl2va":
                 for clip_index, cfg in enumerate(clips, start=1):
-                    for kind in ("first", "last"):
-                        key = f"{kind}_frame"
-                        saved = cfg.get(key)
-                        member = f"fl2va/clip_{clip_index}_{kind}.png"
+                    targets = [
+                        ("first", cfg.get("first_frame"), ("frame", "first_frame")),
+                        ("last", cfg.get("last_frame"), ("frame", "last_frame")),
+                    ]
+                    for guide_index, guide in enumerate(cfg.get("guides") or []):
+                        if isinstance(guide, dict):
+                            targets.append(
+                                (f"guide_{guide_index + 1}", guide.get("frame"), ("guide", guide_index))
+                            )
+
+                    for kind, saved, assign_target in targets:
                         if saved is None:
                             continue
+                        archive_kind = kind
+                        member = f"fl2va/clip_{clip_index}_{archive_kind}.png"
+                        # v2.2.x portable projects stored their only AddGuide
+                        # image under the legacy unsuffixed guide filename.
+                        if (
+                            kind == "guide_1"
+                            and member not in names
+                            and f"fl2va/clip_{clip_index}_guide.png" in names
+                        ):
+                            archive_kind = "guide"
+                            member = f"fl2va/clip_{clip_index}_guide.png"
                         if member not in names:
                             raise ValueError(
                                 f"MiniMax H3 Extender Project: embedded FL2VA clip {clip_index} {kind} frame is missing."
@@ -2563,7 +2672,7 @@ def _import_project_archive(owner_id, archive_path):
                             if isinstance(saved, dict)
                             else desc["id"]
                         )
-                        source_member = f"fl2va/original_clip_{clip_index}_{kind}.png"
+                        source_member = f"fl2va/original_clip_{clip_index}_{archive_kind}.png"
                         if source_member in names:
                             source_info = zf.getinfo(source_member)
                             if int(source_info.file_size) > MAX_REF_UPLOAD_BYTES:
@@ -2593,7 +2702,12 @@ def _import_project_archive(owner_id, archive_path):
                                     )
                                 except Exception:
                                     desc[adjustment_key] = 100.0
-                        cfg[key] = desc
+
+                        target_type, target_value = assign_target
+                        if target_type == "frame":
+                            cfg[target_value] = desc
+                        else:
+                            cfg["guides"][int(target_value)]["frame"] = desc
                 _write_clips_to_project_payload(project_payload, clips, generation_mode)
 
             has_data = "cache/chain.h3cache" in names
@@ -2773,6 +2887,21 @@ def _import_project_archive(owner_id, archive_path):
                 new_audio if imported_manifest is not None and new_audio.exists() else None,
                 generation_mode=generation_mode,
             )
+
+            # Portable .ext projects are intentionally single-mode. The frontend
+            # also resets the inactive card timeline when importing one, so an
+            # old cache from the opposite mode must not survive on disk. If it
+            # did, a later frontend/default-mode mistake could resurrect a stale
+            # preview from a completely different project after F5/restart.
+            inactive_mode = "ref2va" if generation_mode == "fl2va" else "fl2va"
+            try:
+                _replace_cache_transaction(owner_id, generation_mode=inactive_mode)
+            except Exception as exc:
+                print(
+                    f"[WARNING] MiniMax H3 Extender: could not clear stale {inactive_mode} "
+                    f"cache while loading project: {exc}"
+                )
+
             if generation_mode == "fl2va" and imported_manifest is not None and continuity_restore:
                 target_data, _ = _chain_paths(_fl2va_cache_owner_id(owner_id))
                 for clip_id, png_path, json_path in continuity_restore:
@@ -3124,6 +3253,13 @@ class MiniMaxH3Extender:
                 frame_guides.append(cfg.get("first_frame"))
             elif cfg.get("last_frame") is not None:
                 frame_guides.append(cfg.get("last_frame"))
+            else:
+                first_guide = next(
+                    (g.get("frame") for g in (cfg.get("guides") or []) if isinstance(g, dict) and g.get("frame") is not None),
+                    None,
+                )
+                if first_guide is not None:
+                    frame_guides.append(first_guide)
         requested_resolution = _resolve_generation_resolution(
             resolution_mode, megapixels, width, height, frame_guides
         )
@@ -3254,6 +3390,17 @@ class MiniMaxH3Extender:
             if first_source == "manual":
                 first_frame = _load_reference_tensor(first_desc) if first_desc is not None else None
             last_frame = _load_reference_tensor(last_desc) if last_desc is not None else None
+            guide_frames = []
+            for guide_cfg in cfg.get("guides") or []:
+                if not isinstance(guide_cfg, dict):
+                    continue
+                guide_desc = guide_cfg.get("frame")
+                if guide_desc is None:
+                    continue
+                guide_frames.append({
+                    "frame": _load_reference_tensor(guide_desc),
+                    "frame_idx": int(guide_cfg.get("frame_idx", 0) or 0),
+                })
 
             clip_model, clip_text_encoder = _apply_per_clip_loras(
                 self, fl2va_model, clip, cfg.get("loras"), i
@@ -3267,6 +3414,7 @@ class MiniMaxH3Extender:
                 frame_count,
                 first_frame=first_frame,
                 last_frame=last_frame,
+                guide_frames=guide_frames,
             )
 
             _send_extender_progress(
@@ -3315,6 +3463,11 @@ class MiniMaxH3Extender:
                 del first_frame
             if last_frame is not None:
                 del last_frame
+            for guide_item in guide_frames:
+                guide_tensor = guide_item.get("frame") if isinstance(guide_item, dict) else None
+                if guide_tensor is not None:
+                    del guide_tensor
+            guide_frames.clear()
 
             if str(run_mode) == "clip_by_clip":
                 break
