@@ -19,10 +19,10 @@ const BOTTOM_PAD = 16;
 // never covers the Validated/footer row.
 const CARD_SCROLLBAR_SPACE = 24;
 // Cards keep the same compact structure in both modes. FL2VA keyframes live
-// in the shared media strip above the cards; dynamic LoRA rows are the only
-// per-card controls that increase vertical content.
+// in the shared media strip above the cards; FL2VA also exposes one compact
+// per-card dynamic image guides with exact frame indices.
 const CARD_MIN_HEIGHT_REF2VA = 455;
-const CARD_MIN_HEIGHT_FL2VA = 455;
+const CARD_MIN_HEIGHT_FL2VA = 560;
 const REF_SLOT_WIDTH = 96;
 const FL2VA_FRAME_SLOT_WIDTH = 145;
 const REF_THUMB_HEIGHT = 96;
@@ -31,8 +31,19 @@ const REF_THUMB_HEIGHT = 96;
 const REF_SCROLLBAR_SPACE = 14;
 const REF_SECTION_HEIGHT = 160;
 const MAX_IMAGE_REFS = 9;
+const MAX_FL2VA_GUIDES = 3;
 const MAX_RESOLUTION = 4096;
 const DEFAULT_MEGAPIXELS = 0.40;
+
+// Nodes 2.0 lifecycle guard. Workflow loading is bracketed by the official
+// beforeConfigureGraph/afterConfigureGraph extension hooks; while this flag is
+// set, custom DOM code may render but must not publish graph mutations or
+// restore cache state from temporary schema defaults.
+let h3GraphConfiguring = false;
+
+function isH3GraphConfiguring() {
+    return h3GraphConfiguring;
+}
 
 function maxSelectedLoraRows(state) {
     let maxRows = 0;
@@ -539,6 +550,37 @@ function normalizeClipLoras(value, legacy = null) {
         .filter((entry) => Boolean(entry.name));
 }
 
+function h3FrameCountForDuration(duration) {
+    const rawFrames = Math.max(5, Math.round(Math.max(0.25, Number(duration || 10)) * 24));
+    let aligned = rawFrames;
+    while (aligned % 17 !== 5) aligned++;
+    return aligned;
+}
+
+function normalizeGuideFrameIdx(value) {
+    const n = Number(value);
+    if (!Number.isFinite(n)) return 0;
+    return Math.max(-9999, Math.min(9999, Math.trunc(n)));
+}
+
+function normalizeGuideList(clip) {
+    const raw = Array.isArray(clip?.guides)
+        ? clip.guides
+        : (normalizeRefDescriptor(clip?.guide_frame)
+            ? [{ frame: clip.guide_frame, frame_idx: clip?.guide_frame_idx ?? 0 }]
+            : []);
+    const out = [];
+    for (const item of raw.slice(0, MAX_FL2VA_GUIDES)) {
+        const frame = normalizeRefDescriptor(item?.frame ?? item?.guide_frame);
+        if (!frame) continue;
+        out.push({
+            frame,
+            frame_idx: normalizeGuideFrameIdx(item?.frame_idx ?? item?.guide_frame_idx ?? 0),
+        });
+    }
+    return out;
+}
+
 function newClip(index) {
     return {
         id: `clip_${index + 1}_${Date.now().toString(36)}`,
@@ -552,6 +594,7 @@ function newClip(index) {
         loras: [],
         first_frame: null,
         last_frame: null,
+        guides: [],
         first_source: "manual",
     };
 }
@@ -572,6 +615,7 @@ function normalizeClipList(rawClips) {
         loras: normalizeClipLoras(c?.loras, c?.lora),
         first_frame: normalizeRefDescriptor(c?.first_frame),
         last_frame: normalizeRefDescriptor(c?.last_frame),
+        guides: normalizeGuideList(c),
         first_source: (i > 0 && String(c?.first_source || "manual") === "previous_clip")
             ? "previous_clip"
             : "manual",
@@ -683,72 +727,6 @@ function serializeState(state) {
     return JSON.stringify(payload);
 }
 
-function configuredClipsStateJson(info, fallback = "") {
-    // During an in-browser refresh Nodes 2.0 may call onConfigure before the
-    // native widget objects have received their restored values. The serialized
-    // node payload is already available in info.widgets_values, so recover the
-    // clips state directly from there instead of racing the Vue widget restore.
-    const values = Array.isArray(info?.widgets_values) ? info.widgets_values : [];
-    let legacyCandidate = "";
-    for (const value of values) {
-        if (typeof value !== "string") continue;
-        const text = value.trim();
-        if (!text || (text[0] !== "{" && text[0] !== "[")) continue;
-        try {
-            const parsed = JSON.parse(text);
-            if (Array.isArray(parsed)) {
-                // Pre-v14 state was a bare clip array. Keep it only as a fallback
-                // because refs_json is an object and modern clips_json is stronger.
-                if (parsed.length && parsed.some((item) => item && typeof item === "object" && (
-                    Object.prototype.hasOwnProperty.call(item, "prompt") ||
-                    Object.prototype.hasOwnProperty.call(item, "duration") ||
-                    Object.prototype.hasOwnProperty.call(item, "validated")
-                ))) legacyCandidate = text;
-                continue;
-            }
-            if (!parsed || typeof parsed !== "object") continue;
-            if (
-                Object.prototype.hasOwnProperty.call(parsed, "generation_mode") ||
-                Object.prototype.hasOwnProperty.call(parsed, "mode_clips") ||
-                Array.isArray(parsed.clips)
-            ) {
-                return text;
-            }
-        } catch (_) {}
-    }
-    return legacyCandidate || String(fallback || "");
-}
-
-function replaceConfiguredClipsStateJson(info, raw) {
-    if (!Array.isArray(info?.widgets_values) || typeof raw !== "string") return false;
-    const values = info.widgets_values;
-    for (let i = 0; i < values.length; i++) {
-        const value = values[i];
-        if (typeof value !== "string") continue;
-        const text = value.trim();
-        if (!text || (text[0] !== "{" && text[0] !== "[")) continue;
-        try {
-            const parsed = JSON.parse(text);
-            const isClipState = Array.isArray(parsed)
-                ? parsed.some((item) => item && typeof item === "object" && (
-                    Object.prototype.hasOwnProperty.call(item, "prompt") ||
-                    Object.prototype.hasOwnProperty.call(item, "duration") ||
-                    Object.prototype.hasOwnProperty.call(item, "validated")
-                ))
-                : Boolean(parsed && typeof parsed === "object" && (
-                    Object.prototype.hasOwnProperty.call(parsed, "generation_mode") ||
-                    Object.prototype.hasOwnProperty.call(parsed, "mode_clips") ||
-                    Array.isArray(parsed.clips)
-                ));
-            if (isClipState) {
-                values[i] = raw;
-                return true;
-            }
-        } catch (_) {}
-    }
-    return false;
-}
-
 function serializeProjectState(state) {
     // Portable .ext projects intentionally remain single-mode. This preserves
     // the existing archive/cache contract and avoids embedding inactive FL2VA
@@ -818,7 +796,7 @@ function validatedPrefixFromState(state) {
 }
 
 async function restoreCacheState(node, runtime) {
-    if (!node || !runtime || runtime.cacheStateRequestRunning) return;
+    if (!node || !runtime || runtime.hydrating || runtime.cacheStateRequestRunning) return;
 
     runtime.cacheStateRequestRunning = true;
     try {
@@ -944,6 +922,12 @@ function dimensionsFromFl2vaKeyframe(runtime) {
     for (const clip of runtime?.state?.clips || []) {
         for (const key of ["first_frame", "last_frame"]) {
             const ref = normalizeRefDescriptor(clip?.[key]);
+            const width = Number(ref?.width || 0);
+            const height = Number(ref?.height || 0);
+            if (width > 0 && height > 0) return { width, height };
+        }
+        for (const guide of normalizeGuideList(clip)) {
+            const ref = normalizeRefDescriptor(guide?.frame);
             const width = Number(ref?.width || 0);
             const height = Number(ref?.height || 0);
             if (width > 0 && height > 0) return { width, height };
@@ -1357,18 +1341,83 @@ function restoreModeValidation(runtime, mode) {
     return true;
 }
 
+function explicitGenerationModeFromStateJson(raw) {
+    if (typeof raw !== "string" || !raw.trim()) return "";
+    try {
+        const parsed = JSON.parse(raw);
+        if (!parsed || Array.isArray(parsed) || typeof parsed !== "object") return "";
+        if (!Object.prototype.hasOwnProperty.call(parsed, "generation_mode")) return "";
+        const mode = String(parsed.generation_mode || "").toLowerCase();
+        return mode === "fl2va" || mode === "ref2va" ? mode : "";
+    } catch (_) {
+        return "";
+    }
+}
+
+function persistentGenerationMode(node, raw = "") {
+    // Both sources below are native ComfyUI widgets and are therefore restored
+    // by LGraphNode.configure(). clips_json is preferred for compatibility with
+    // workflows saved before the trailing generation_mode combo existed.
+    const explicit = explicitGenerationModeFromStateJson(raw);
+    if (explicit) return explicit;
+    const widgetMode = String(getWidget(node, "generation_mode")?.value || "").toLowerCase();
+    return widgetMode === "fl2va" ? "fl2va" : "ref2va";
+}
+
+function captureNativeWorkflowState(node, runtime = null) {
+    // Custom DOM buttons mutate hidden native widgets on `click`, but Nodes 2.0
+    // captures normal UI edits on the preceding `mouseup`. Without an explicit
+    // post-mutation capture, ChangeTracker.activeState can therefore lag one
+    // interaction behind the canvas and a quick refresh can restore the old mode.
+    if (runtime?.hydrating || isH3GraphConfiguring()) return false;
+    try {
+        const workflow = app?.extensionManager?.workflow?.activeWorkflow;
+        const tracker = workflow?.changeTracker;
+        if (!tracker) return false;
+        if (typeof tracker.captureCanvasState === "function") {
+            tracker.captureCanvasState();
+            return true;
+        }
+        // Compatibility fallback for older frontends.
+        if (typeof tracker.checkState === "function") {
+            tracker.checkState();
+            return true;
+        }
+    } catch (_) {}
+    return false;
+}
+
+function notifyWorkflowChanged(node, runtime = null) {
+    const graph = node?.graph || app.graph;
+    // Never mark the graph changed while ComfyUI is hydrating/configuring this
+    // node from an existing workflow. Doing so can make the frontend serialize
+    // the temporary schema defaults before the saved widgets have finished
+    // restoring; a second browser refresh would then load that poisoned snapshot.
+    if (runtime?.hydrating || isH3GraphConfiguring()) {
+        graph?.setDirtyCanvas?.(true, true);
+        return;
+    }
+    // setDirtyCanvas() only repaints. graph.change() is the actual LiteGraph /
+    // Nodes 2.0 mutation notification used for genuine custom-DOM edits.
+    try { graph?.change?.(); } catch (_) {}
+    graph?.setDirtyCanvas?.(true, true);
+}
+
 function updateHidden(node, runtime) {
     snapshotModeValidation(runtime);
     const raw = serializeState(runtime.state);
     runtime.jsonWidget.value = raw;
-    node.graph?.setDirtyCanvas(true, true);
+    if (runtime.generationModeWidget) {
+        runtime.generationModeWidget.value = runtime.state?.generation_mode === "fl2va" ? "fl2va" : "ref2va";
+    }
+    notifyWorkflowChanged(node, runtime);
 }
 
 function updateRefsHidden(node, runtime) {
     if (!runtime?.refsWidget) return;
     runtime.refsState.refs = normalizeRefsArray(runtime.refsState?.refs || []);
     runtime.refsWidget.value = serializeRefsState(runtime.refsState);
-    node.graph?.setDirtyCanvas(true, true);
+    notifyWorkflowChanged(node, runtime);
 }
 
 function handleReferenceChange(node, runtime, message = "Image references changed") {
@@ -1391,14 +1440,22 @@ function handleReferenceChange(node, runtime, message = "Image references change
 
 function openReferenceEditor(node, runtime, slotIndex, ref, target = null) {
     if (!ref?.id || !node || !runtime) return;
-    const isFrame = Boolean(target && ["first", "last"].includes(String(target.kind)));
+    const isFrame = Boolean(target && ["first", "last", "guide"].includes(String(target.kind)));
     const frameClipIndex = isFrame ? Number(target.clipIndex) : -1;
     const frameKind = isFrame ? String(target.kind) : "";
+    const frameGuideIndex = frameKind === "guide" ? Number(target?.guideIndex) : -1;
+    const frameKindLabel = frameKind === "first"
+        ? "First frame"
+        : frameKind === "last"
+            ? "Last frame"
+            : `Guide ${Number.isInteger(frameGuideIndex) && frameGuideIndex >= 0 ? frameGuideIndex + 1 : 1}`;
     const frameLabel = isFrame
-        ? `Clip ${frameClipIndex + 1} ${frameKind === "first" ? "First frame" : "Last frame"}`
+        ? `Clip ${frameClipIndex + 1} ${frameKindLabel}`
         : `Ref ${slotIndex + 1}`;
     const defaultName = isFrame
-        ? `clip_${frameClipIndex + 1}_${frameKind}.png`
+        ? (frameKind === "guide"
+            ? `clip_${frameClipIndex + 1}_guide_${Math.max(0, frameGuideIndex) + 1}.png`
+            : `clip_${frameClipIndex + 1}_${frameKind}.png`)
         : `ref_${slotIndex + 1}.png`;
     if (projectBusy(runtime) || runtime.refBusy || runtime.projectOperationBusy) {
         alert("Wait for the current clip generation to finish before editing a reference image.");
@@ -1683,15 +1740,24 @@ function openReferenceEditor(node, runtime, slotIndex, ref, target = null) {
             if (!newRef) throw new Error("The backend returned invalid reference metadata.");
 
             const current = isFrame
-                ? runtime.state?.clips?.[frameClipIndex]?.[`${frameKind}_frame`]
+                ? (frameKind === "guide"
+                    ? runtime.state?.clips?.[frameClipIndex]?.guides?.[frameGuideIndex]?.frame
+                    : runtime.state?.clips?.[frameClipIndex]?.[`${frameKind}_frame`])
                 : runtime.refsState.refs[slotIndex];
             if (!current || String(current.id) !== String(ref.id)) {
                 throw new Error(`${frameLabel} changed while the editor was open.`);
             }
 
             if (isFrame) {
-                runtime.state.clips[frameClipIndex][`${frameKind}_frame`] = newRef;
+                if (frameKind === "guide") {
+                    const guide = runtime.state?.clips?.[frameClipIndex]?.guides?.[frameGuideIndex];
+                    if (!guide) throw new Error(`${frameLabel} changed while the editor was open.`);
+                    guide.frame = newRef;
+                } else {
+                    runtime.state.clips[frameClipIndex][`${frameKind}_frame`] = newRef;
+                }
                 updateHidden(node, runtime);
+                captureNativeWorkflowState(node, runtime);
                 runtime.statusText = sameRefContent(ref, newRef)
                     ? `${frameLabel} unchanged`
                     : `${frameLabel} adjusted | validations unchanged`;
@@ -1768,16 +1834,18 @@ async function uploadReference(node, runtime, slotIndex, file) {
     }
 }
 
-async function uploadClipFrame(node, runtime, clipIndex, kind, file) {
+async function uploadClipFrame(node, runtime, clipIndex, kind, file, guideIndex = -1) {
     if (!node || !runtime || !file) return;
     const clip = runtime.state?.clips?.[clipIndex];
-    if (!clip || !["first", "last"].includes(kind)) return;
+    if (!clip || !["first", "last", "guide"].includes(kind)) return;
     if (projectBusy(runtime)) {
         alert("Wait for the current clip generation to finish before changing an FL2VA keyframe.");
         return;
     }
+    if (kind === "guide" && (!Number.isInteger(guideIndex) || guideIndex < 0 || guideIndex > MAX_FL2VA_GUIDES)) return;
     runtime.refBusy = true;
-    runtime.statusText = `Loading Clip ${clipIndex + 1} ${kind} frame: ${file.name}…`;
+    const label = kind === "guide" ? `guide ${guideIndex + 1}` : `${kind} frame`;
+    runtime.statusText = `Loading Clip ${clipIndex + 1} ${label}: ${file.name}…`;
     render(node, runtime);
     try {
         const form = new FormData();
@@ -1789,13 +1857,28 @@ async function uploadClipFrame(node, runtime, clipIndex, kind, file) {
         }
         const ref = normalizeRefDescriptor(payload.ref);
         if (!ref) throw new Error("The backend returned invalid FL2VA frame metadata.");
-        clip[`${kind}_frame`] = ref;
-        if (kind === "first" && String(clip.first_source || "manual") === "previous_clip") {
-            clip.first_source = "manual";
-            invalidateFl2vaPlanAndFollowers(runtime, clipIndex, true);
+
+        if (kind === "guide") {
+            clip.guides = normalizeGuideList(clip);
+            if (guideIndex < clip.guides.length) {
+                clip.guides[guideIndex].frame = ref;
+            } else if (guideIndex === clip.guides.length && clip.guides.length < MAX_FL2VA_GUIDES) {
+                clip.guides.push({ frame: ref, frame_idx: 0 });
+            } else {
+                throw new Error(`A maximum of ${MAX_FL2VA_GUIDES} image guides is supported per FL2VA clip.`);
+            }
+        } else {
+            clip[`${kind}_frame`] = ref;
+            if (kind === "first" && String(clip.first_source || "manual") === "previous_clip") {
+                clip.first_source = "manual";
+                invalidateFl2vaPlanAndFollowers(runtime, clipIndex, true);
+            }
         }
         updateHidden(node, runtime);
-        runtime.statusText = `Clip ${clipIndex + 1} ${kind} frame loaded`;
+        captureNativeWorkflowState(node, runtime);
+        runtime.statusText = kind === "guide"
+            ? `Clip ${clipIndex + 1} Guide ${guideIndex + 1} loaded`
+            : `Clip ${clipIndex + 1} ${kind} frame loaded`;
     } catch (error) {
         runtime.statusText = "FL2VA frame load failed";
         alert(String(error?.message || error));
@@ -1805,11 +1888,18 @@ async function uploadClipFrame(node, runtime, clipIndex, kind, file) {
     }
 }
 
-function removeClipFrame(node, runtime, clipIndex, kind) {
+function removeClipFrame(node, runtime, clipIndex, kind, guideIndex = -1) {
     const clip = runtime?.state?.clips?.[clipIndex];
-    if (!clip || !["first", "last"].includes(kind)) return;
-    clip[`${kind}_frame`] = null;
+    if (!clip || !["first", "last", "guide"].includes(kind)) return;
+    if (kind === "guide") {
+        clip.guides = normalizeGuideList(clip);
+        if (!Number.isInteger(guideIndex) || guideIndex < 0 || guideIndex >= clip.guides.length) return;
+        clip.guides.splice(guideIndex, 1);
+    } else {
+        clip[`${kind}_frame`] = null;
+    }
     updateHidden(node, runtime);
+    captureNativeWorkflowState(node, runtime);
     render(node, runtime);
 }
 
@@ -2299,6 +2389,7 @@ function applyProjectPayload(node, runtime, projectPayload) {
     // visible setting happens to match the workflow that was previously run.
     runtime.state.load_token = `${Date.now().toString(36)}_${randomSeed().toString(36)}`;
     updateHidden(node, runtime);
+    captureNativeWorkflowState(node, runtime);
 
     const finalSettings = projectPayload?.final_decode?.settings;
     const finalNode = connectedFinalDecode(node);
@@ -2452,8 +2543,14 @@ async function loadProjectFile(node, runtime, file) {
 
         // Final Decode / Preview can rebuild the full preview from decoded blobs
         // already inside the imported cache, with no sampler or VAE execution.
+        // Pass the imported mode explicitly. During Nodes 2.0 restore the hidden
+        // native combo can transiently expose its Ref2VA schema default; Final
+        // Decode must restore the cache that belongs to the project just loaded.
         window.dispatchEvent(new CustomEvent("h3-extender-project-loaded", {
-            detail: { owner_id: String(node.id) },
+            detail: {
+                owner_id: String(node.id),
+                generation_mode: runtime.state?.generation_mode === "fl2va" ? "fl2va" : "ref2va",
+            },
         }));
     } catch (error) {
         runtime.statusText = "Load Project failed";
@@ -2894,7 +2991,7 @@ function renderFl2vaFrames(node, runtime) {
 function renderMediaStrip(node, runtime, fl2vaMode) {
     if (runtime?.refsHeader) {
         runtime.refsHeader.textContent = fl2vaMode
-            ? "FL2VA FIRST / LAST FRAMES — double-click a thumbnail to edit"
+            ? "FL2VA FIRST / LAST FRAMES — per-clip IMAGE GUIDES are inside each card"
             : "REFERENCE IMAGES — double-click a thumbnail to edit";
     }
     if (runtime?.refsRow) runtime.refsRow.style.gap = fl2vaMode ? "9px" : "7px";
@@ -3084,8 +3181,230 @@ function render(node, runtime) {
         card.appendChild(head);
 
         // FL2VA First/Last frames live in the shared media strip above the
-        // cards, replacing the Ref2VA reference-image strip. Cards therefore
-        // keep the same compact structure in both modes.
+        // cards. AddGuide anchors are dynamic and stay compact in a horizontal
+        // per-card strip because every guide owns its own exact frame index.
+        if (fl2vaMode) {
+            clip.guides = normalizeGuideList(clip);
+            const guideFrameCount = h3FrameCountForDuration(clip.duration);
+            for (const guide of clip.guides) {
+                guide.frame_idx = Math.max(
+                    -guideFrameCount,
+                    Math.min(guideFrameCount - 1, normalizeGuideFrameIdx(guide.frame_idx ?? 0)),
+                );
+            }
+
+            const guideWrap = document.createElement("div");
+            guideWrap.style.display = "flex";
+            guideWrap.style.flexDirection = "column";
+            guideWrap.style.gap = "4px";
+            guideWrap.style.marginBottom = "7px";
+            guideWrap.style.padding = "5px";
+            guideWrap.style.border = "1px solid rgba(255,255,255,.11)";
+            guideWrap.style.borderRadius = "6px";
+            guideWrap.style.background = "rgba(0,0,0,.16)";
+
+            const guideHeader = document.createElement("div");
+            guideHeader.style.display = "flex";
+            guideHeader.style.alignItems = "center";
+            guideHeader.style.justifyContent = "space-between";
+            guideHeader.style.gap = "6px";
+
+            const guideTitle = document.createElement("div");
+            guideTitle.textContent = `IMAGE GUIDES${clip.guides.length ? ` • ${clip.guides.length}` : ""}`;
+            guideTitle.style.fontSize = "10px";
+            guideTitle.style.fontWeight = "700";
+            guideTitle.style.opacity = ".78";
+
+            const guideAdd = document.createElement("button");
+            guideAdd.type = "button";
+            guideAdd.textContent = "+ Add Guide";
+            guideAdd.title = "Add another MiniMax H3 image guide";
+            guideAdd.style.height = "21px";
+            guideAdd.style.fontSize = "9px";
+            guideAdd.style.padding = "1px 7px";
+            guideAdd.disabled = Boolean(
+                runtime.refBusy
+                || runtime.projectOperationBusy
+                || projectBusy(runtime)
+                || clip.guides.length >= MAX_FL2VA_GUIDES
+            );
+            guideAdd.addEventListener("click", (event) => {
+                event.preventDefault();
+                if (guideAdd.disabled) return;
+                runtime.pendingFrameClip = index;
+                runtime.pendingFrameKind = "guide";
+                runtime.pendingFrameGuideIndex = clip.guides.length;
+                runtime.frameFileInput?.click();
+            });
+            guideHeader.append(guideTitle, guideAdd);
+            guideWrap.appendChild(guideHeader);
+
+            const guideRow = document.createElement("div");
+            guideRow.style.display = "flex";
+            guideRow.style.gap = "6px";
+            guideRow.style.alignItems = "flex-start";
+            guideRow.style.overflowX = "auto";
+            guideRow.style.overflowY = "hidden";
+            guideRow.style.paddingBottom = clip.guides.length > 3 ? "3px" : "0";
+            guideRow.style.minHeight = "82px";
+
+            if (!clip.guides.length) {
+                const emptyGuide = document.createElement("button");
+                emptyGuide.type = "button";
+                emptyGuide.textContent = "+";
+                emptyGuide.title = "Load the first image guide";
+                emptyGuide.style.flex = "0 0 72px";
+                emptyGuide.style.width = "72px";
+                emptyGuide.style.height = "76px";
+                emptyGuide.style.fontSize = "24px";
+                emptyGuide.style.opacity = ".55";
+                emptyGuide.disabled = Boolean(runtime.refBusy || runtime.projectOperationBusy || projectBusy(runtime));
+                emptyGuide.addEventListener("click", (event) => {
+                    event.preventDefault();
+                    if (emptyGuide.disabled) return;
+                    runtime.pendingFrameClip = index;
+                    runtime.pendingFrameKind = "guide";
+                    runtime.pendingFrameGuideIndex = 0;
+                    runtime.frameFileInput?.click();
+                });
+                guideRow.appendChild(emptyGuide);
+            }
+
+            clip.guides.forEach((guide, guideIndex) => {
+                const guideRef = normalizeRefDescriptor(guide.frame);
+                if (!guideRef) return;
+                guide.frame = guideRef;
+
+                const slot = document.createElement("div");
+                slot.style.flex = "0 0 82px";
+                slot.style.width = "82px";
+                slot.style.minWidth = "82px";
+
+                const guideThumb = document.createElement("div");
+                guideThumb.style.width = "82px";
+                guideThumb.style.height = "54px";
+                guideThumb.style.position = "relative";
+                guideThumb.style.display = "flex";
+                guideThumb.style.alignItems = "center";
+                guideThumb.style.justifyContent = "center";
+                guideThumb.style.overflow = "hidden";
+                guideThumb.style.border = "1px solid rgba(255,255,255,.15)";
+                guideThumb.style.borderRadius = "5px";
+                guideThumb.style.background = "rgba(0,0,0,.25)";
+                guideThumb.title = `Guide ${guideIndex + 1} — double-click to edit`;
+
+                const img = document.createElement("img");
+                img.src = refImageUrl(guideRef);
+                img.alt = `Clip ${index + 1} Guide ${guideIndex + 1}`;
+                img.style.width = "100%";
+                img.style.height = "100%";
+                img.style.objectFit = "contain";
+                img.draggable = false;
+                img.addEventListener("dblclick", (event) => {
+                    event.preventDefault();
+                    event.stopPropagation();
+                    openReferenceEditor(node, runtime, -1, guideRef, {
+                        clipIndex: index,
+                        kind: "guide",
+                        guideIndex,
+                    });
+                });
+                guideThumb.appendChild(img);
+
+                const badge = document.createElement("div");
+                badge.textContent = `G${guideIndex + 1}`;
+                badge.style.position = "absolute";
+                badge.style.left = "3px";
+                badge.style.top = "3px";
+                badge.style.padding = "1px 4px";
+                badge.style.fontSize = "8px";
+                badge.style.lineHeight = "12px";
+                badge.style.borderRadius = "4px";
+                badge.style.background = "rgba(0,0,0,.68)";
+                badge.style.pointerEvents = "none";
+                guideThumb.appendChild(badge);
+
+                const clear = document.createElement("button");
+                clear.type = "button";
+                clear.textContent = "×";
+                clear.title = `Remove Guide ${guideIndex + 1}`;
+                clear.style.position = "absolute";
+                clear.style.top = "3px";
+                clear.style.right = "3px";
+                clear.style.width = "19px";
+                clear.style.height = "19px";
+                clear.style.minWidth = "19px";
+                clear.style.padding = "0";
+                clear.style.borderRadius = "10px";
+                clear.style.background = "rgba(0,0,0,.68)";
+                clear.disabled = Boolean(runtime.refBusy || runtime.projectOperationBusy || projectBusy(runtime));
+                clear.addEventListener("click", (event) => {
+                    event.preventDefault();
+                    event.stopPropagation();
+                    if (!clear.disabled) removeClipFrame(node, runtime, index, "guide", guideIndex);
+                });
+                guideThumb.appendChild(clear);
+                slot.appendChild(guideThumb);
+
+                const guideControls = document.createElement("div");
+                guideControls.style.display = "grid";
+                guideControls.style.gridTemplateColumns = "53px 25px";
+                guideControls.style.gap = "4px";
+                guideControls.style.marginTop = "3px";
+
+                const guideIdx = document.createElement("input");
+                guideIdx.type = "number";
+                guideIdx.min = String(-guideFrameCount);
+                guideIdx.max = String(guideFrameCount - 1);
+                guideIdx.step = "1";
+                guideIdx.value = String(guide.frame_idx);
+                guideIdx.title = `Guide ${guideIndex + 1} frame index. Valid range: ${-guideFrameCount} to ${guideFrameCount - 1}. Negative values count from the end.`;
+                guideIdx.style.width = "53px";
+                guideIdx.style.height = "22px";
+                guideIdx.style.boxSizing = "border-box";
+                guideIdx.style.fontSize = "9px";
+                guideIdx.style.padding = "1px 3px";
+                guideIdx.addEventListener("change", () => {
+                    const next = Math.max(
+                        -guideFrameCount,
+                        Math.min(guideFrameCount - 1, normalizeGuideFrameIdx(guideIdx.value)),
+                    );
+                    guideIdx.value = String(next);
+                    if (next !== guide.frame_idx) {
+                        guide.frame_idx = next;
+                        updateHidden(node, runtime);
+                        captureNativeWorkflowState(node, runtime);
+                        runtime.statusText = `Clip ${index + 1} Guide ${guideIndex + 1} → frame ${next}`;
+                        render(node, runtime);
+                    }
+                });
+
+                const replace = document.createElement("button");
+                replace.type = "button";
+                replace.textContent = "↻";
+                replace.title = `Replace Guide ${guideIndex + 1}`;
+                replace.style.width = "25px";
+                replace.style.height = "22px";
+                replace.style.padding = "0";
+                replace.style.fontSize = "12px";
+                replace.disabled = Boolean(runtime.refBusy || runtime.projectOperationBusy || projectBusy(runtime));
+                replace.addEventListener("click", (event) => {
+                    event.preventDefault();
+                    if (replace.disabled) return;
+                    runtime.pendingFrameClip = index;
+                    runtime.pendingFrameKind = "guide";
+                    runtime.pendingFrameGuideIndex = guideIndex;
+                    runtime.frameFileInput?.click();
+                });
+
+                guideControls.append(guideIdx, replace);
+                slot.appendChild(guideControls);
+                guideRow.appendChild(slot);
+            });
+
+            guideWrap.appendChild(guideRow);
+            card.appendChild(guideWrap);
+        }
 
         card.appendChild(makeFieldLabel("Prompt"));
         const prompt = document.createElement("textarea");
@@ -3288,6 +3607,12 @@ function render(node, runtime) {
             const v = Math.max(0.25, Math.min(150, Number(duration.value || 10)));
             if (Math.abs(v - clip.duration) > 1e-9) {
                 clip.duration = v;
+                const frameCount = h3FrameCountForDuration(v);
+                clip.guides = normalizeGuideList(clip);
+                for (const guide of clip.guides) {
+                    const guideIdx = normalizeGuideFrameIdx(guide.frame_idx ?? 0);
+                    guide.frame_idx = Math.max(-frameCount, Math.min(frameCount - 1, guideIdx));
+                }
                 updateHidden(node, runtime);
                 render(node, runtime);
             }
@@ -3333,9 +3658,7 @@ function render(node, runtime) {
         validateLabel.append(validated, document.createTextNode("Validated"));
 
         const info = document.createElement("span");
-        const rawFrames = Math.max(5, Math.round(clip.duration * 24));
-        let aligned = rawFrames;
-        while (aligned % 17 !== 5) aligned++;
+        const aligned = h3FrameCountForDuration(clip.duration);
         info.textContent = `${aligned}f / ${(aligned / 24).toFixed(3)}s`;
         info.style.fontSize = "10px";
         info.style.opacity = ".65";
@@ -3495,6 +3818,52 @@ function installInvalidationHooks(node, runtime) {
 }
 
 
+function hydrateRuntimeFromNativeWidgets(node, runtime, restoreCache = false) {
+    if (!node || !runtime) return;
+
+    // Native workflow widgets are the only persistence source. No onSerialize
+    // interception, no node-property mirror, no widgets_values rewriting.
+    const rawState = String(runtime.jsonWidget?.value || "");
+    const state = parseState(rawState);
+    const mode = persistentGenerationMode(node, rawState);
+    activateModeState(state, mode);
+    runtime.state = state;
+    if (runtime.generationModeWidget) runtime.generationModeWidget.value = mode;
+
+    runtime.refsState = parseRefsState(runtime.refsWidget?.value);
+    snapshotModeValidation(runtime, mode);
+    const restoredValidatedPrefix = validatedPrefixFromState(runtime.state);
+    runtime.cachedCount = restoredValidatedPrefix;
+    runtime.validatedCount = restoredValidatedPrefix;
+
+    const removedLegacyRefs = removeLegacyImageRefInputs(node);
+    syncDynamicAVReferenceInputs(node);
+    if (removedLegacyRefs && refCount(runtime) === 0) {
+        runtime.statusText = "Legacy image-ref sockets removed — load references in the Extender";
+    }
+
+    if (String(getWidget(node, "resolution_mode")?.value || "manual") === "manual") {
+        rememberManualResolution(
+            node,
+            runtime,
+            Number(getWidget(node, "width")?.value || runtime.manualWidth || 896),
+            Number(getWidget(node, "height")?.value || runtime.manualHeight || 576),
+        );
+    }
+
+    render(node, runtime);
+    syncResolutionMirror(node, runtime);
+    syncDomHeight(node, runtime, true);
+    if (restoreCache) restoreCacheState(node, runtime);
+}
+
+function finalizeRuntimeAfterGraphLoad(node, runtime) {
+    if (!node || !runtime) return;
+    runtime.hydrating = false;
+    runtime.ready = true;
+    hydrateRuntimeFromNativeWidgets(node, runtime, true);
+}
+
 function buildUi(node) {
     if (node.__h3Extender) return node.__h3Extender;
 
@@ -3509,12 +3878,10 @@ function buildUi(node) {
     hideNativeWidget(node, generationModeWidget);
 
     const state = parseState(jsonWidget.value);
-    // clips_json is the durable source of truth for the active mode. On workflow
-    // startup the hidden native combo may still be at its schema default before
-    // ComfyUI restores widget values; letting that default win forced every saved
-    // FL2VA workflow to reopen as REF2VA. Old states without a mode marker already
-    // parse as REF2VA, so this remains backward compatible.
-    const persistedMode = state.generation_mode === "fl2va" ? "fl2va" : "ref2va";
+    // Initial node construction can happen before a saved workflow has been
+    // configured. This state is display-only until loadedGraphNode hydrates it
+    // from the native serialized widgets.
+    const persistedMode = persistentGenerationMode(node, jsonWidget.value);
     generationModeWidget.value = persistedMode;
     activateModeState(state, persistedMode);
     const refsState = parseRefsState(refsWidget.value);
@@ -3560,6 +3927,7 @@ function buildUi(node) {
         runtime.validatedCount = 0;
         runtime.cacheStateRestored = false;
         updateHidden(node, runtime);
+        captureNativeWorkflowState(node, runtime);
         render(node, runtime);
         restoreCacheState(node, runtime);
         requestAnimationFrame(() => syncDomHeight(node, runtime, true));
@@ -3715,6 +4083,7 @@ function buildUi(node) {
         pendingRefSlot: -1,
         pendingFrameClip: -1,
         pendingFrameKind: "",
+        pendingFrameGuideIndex: -1,
         refBusy: false,
         projectOperationBusy: false,
         projectName: String(node?.properties?.h3_project_name || ""),
@@ -3767,6 +4136,10 @@ function buildUi(node) {
                 (state.clips || []).map((clip) => [String(clip.id), Boolean(clip.validated)])
             ),
         },
+        // True while ComfyUI is reconstructing a serialized graph. The official
+        // lifecycle hooks clear this only after native widget restoration has
+        // completed; custom controls never serialize a parallel state.
+        hydrating: isH3GraphConfiguring(),
         ready: false,
     };
 
@@ -3784,11 +4157,13 @@ function buildUi(node) {
         const file = frameFileInput.files?.[0];
         const clipIndex = Number(runtime.pendingFrameClip);
         const kind = String(runtime.pendingFrameKind || "");
+        const guideIndex = Number(runtime.pendingFrameGuideIndex);
         frameFileInput.value = "";
         runtime.pendingFrameClip = -1;
         runtime.pendingFrameKind = "";
-        if (file && Number.isInteger(clipIndex) && clipIndex >= 0 && ["first", "last"].includes(kind)) {
-            await uploadClipFrame(node, runtime, clipIndex, kind, file);
+        runtime.pendingFrameGuideIndex = -1;
+        if (file && Number.isInteger(clipIndex) && clipIndex >= 0 && ["first", "last", "guide"].includes(kind)) {
+            await uploadClipFrame(node, runtime, clipIndex, kind, file, guideIndex);
         }
     });
 
@@ -3837,19 +4212,11 @@ function buildUi(node) {
 
     const oldConfigure = node.onConfigure;
     node.onConfigure = function (info) {
-        if (oldConfigure) oldConfigure.apply(this, arguments);
+        const result = oldConfigure ? oldConfigure.apply(this, arguments) : undefined;
 
-        // Keep a copy of the serialized clips_json from the configure payload.
-        // On a browser F5/Refresh, Nodes 2.0 can restore native widget.value a
-        // frame later than onConfigure; reading runtime.jsonWidget.value there
-        // would therefore see the schema default and incorrectly select Ref2VA.
-        const configuredStateRaw = configuredClipsStateJson(info, runtime.jsonWidget.value);
-        if (configuredStateRaw) runtime.jsonWidget.value = configuredStateRaw;
-
-        // Workflow widget arrays are positional. The two v14.25 resolution
-        // widgets were intentionally appended after clips_json so old values do
-        // not shift. If this is an older workflow, force Manual to preserve its
-        // historical width/height behavior. Newly-created nodes default to Auto.
+        // Keep only the legacy resolution migration here. Native ComfyUI
+        // configure() already restored clips_json/refs_json/generation_mode by
+        // the time loadedGraphNode is emitted; do not shadow that mechanism.
         const savedWidgetValues = Array.isArray(info?.widgets_values) ? info.widgets_values : null;
         const hasSavedResolutionMode = Boolean(
             savedWidgetValues?.some((value) => value === "auto_from_ref" || value === "manual")
@@ -3858,71 +4225,21 @@ function buildUi(node) {
             setWidgetValue(this, "resolution_mode", "manual");
         }
 
-        requestAnimationFrame(() => {
-            const removedLegacyRefs = removeLegacyImageRefInputs(this);
-            syncDynamicAVReferenceInputs(this);
-            // Use the captured configure payload, not the potentially late Vue
-            // widget restore. This makes F5/Refresh follow the same deterministic
-            // path as a full ComfyUI restart.
-            runtime.state = parseState(configuredStateRaw || runtime.jsonWidget.value);
-            runtime.jsonWidget.value = serializeState(runtime.state);
-            // Same startup rule as buildUi(): persisted card state owns the mode.
-            // This prevents the hidden native widget's transient default from
-            // switching a saved FL2VA workflow back to REF2VA during configure.
-            const persistedMode = runtime.state.generation_mode === "fl2va" ? "fl2va" : "ref2va";
-            const modeWidget = getWidget(this, "generation_mode");
-            if (modeWidget) modeWidget.value = persistedMode;
-            activateModeState(runtime.state, persistedMode);
-            snapshotModeValidation(runtime, runtime.state.generation_mode);
-            runtime.refsState = parseRefsState(runtime.refsWidget.value);
-            updateRefsHidden(this, runtime);
-            const restoredValidatedPrefix = validatedPrefixFromState(runtime.state);
-            runtime.cachedCount = restoredValidatedPrefix;
-            runtime.validatedCount = restoredValidatedPrefix;
-            if (removedLegacyRefs && refCount(runtime) === 0) {
-                runtime.statusText = "Legacy image-ref sockets removed — load references in the Extender";
-            }
-            if (String(getWidget(this, "resolution_mode")?.value || "manual") === "manual") {
-                rememberManualResolution(
-                    this,
-                    runtime,
-                    Number(getWidget(this, "width")?.value || runtime.manualWidth || 896),
-                    Number(getWidget(this, "height")?.value || runtime.manualHeight || 576),
-                );
-            }
-            render(this, runtime);
-            restoreCacheState(this, runtime);
-            syncResolutionMirror(this, runtime);
-            syncDomHeight(this, runtime, true);
-        });
-    };
-
-    const oldSerialize = node.onSerialize;
-    node.onSerialize = function (info) {
-        const result = oldSerialize ? oldSerialize.apply(this, arguments) : undefined;
-        // Flush the custom runtime state into the native serialized payload too.
-        // This is especially important for ComfyUI's in-browser refresh path,
-        // which can snapshot the graph without a backend execution in between.
-        // Do it after the previous hook so no older serializer can overwrite it.
-        if (runtime?.state) {
-            const raw = serializeState(runtime.state);
-            runtime.jsonWidget.value = raw;
-            if (runtime.generationModeWidget) {
-                runtime.generationModeWidget.value = runtime.state.generation_mode === "fl2va" ? "fl2va" : "ref2va";
-            }
-            replaceConfiguredClipsStateJson(info, raw);
+        // Direct configure() calls outside a full graph load (copy/paste and a
+        // few legacy paths) still hydrate from the native widget values, but no
+        // custom serialization is involved.
+        if (!isH3GraphConfiguring()) {
+            hydrateRuntimeFromNativeWidgets(this, runtime, false);
+            runtime.hydrating = false;
+            finalizeRuntimeAfterGraphLoad(this, runtime);
         }
         return result;
     };
 
     requestAnimationFrame(() => {
         requestAnimationFrame(() => {
-            removeLegacyImageRefInputs(node);
-            syncDynamicAVReferenceInputs(node);
-            runtime.ready = true;
-            restoreCacheState(node, runtime);
-            syncResolutionMirror(node, runtime);
-            syncDomHeight(node, runtime, true);
+            if (runtime.hydrating || isH3GraphConfiguring()) return;
+            finalizeRuntimeAfterGraphLoad(node, runtime);
         });
     });
 
@@ -3999,7 +4316,52 @@ function clearTransientRenderingState(statusText = null) {
 app.registerExtension({
     name: "MiniMaxH3.Extender",
 
+    beforeConfigureGraph() {
+        h3GraphConfiguring = true;
+        for (const node of app.graph?._nodes || []) {
+            if (!(node?.comfyClass === TARGET || node?.type === TARGET)) continue;
+            if (node.__h3Extender) node.__h3Extender.hydrating = true;
+        }
+    },
+
+    loadedGraphNode(node) {
+        if (!(node?.comfyClass === TARGET || node?.type === TARGET)) return;
+        const runtime = buildUi(node);
+        if (!runtime) return;
+        runtime.hydrating = true;
+        // This hook runs after LGraphNode.configure() restored the native widget
+        // values. Hydrate runtime/UI from them, but wait for afterConfigureGraph
+        // before touching disk cache/preview state.
+        hydrateRuntimeFromNativeWidgets(node, runtime, false);
+    },
+
+    afterConfigureGraph() {
+        h3GraphConfiguring = false;
+        for (const node of app.graph?._nodes || []) {
+            if (!(node?.comfyClass === TARGET || node?.type === TARGET)) continue;
+            const runtime = buildUi(node);
+            if (!runtime) continue;
+            finalizeRuntimeAfterGraphLoad(node, runtime);
+        }
+    },
+
     setup() {
+        // Nodes 2.0 persists workflow drafts on graphChanged with a debounce and
+        // current frontends flush that debounce on pagehide. Run our capture in
+        // the capture phase so ComfyUI's own pagehide flush serializes the latest
+        // hidden widget values even when the user hits F5 immediately after a
+        // custom-DOM action.
+        if (!window.__h3ExtenderPagehideCaptureInstalled) {
+            window.__h3ExtenderPagehideCaptureInstalled = true;
+            window.addEventListener("pagehide", () => {
+                for (const node of app.graph?._nodes || []) {
+                    if (!(node?.comfyClass === TARGET || node?.type === TARGET)) continue;
+                    const runtime = node.__h3Extender || null;
+                    captureNativeWorkflowState(node, runtime);
+                }
+            }, true);
+        }
+
         // Official ComfyUI terminal execution events. In particular, pressing
         // Kill/Interrupt raises execution_interrupted and bypasses onExecuted.
         api.addEventListener("execution_interrupted", () => {
@@ -4046,6 +4408,7 @@ app.registerExtension({
 
             runtime.refsWidget.value = String(detail.refs_json);
             runtime.refsState = parseRefsState(detail.refs_json);
+            updateRefsHidden(node, runtime);
             const slots = Array.isArray(detail?.imported_slots)
                 ? detail.imported_slots.map((value) => Number(value)).filter((value) => Number.isInteger(value) && value >= 1 && value <= MAX_IMAGE_REFS)
                 : [];

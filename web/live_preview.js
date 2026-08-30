@@ -5,6 +5,8 @@ const TARGET = "MiniMaxH3MotionContextDiskFinalDecode";
 const DISK_JOIN_TARGET = "MiniMaxH3MotionContextDiskJoin";
 const EXTENDER_TARGET = "MiniMaxH3Extender";
 
+let h3PreviewGraphConfiguring = false;
+
 function ensureSavePreviewButtonStyle() {
     if (document.getElementById("h3-save-preview-button-style")) return;
     const style = document.createElement("style");
@@ -45,20 +47,37 @@ function ensureSavePreviewButtonStyle() {
 }
 
 function stripFinalDecodeOutputs(node) {
-    if (!node?.outputs?.length) return;
+    if (!node) return;
 
-    // Old workflows serialize the nine legacy outputs in the graph JSON.
-    // RETURN_TYPES=() prevents them on newly-defined nodes, but LiteGraph can
-    // restore the serialized sockets during configure(). Remove them here too.
-    while (node.outputs?.length) {
-        const index = node.outputs.length - 1;
+    // Old workflows may still serialize the nine historical Final Decode
+    // outputs. Since v2.1 the node intentionally exposes one native VIDEO
+    // output, so only remove legacy sockets and preserve that one.
+    let keptVideo = false;
+    for (let index = (node.outputs?.length || 0) - 1; index >= 0; index--) {
+        const output = node.outputs[index];
+        const isVideo =
+            String(output?.type || "").toUpperCase() === "VIDEO" ||
+            String(output?.name || "").toLowerCase() === "video";
+
+        if (isVideo && !keptVideo) {
+            keptVideo = true;
+            // Normalize workflows that may have restored an older label.
+            output.name = "video";
+            output.type = "VIDEO";
+            continue;
+        }
+
         if (typeof node.removeOutput === "function") {
             node.removeOutput(index);
         } else {
-            // Fallback for older LiteGraph builds. These outputs were never
-            // meant to be consumed; remove the visual slots at minimum.
             node.outputs.splice(index, 1);
         }
+    }
+
+    // Defensive recovery for workflow/configure paths where LiteGraph restored
+    // legacy sockets after the Python node definition was applied.
+    if (!keptVideo && typeof node.addOutput === "function") {
+        node.addOutput("video", "VIDEO");
     }
 
     node.graph?.setDirtyCanvas(true, true);
@@ -269,14 +288,9 @@ function findUpstreamExtenderId(node) {
 function upstreamGenerationMode(node) {
     const origin = findUpstreamExtenderNode(node);
 
-    // The Extender custom runtime owns the authoritative mode once its UI has
-    // been restored. Prefer it over the hidden native combo, whose default can
-    // transiently be Ref2VA during Nodes 2.0 workflow startup/refresh.
-    const runtimeMode = String(origin?.__h3Extender?.state?.generation_mode || "").toLowerCase();
-    if (runtimeMode === "fl2va" || runtimeMode === "ref2va") return runtimeMode;
-
-    // clips_json also persists the active mode. It gives us a second stable
-    // source before falling back to the native generation_mode widget.
+    // Native serialized widgets are authoritative in Nodes 2.0. Prefer them
+    // over the custom runtime so preview restore can never follow a transient
+    // UI state left over from node construction.
     const clipsWidget = (origin?.widgets || []).find((w) => w?.name === "clips_json");
     if (typeof clipsWidget?.value === "string") {
         try {
@@ -287,7 +301,11 @@ function upstreamGenerationMode(node) {
     }
 
     const widget = (origin?.widgets || []).find((w) => w?.name === "generation_mode");
-    return String(widget?.value || "ref2va") === "fl2va" ? "fl2va" : "ref2va";
+    const widgetMode = String(widget?.value || "").toLowerCase();
+    if (widgetMode === "fl2va" || widgetMode === "ref2va") return widgetMode;
+
+    const runtimeMode = String(origin?.__h3Extender?.state?.generation_mode || "").toLowerCase();
+    return runtimeMode === "fl2va" ? "fl2va" : "ref2va";
 }
 
 function loadPreviewSource(node, state, url) {
@@ -379,7 +397,10 @@ async function restorePreviewOnLoad(node, state, attempt = 0) {
         const params = new URLSearchParams();
         params.set("owner_id", String(ownerId));
         params.set("final_id", String(node.id));
-        params.set("mode", upstreamGenerationMode(node));
+        const restoreMode = String(state.restoreModeOverride || upstreamGenerationMode(node)) === "fl2va"
+            ? "fl2va"
+            : "ref2va";
+        params.set("mode", restoreMode);
 
         const response = await fetch(
             api.apiURL("/h3_extender/restored_preview?" + params.toString())
@@ -416,6 +437,7 @@ async function restorePreviewOnLoad(node, state, attempt = 0) {
         state.saveButton.disabled = false;
         loadPreviewSource(node, state, mediaUrl(payload.video) + "&t=" + Date.now());
         state.restoreLoaded = true;
+        state.restoreModeOverride = null;
 
         requestAnimationFrame(() => {
             requestAnimationFrame(() => {
@@ -782,7 +804,7 @@ function makePlayer(node) {
     return state;
 }
 
-function refreshImportedProjectPreview(ownerId) {
+function refreshImportedProjectPreview(ownerId, generationMode = null) {
     const graph = app.graph;
     if (!graph) return;
     const wanted = String(ownerId);
@@ -794,6 +816,9 @@ function refreshImportedProjectPreview(ownerId) {
         state.liveLoaded = false;
         state.restoreLoaded = false;
         state.restoreRequestRunning = false;
+        state.restoreModeOverride = String(generationMode || "") === "fl2va"
+            ? "fl2va"
+            : (String(generationMode || "") === "ref2va" ? "ref2va" : null);
         state.currentVideoInfo = null;
         state.currentPreviewMeta = null;
         state.colorTimeline = [];
@@ -812,11 +837,36 @@ function refreshImportedProjectPreview(ownerId) {
 app.registerExtension({
     name: "MiniMaxH3.MotionContext.LivePreview",
 
+    beforeConfigureGraph() {
+        h3PreviewGraphConfiguring = true;
+    },
+
+    loadedGraphNode(node) {
+        if (!(node?.comfyClass === TARGET || node?.type === TARGET)) return;
+        stripFinalDecodeOutputs(node);
+        hideCompatibilityWidget(node, "fps");
+        makePlayer(node);
+    },
+
+    afterConfigureGraph() {
+        h3PreviewGraphConfiguring = false;
+        requestAnimationFrame(() => {
+            for (const node of app.graph?._nodes || []) {
+                if (!(node?.comfyClass === TARGET || node?.type === TARGET)) continue;
+                stripFinalDecodeOutputs(node);
+                hideCompatibilityWidget(node, "fps");
+                const state = makePlayer(node);
+                syncPlayerToNode(node, state, true);
+                restorePreviewOnLoad(node, state);
+            }
+        });
+    },
+
     setup() {
         window.addEventListener("h3-extender-project-loaded", (event) => {
             const ownerId = event?.detail?.owner_id;
             if (ownerId == null) return;
-            refreshImportedProjectPreview(ownerId);
+            refreshImportedProjectPreview(ownerId, event?.detail?.generation_mode);
         });
         window.addEventListener("h3-extender-color-updated", (event) => {
             const ownerId = event?.detail?.owner_id;
@@ -873,7 +923,7 @@ app.registerExtension({
                     stripFinalDecodeOutputs(this);
                     hideCompatibilityWidget(this, "fps");
                     syncPlayerToNode(this, state, true);
-                    restorePreviewOnLoad(this, state);
+                    if (!h3PreviewGraphConfiguring) restorePreviewOnLoad(this, state);
                 });
             });
 
@@ -894,7 +944,8 @@ app.registerExtension({
             requestAnimationFrame(() => {
                 stripFinalDecodeOutputs(this);
                 hideCompatibilityWidget(this, "fps");
-                restorePreviewOnLoad(this, state);
+                syncPlayerToNode(this, state, true);
+                if (!h3PreviewGraphConfiguring) restorePreviewOnLoad(this, state);
             });
             return r;
         };
