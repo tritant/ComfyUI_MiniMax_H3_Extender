@@ -759,14 +759,16 @@ def _ensure_plan_timeline_video_cache(data_path, desc, full_path, ffmpeg, fps, *
 
     temp = target.with_name(target.stem + f".tmp_{os.urandom(4).hex()}.mp4")
     log_path = target.with_name(target.stem + f".log_{os.urandom(3).hex()}.txt")
+    from . import motion_context_disk as d
+    ffmpeg = d._preferred_h264_ffmpeg(ffmpeg)
     cmd = [
         ffmpeg, "-y",
         "-i", str(full_path),
         "-map", "0:v:0",
         "-vf", f"trim=end_frame={int(visible_frames)},setpts=PTS-STARTPTS",
         "-an",
-        "-c:v", "libx264", "-preset", "ultrafast", "-crf", "17",
-        "-pix_fmt", "yuv420p", "-movflags", "+faststart",
+        *d._h264_encode_args(ffmpeg, 17, "ultrafast"),
+        "-movflags", "+faststart",
         str(temp),
     ]
     try:

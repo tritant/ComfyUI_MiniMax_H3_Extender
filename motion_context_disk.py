@@ -60,7 +60,7 @@ from .motion_context_ram import (
     _streams_from_latent,
 )
 
-BUILD = "motion-context-disk-v2.3.1"
+BUILD = "motion-context-disk-v2.3.2"
 PREVIEW_AUDIO_MODE = "pcm_single_aac_gain_chain_v3_entry_ramp"
 CACHE_VERSION = 12
 PREVIEW_ROTATION_SLOTS = 3
@@ -1083,6 +1083,96 @@ def _find_ffmpeg():
     raise RuntimeError("MiniMax H3 Disk Final Decode: ffmpeg executable not found.")
 
 
+_NVENC_H264_CACHE = {}
+
+
+def _h264_nvenc_available(ffmpeg):
+    """Return True only when this ffmpeg can actually start an NVENC H.264 encode.
+
+    Checking the encoder list is not enough: ffmpeg may have been compiled with
+    h264_nvenc while the NVIDIA driver/GPU encoder is unavailable. A tiny 64x64
+    one-frame probe catches both cases. The result is cached per ffmpeg binary.
+    """
+    key = str(Path(ffmpeg).resolve()) if ffmpeg else str(ffmpeg)
+    cached = _NVENC_H264_CACHE.get(key)
+    if cached is not None:
+        return bool(cached)
+
+    cmd = [
+        ffmpeg, "-hide_banner", "-loglevel", "error",
+        "-f", "lavfi", "-i", "color=c=black:s=64x64:r=1",
+        "-frames:v", "1", "-an",
+        "-c:v", "h264_nvenc",
+        "-f", "null", "-",
+    ]
+    try:
+        proc = subprocess.run(
+            cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=8
+        )
+        available = proc.returncode == 0
+    except Exception:
+        available = False
+
+    _NVENC_H264_CACHE[key] = bool(available)
+    if available:
+        _LOG.info("H3 Final Decode: H.264 NVENC available; using hardware encoder by default.")
+    else:
+        _LOG.info("H3 Final Decode: H.264 NVENC unavailable; falling back to libx264 CPU.")
+    return bool(available)
+
+
+def _preferred_h264_ffmpeg(ffmpeg):
+    """Prefer a working NVENC-capable ffmpeg only for automatic H.264.
+
+    imageio-ffmpeg remains the default binary for every other codec/path. If its
+    bundled ffmpeg lacks NVENC, a system ffmpeg is tried as a hardware-only
+    alternative without changing HEVC, FFV1, muxing, or metadata behavior.
+    """
+    if _h264_nvenc_available(ffmpeg):
+        return ffmpeg
+    system_ffmpeg = shutil.which("ffmpeg")
+    if system_ffmpeg:
+        try:
+            same = Path(system_ffmpeg).resolve() == Path(ffmpeg).resolve()
+        except Exception:
+            same = str(system_ffmpeg) == str(ffmpeg)
+        if not same and _h264_nvenc_available(system_ffmpeg):
+            return str(system_ffmpeg)
+    return ffmpeg
+
+
+def _nvenc_preset_from_x264(preset):
+    # Preserve the existing speed intent while mapping x264 names to NVENC's p1-p7.
+    return {
+        "ultrafast": "p1",
+        "superfast": "p2",
+        "veryfast": "p3",
+        "faster": "p4",
+        "fast": "p4",
+        "medium": "p5",
+        "slow": "p6",
+    }.get(str(preset), "p4")
+
+
+def _h264_encode_args(ffmpeg, crf, preset, *, force_cpu=False):
+    if not force_cpu and _h264_nvenc_available(ffmpeg):
+        return [
+            "-c:v", "h264_nvenc",
+            "-preset", _nvenc_preset_from_x264(preset),
+            "-tune", "hq",
+            "-rc", "vbr",
+            "-cq", str(int(crf)),
+            "-b:v", "0",
+            "-pix_fmt", "yuv420p",
+        ]
+    return [
+        "-c:v", "libx264",
+        "-preset", str(preset),
+        "-crf", str(int(crf)),
+        "-pix_fmt", "yuv420p",
+    ]
+
+
 def _next_output_path(output_dir, prefix, extension):
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -1140,7 +1230,10 @@ def _start_video_encoder(ffmpeg, temp_video, width, height, fps, codec, crf, pre
     elif str(codec) == "FFV1 lossless":
         enc = ["-c:v", "ffv1", "-level", "3", "-pix_fmt", "gbrp"]
     else:
-        enc = ["-c:v", "libx264", "-preset", str(preset), "-crf", str(int(crf)), "-pix_fmt", "yuv420p"]
+        force_cpu = str(codec) == "H.264 CPU (libx264)"
+        if not force_cpu:
+            ffmpeg = _preferred_h264_ffmpeg(ffmpeg)
+        enc = _h264_encode_args(ffmpeg, crf, preset, force_cpu=force_cpu)
 
     cmd = [
         ffmpeg, "-y",
@@ -1633,12 +1726,15 @@ def _ffmpeg_color_filter(timeline):
     return ",".join(filters)
 
 
-def _video_reencode_args(codec, crf, preset):
+def _video_reencode_args(ffmpeg, codec, crf, preset):
     if str(codec) == "H.265 / HEVC":
         return ["-c:v", "libx265", "-preset", str(preset), "-crf", str(int(crf)), "-pix_fmt", "yuv420p"]
     if str(codec) == "FFV1 lossless":
         return ["-c:v", "ffv1", "-level", "3", "-pix_fmt", "gbrp"]
-    return ["-c:v", "libx264", "-preset", str(preset), "-crf", str(int(crf)), "-pix_fmt", "yuv420p"]
+    return _h264_encode_args(
+        ffmpeg, crf, preset,
+        force_cpu=(str(codec) == "H.264 CPU (libx264)"),
+    )
 
 
 def _apply_color_timeline_to_file(
@@ -1658,13 +1754,15 @@ def _apply_color_timeline_to_file(
         return destination
 
     log_path = _ensure_cache_root() / f"_color_{uuid.uuid4().hex[:10]}.log"
+    if str(codec) == "H.264":
+        ffmpeg = _preferred_h264_ffmpeg(ffmpeg)
     cmd = [
         ffmpeg, "-y",
         "-i", str(source),
         "-map", "0:v:0",
         "-map", "0:a?",
         "-vf", vf,
-        *_video_reencode_args(codec, crf, preset),
+        *_video_reencode_args(ffmpeg, codec, crf, preset),
         "-c:a", "copy",
     ]
     if str(destination).lower().endswith(".mp4"):
@@ -3226,7 +3324,10 @@ class MiniMaxH3MotionContextDiskFinalDecode:
                 "fps": ("FLOAT", {"default": 24.0, "min": 1.0, "max": 240.0, "step": 0.001}),
                 "filename_prefix": ("STRING", {"default": "MiniMax_H3_cached"}),
                 "output_directory": ("STRING", {"default": ""}),
-                "codec": (["H.264", "H.265 / HEVC", "FFV1 lossless"], {"default": "H.264"}),
+                "codec": (["H.264", "H.264 CPU (libx264)", "H.265 / HEVC", "FFV1 lossless"], {
+                    "default": "H.264",
+                    "tooltip": "H.264 automatically uses NVIDIA NVENC hardware encoding when available, with transparent libx264 CPU fallback. Choose H.264 CPU (libx264) to force software encoding.",
+                }),
                 "crf": ("INT", {"default": 17, "min": 0, "max": 51, "step": 1}),
                 "preset": (["ultrafast", "superfast", "veryfast", "faster", "fast", "medium", "slow"], {"default": "fast"}),
                 "audio_bitrate": (["128k", "192k", "256k", "320k"], {"default": "192k"}),

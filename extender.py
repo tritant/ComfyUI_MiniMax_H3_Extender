@@ -86,7 +86,7 @@ from .fl2va_engine import (
     install_fl2va_project_continuity,
 )
 
-BUILD = "minimax-h3-extender-v2.3.1"
+BUILD = "minimax-h3-extender-v2.3.2"
 FPS = 24
 AUDIO_LATENT_FPS = 40
 CANVAS_MULTIPLE = 32
