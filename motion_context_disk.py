@@ -60,7 +60,7 @@ from .motion_context_ram import (
     _streams_from_latent,
 )
 
-BUILD = "motion-context-disk-v2.3.2"
+BUILD = "motion-context-disk-v2.3.3"
 PREVIEW_AUDIO_MODE = "pcm_single_aac_gain_chain_v3_entry_ramp"
 CACHE_VERSION = 12
 PREVIEW_ROTATION_SLOTS = 3
@@ -1090,8 +1090,9 @@ def _h264_nvenc_available(ffmpeg):
     """Return True only when this ffmpeg can actually start an NVENC H.264 encode.
 
     Checking the encoder list is not enough: ffmpeg may have been compiled with
-    h264_nvenc while the NVIDIA driver/GPU encoder is unavailable. A tiny 64x64
-    one-frame probe catches both cases. The result is cached per ffmpeg binary.
+    h264_nvenc while the NVIDIA driver/GPU encoder is unavailable. A tiny 256x256
+    one-frame probe catches both cases while staying above NVENC minimum
+    H.264 dimensions on recent NVIDIA GPUs. The result is cached per ffmpeg binary.
     """
     key = str(Path(ffmpeg).resolve()) if ffmpeg else str(ffmpeg)
     cached = _NVENC_H264_CACHE.get(key)
@@ -1100,7 +1101,7 @@ def _h264_nvenc_available(ffmpeg):
 
     cmd = [
         ffmpeg, "-hide_banner", "-loglevel", "error",
-        "-f", "lavfi", "-i", "color=c=black:s=64x64:r=1",
+        "-f", "lavfi", "-i", "color=c=black:s=256x256:r=1",
         "-frames:v", "1", "-an",
         "-c:v", "h264_nvenc",
         "-f", "null", "-",
