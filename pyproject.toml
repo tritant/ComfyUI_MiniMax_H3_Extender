@@ -1,7 +1,7 @@
 [project]
 name = "ComfyUI_MiniMax_H3_Extender"
 description = "ComfyUI node for MiniMax H3 that chains multiple video clips with motion context, disk caching, dynamic image references, audio reference support, and seamless final video/audio decoding."
-version = "2.3.2"
+version = "2.3.3"
 license = { file = "LICENSE.txt" }
 
 [project.urls]
