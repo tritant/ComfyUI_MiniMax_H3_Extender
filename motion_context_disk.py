@@ -27,6 +27,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+import threading
 import time
 import uuid
 
@@ -60,10 +61,106 @@ from .motion_context_ram import (
     _streams_from_latent,
 )
 
-BUILD = "motion-context-disk-v2.3.3"
+BUILD = "motion-context-disk-v2.5.16"
 PREVIEW_AUDIO_MODE = "pcm_single_aac_gain_chain_v3_entry_ramp"
 CACHE_VERSION = 12
 PREVIEW_ROTATION_SLOTS = 3
+
+# The browser/live-preview cache remains a neutral H.264 convenience cache.
+# Full Batch final output uses a separate per-clip cache encoded directly with
+# the Final Decode codec/CRF/preset selected when the batch starts. Final Decode
+# then performs video stream-copy concat only; it never transcodes an already
+# compressed clip to another video profile.
+FULL_BATCH_H264_CACHE_CRF = 17
+FULL_BATCH_H264_CACHE_PRESET = "fast"
+FULL_BATCH_H264_CACHE_PROFILE = "h264_preview_crf17_fast_v2"
+FULL_BATCH_FINAL_PROFILE_VERSION = 1
+FULL_BATCH_FINAL_CACHE_VERSION = 1
+
+
+def normalize_full_batch_export_profile(profile=None, *, codec="H.264", crf=17, preset="fast"):
+    raw = profile if isinstance(profile, dict) else {}
+    wanted_codec = str(raw.get("codec", codec) or codec)
+    if wanted_codec not in {"H.264", "H.264 CPU (libx264)", "H.265 / HEVC", "FFV1 lossless"}:
+        wanted_codec = "H.264"
+    try:
+        wanted_crf = max(0, min(51, int(raw.get("crf", crf))))
+    except Exception:
+        wanted_crf = int(crf)
+    wanted_preset = str(raw.get("preset", preset) or preset)
+    if wanted_preset not in {"ultrafast", "superfast", "veryfast", "faster", "fast", "medium", "slow"}:
+        wanted_preset = "fast"
+    return {
+        "version": int(FULL_BATCH_FINAL_PROFILE_VERSION),
+        "codec": wanted_codec,
+        "crf": int(wanted_crf),
+        "preset": wanted_preset,
+    }
+
+
+def _full_batch_export_profile_signature(profile):
+    normalized = normalize_full_batch_export_profile(profile)
+    raw = json.dumps(normalized, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    import hashlib
+    return hashlib.sha256(raw).hexdigest()
+
+
+def _full_batch_export_profile_extension(profile):
+    normalized = normalize_full_batch_export_profile(profile)
+    return "mkv" if normalized["codec"] == "FFV1 lossless" else "mp4"
+
+
+def _final_segment_cache_dir(data_path):
+    path = Path(data_path).with_suffix(".final.video")
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _ref2va_final_segment_cache_path(data_path, index, profile):
+    ext = _full_batch_export_profile_extension(profile)
+    return _final_segment_cache_dir(data_path) / f"ref2va_{int(index):04d}.{ext}"
+
+
+def _color_adjustment_signature(value):
+    c = _normalize_color_adjustment(value) if "_normalize_color_adjustment" in globals() else (value or {})
+    raw = json.dumps(c, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    import hashlib
+    return hashlib.sha256(raw).hexdigest()
+
+
+# Full-batch soft-interrupt requests are intentionally process-local. The
+# browser asks the currently running Extender node to stop *after* the active
+# clip has been safely written to disk; the execution worker polls this tiny
+# registry only at clip boundaries. Disk-backed checkpoint state itself lives
+# in the manifest, so a later restart does not depend on this in-memory flag.
+_FULL_BATCH_INTERRUPT_LOCK = threading.Lock()
+_FULL_BATCH_INTERRUPT_REQUESTS = set()
+
+
+def _full_batch_interrupt_key(owner_id, generation_mode="ref2va"):
+    mode = "fl2va" if str(generation_mode or "ref2va").lower() == "fl2va" else "ref2va"
+    return str(owner_id), mode
+
+
+def clear_full_batch_interrupt(owner_id, generation_mode="ref2va"):
+    key = _full_batch_interrupt_key(owner_id, generation_mode)
+    with _FULL_BATCH_INTERRUPT_LOCK:
+        _FULL_BATCH_INTERRUPT_REQUESTS.discard(key)
+
+
+def request_full_batch_interrupt(owner_id, generation_mode="ref2va"):
+    key = _full_batch_interrupt_key(owner_id, generation_mode)
+    with _FULL_BATCH_INTERRUPT_LOCK:
+        _FULL_BATCH_INTERRUPT_REQUESTS.add(key)
+
+
+def full_batch_interrupt_requested(owner_id, generation_mode="ref2va", *, consume=False):
+    key = _full_batch_interrupt_key(owner_id, generation_mode)
+    with _FULL_BATCH_INTERRUPT_LOCK:
+        found = key in _FULL_BATCH_INTERRUPT_REQUESTS
+        if found and consume:
+            _FULL_BATCH_INTERRUPT_REQUESTS.discard(key)
+    return bool(found)
 
 
 def _video_output_from_path(path):
@@ -424,6 +521,14 @@ def _cache_size_mb(data_path, manifest_path):
             total += p.stat().st_size
         except OSError:
             pass
+    for cache_dir in (data_path.with_suffix(".final.video"), data_path.with_suffix(".fl2va.video")):
+        if cache_dir.exists():
+            for child in cache_dir.iterdir():
+                try:
+                    if child.is_file():
+                        total += child.stat().st_size
+                except OSError:
+                    pass
     return float(total / (1024.0 * 1024.0))
 
 
@@ -545,6 +650,38 @@ def _truncate_chain(data_path, manifest_path, manifest, index):
     if index == 0:
         reduced["geometry"] = None
     reduced["final_frame_count"] = _final_frame_count(prefix)
+    # The assembled preview is derived from the old timeline. A rerun may keep
+    # every decoded checkpoint before ``index``, but the joined preview itself
+    # must never survive the edit or Final Decode could publish stale pixels.
+    for key in (
+        "preview_committed_count",
+        "preview_audio_mode",
+        "preview_fl2va_timeline_signature",
+        "preview_updated_at",
+        "preview_portable_full",
+    ):
+        reduced.pop(key, None)
+    for preview_file in (
+        _decoded_preview_cache_path(data_path),
+        _decoded_preview_video_cache_path(data_path),
+    ):
+        try:
+            Path(preview_file).unlink(missing_ok=True)
+        except OSError:
+            pass
+    # Exact Ref2VA final sidecars are independent files. Drop only the suffix
+    # whose latent descriptors were truncated; retained clips keep their final
+    # bitstreams untouched.
+    final_dir = Path(data_path).with_suffix(".final.video")
+    if final_dir.exists():
+        for sidecar in final_dir.glob("ref2va_*.*"):
+            match = re.match(r"ref2va_(\d+)\.", sidecar.name)
+            if match and int(match.group(1)) >= int(index):
+                try:
+                    sidecar.unlink(missing_ok=True)
+                except OSError:
+                    pass
+
     reduced["updated_at"] = time.time()
     _write_json_atomic(manifest_path, reduced)
 
@@ -746,6 +883,8 @@ class MiniMaxH3MotionContextDiskJoin:
         fps=24.0,
         previous_cache=None,
         unique_id=None,
+        reuse_existing=False,
+        computed=False,
     ):
         data_path, manifest_path, manifest, mode, stop, index = _effective_state(
             previous_cache, run_mode, fps, unique_id
@@ -785,10 +924,18 @@ class MiniMaxH3MotionContextDiskJoin:
                     "before every previous clip is validated."
                 )
 
-        if bool(validated) and existing:
+        if bool(reuse_existing) and existing:
+            # Full-batch resume checkpoint: advance through an already computed
+            # unvalidated clip without touching its latent bytes or validation
+            # state. This is deliberately an internal Extender path; the public
+            # Disk Join node keeps its historical inputs unchanged.
+            status = f"clip {index + 1} resumed from checkpoint"
+
+        elif bool(validated) and existing:
             # Commit/freeze the existing candidate without evaluating samples.
-            if not bool(segments[index].get("validated", False)):
+            if not bool(segments[index].get("validated", False)) or bool(segments[index].get("computed", False)):
                 segments[index]["validated"] = True
+                segments[index].pop("computed", None)
                 manifest = dict(manifest)
                 manifest["segments"] = segments
                 manifest["build"] = BUILD
@@ -817,6 +964,8 @@ class MiniMaxH3MotionContextDiskJoin:
                 validated=bool(validated),
                 manifest=manifest,
             )
+            if bool(computed) and not bool(validated):
+                desc["computed"] = True
             segments = [dict(x) for x in manifest.get("segments", [])] + [desc]
             manifest = dict(manifest)
             manifest["geometry"] = geom if manifest.get("geometry") is None else manifest["geometry"]
@@ -1225,7 +1374,10 @@ def _replace_output_from_preview(
     return destination
 
 
-def _start_video_encoder(ffmpeg, temp_video, width, height, fps, codec, crf, preset, log_path):
+def _start_video_encoder(
+    ffmpeg, temp_video, width, height, fps, codec, crf, preset, log_path,
+    video_filter=None,
+):
     if str(codec) == "H.265 / HEVC":
         enc = ["-c:v", "libx265", "-preset", str(preset), "-crf", str(int(crf)), "-pix_fmt", "yuv420p"]
     elif str(codec) == "FFV1 lossless":
@@ -1243,6 +1395,10 @@ def _start_video_encoder(ffmpeg, temp_video, width, height, fps, codec, crf, pre
         "-s:v", f"{int(width)}x{int(height)}",
         "-r", f"{float(fps):.9f}",
         "-i", "pipe:0",
+    ]
+    if video_filter:
+        cmd += ["-vf", str(video_filter)]
+    cmd += [
         "-an",
         *enc,
         str(temp_video),
@@ -2087,15 +2243,18 @@ def _cache_candidate_render(
     manifest_path,
     manifest,
     clip_index,
-    rendered_mp4,
-    rendered_audio,
+    rendered_mp4=None,
+    rendered_audio=None,
+    seam_shift=None,
+    video_profile=None,
 ):
-    """Persist one clip-by-clip candidate render.
+    """Persist decoded data for the current tail segment.
 
-    Video remains beside the latent payload in the main .h3cache. Decoded PCM
-    uses the dedicated primary audio cache shared by both clip-by-clip and
-    full-batch modes. This gives both execution modes the same per-clip audio
-    cache without rebuilding anything when switching modes.
+    The same primitive is used by Clip-by-Clip and resumable Full Batch. Video
+    stays beside the latent payload in the main ``.h3cache`` while decoded PCM
+    lives in the dedicated primary audio cache. Either part may be omitted, so
+    Full Batch can secure the expensive VideoVAE result even when ``audio_vae``
+    is not connected to the Extender.
     """
     segments = [dict(x) for x in manifest.get("segments", [])]
     idx = int(clip_index)
@@ -2107,29 +2266,40 @@ def _cache_candidate_render(
     desc = dict(segments[idx])
     latent_end = int(desc.get("latent_end", _latent_payload_end(desc)))
 
-    # Main cache: latent payload + video-only decoded candidate.
-    with open(data_path, "r+b", buffering=0) as f:
-        f.truncate(latent_end)
-        f.seek(latent_end)
-        render_spec = _write_blob_raw(f, rendered_mp4)
-        segment_end = int(f.tell())
-        f.flush()
-        os.fsync(f.fileno())
+    if rendered_mp4 is not None:
+        # Main cache: latent payload + video-only decoded candidate. A rerender
+        # of the tail replaces any older derived blob without touching latents.
+        with open(data_path, "r+b", buffering=0) as f:
+            f.truncate(latent_end)
+            f.seek(latent_end)
+            render_spec = _write_blob_raw(f, rendered_mp4)
+            segment_end = int(f.tell())
+            f.flush()
+            os.fsync(f.fileno())
+        desc["latent_end"] = latent_end
+        desc["decoded_mp4_blob"] = render_spec
+        desc["segment_end"] = segment_end
+        # Overwriting the decoded video also overwrites its profile identity.
+        # Clip-by-Clip preview blobs intentionally have no Full-Batch-final
+        # profile, while progressive Full Batch records the exact default one.
+        desc.pop("decoded_video_profile", None)
+        if video_profile is not None:
+            desc["decoded_video_profile"] = str(video_profile)
 
-    # Primary decoded-audio cache: one sequential PCM tensor per clip.
-    audio_path = _decoded_audio_cache_path(data_path)
-    _ensure_audio_cache_file(audio_path)
-    with open(audio_path, "ab", buffering=0) as af:
-        audio_meta = _decoded_audio_meta_from_waveform(af, rendered_audio)
-        af.flush()
-        os.fsync(af.fileno())
+    if rendered_audio is not None:
+        # Primary decoded-audio cache: one lossless PCM tensor per clip.
+        audio_path = _decoded_audio_cache_path(data_path)
+        _ensure_audio_cache_file(audio_path)
+        with open(audio_path, "ab", buffering=0) as af:
+            audio_meta = _decoded_audio_meta_from_waveform(af, rendered_audio)
+            af.flush()
+            os.fsync(af.fileno())
+        desc["decoded_audio"] = audio_meta
 
-    desc["latent_end"] = latent_end
-    desc["decoded_mp4_blob"] = render_spec
-    desc["decoded_audio"] = audio_meta
-    desc["segment_end"] = segment_end
+    if seam_shift is not None:
+        desc["decoded_seam_shift"] = int(seam_shift)
+
     segments[idx] = desc
-
     updated = dict(manifest)
     updated["segments"] = segments
     updated["build"] = BUILD
@@ -2143,6 +2313,9 @@ def _encode_corrected_segment_video_mp4(
     fps,
     target_path,
     token,
+    *,
+    crf=17,
+    preset="ultrafast",
 ):
     """Encode one corrected preview segment as VIDEO ONLY.
 
@@ -2163,8 +2336,8 @@ def _encode_corrected_segment_video_mp4(
             h,
             fps,
             "H.264",
-            17,
-            "ultrafast",
+            int(crf),
+            str(preset),
             video_log,
         )
         _write_image_frames(proc, video)
@@ -2192,6 +2365,190 @@ def _encode_corrected_segment_video_mp4(
                 video_log.unlink()
         except OSError:
             pass
+
+
+def _encode_final_segment_video(
+    ffmpeg,
+    video,
+    fps,
+    target_path,
+    token,
+    export_profile,
+    color_adjustment=None,
+):
+    """Encode one decoded clip directly to its immutable Full-Batch final profile.
+
+    This is the only lossy video encode for that clip. Final assembly later uses
+    concat demuxer + ``-c:v copy`` and therefore cannot introduce another video
+    generation. Color is baked here from the same decoded RGB tensor.
+    """
+    profile = normalize_full_batch_export_profile(export_profile)
+    root = _ensure_cache_root()
+    video_log = root / f"_{token}_final_segment.log"
+    proc = None
+    log_f = None
+    try:
+        h, w = int(video.shape[1]), int(video.shape[2])
+        adjustment = _normalize_color_adjustment(color_adjustment)
+        video_filter = None
+        if not _color_is_neutral(adjustment):
+            duration = max(1.0 / float(fps), float(video.shape[0]) / float(fps))
+            video_filter = _ffmpeg_color_filter([{
+                "index": 0,
+                "start": 0.0,
+                "end": duration + (1.0 / float(fps)),
+                "adjustment": adjustment,
+                "modified": True,
+            }])
+        proc, log_f = _start_video_encoder(
+            ffmpeg,
+            target_path,
+            w,
+            h,
+            fps,
+            profile["codec"],
+            int(profile["crf"]),
+            str(profile["preset"]),
+            video_log,
+            video_filter=video_filter,
+        )
+        _write_image_frames(proc, video)
+        _finish_process(proc, log_f, video_log, "H3 Full Batch final segment encoder")
+        proc = None
+        log_f = None
+    finally:
+        if proc is not None:
+            try:
+                if proc.stdin is not None:
+                    proc.stdin.close()
+            except Exception:
+                pass
+            try:
+                proc.kill()
+            except Exception:
+                pass
+        if log_f is not None:
+            try:
+                log_f.close()
+            except Exception:
+                pass
+        try:
+            video_log.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def _final_segment_cache_meta_matches(desc, export_profile, color_adjustment, path, *, visible_frames=None):
+    profile_sig = _full_batch_export_profile_signature(export_profile)
+    color_sig = _color_adjustment_signature(color_adjustment)
+    if not Path(path).exists() or Path(path).stat().st_size <= 0:
+        return False
+    if bool(desc.get("final_video_dirty", False)):
+        return False
+    if int(desc.get("final_video_cache_version", 0) or 0) != int(FULL_BATCH_FINAL_CACHE_VERSION):
+        return False
+    if str(desc.get("final_video_profile_signature") or "") != profile_sig:
+        return False
+    if str(desc.get("final_video_color_signature") or "") != color_sig:
+        return False
+    if visible_frames is not None and int(desc.get("final_video_visible_frames", -1)) != int(visible_frames):
+        return False
+    return True
+
+
+def _tag_ref2va_final_segment_cache(
+    manifest_path, manifest, index, export_profile, color_adjustment, *, visible_frames=None
+):
+    segments = [dict(x) for x in manifest.get("segments", [])]
+    idx = int(index)
+    if idx < 0 or idx >= len(segments):
+        raise IndexError(f"H3 final segment tag: invalid clip index {idx}.")
+    desc = dict(segments[idx])
+    desc["final_video_cache_version"] = int(FULL_BATCH_FINAL_CACHE_VERSION)
+    desc["final_video_profile_signature"] = _full_batch_export_profile_signature(export_profile)
+    desc["final_video_color_signature"] = _color_adjustment_signature(color_adjustment)
+    desc["final_video_codec"] = normalize_full_batch_export_profile(export_profile)["codec"]
+    desc["color_adjustment"] = _normalize_color_adjustment(color_adjustment)
+    if visible_frames is not None:
+        desc["final_video_visible_frames"] = int(visible_frames)
+    desc.pop("final_video_dirty", None)
+    segments[idx] = desc
+    updated = dict(manifest)
+    updated["segments"] = segments
+    updated["updated_at"] = time.time()
+    _write_json_atomic(manifest_path, updated)
+    return updated, desc
+
+
+def _ensure_ref2va_final_segment_cache(
+    data_path,
+    manifest_path,
+    manifest,
+    index,
+    vae,
+    fps,
+    ffmpeg,
+    export_profile,
+    *,
+    progress=None,
+    decoded_video=None,
+    color_adjustment=None,
+):
+    """Ensure exactly one Ref2VA clip has a final-profile sidecar.
+
+    Existing matching sidecars are never decoded or re-encoded. A missing/dirty
+    sidecar causes VideoVAE work for this clip only.
+    """
+    profile = normalize_full_batch_export_profile(export_profile)
+    segments = [dict(x) for x in manifest.get("segments", [])]
+    idx = int(index)
+    if idx < 0 or idx >= len(segments):
+        raise IndexError(f"H3 final segment cache: invalid clip index {idx}.")
+    desc = dict(segments[idx])
+    adjustment = _normalize_color_adjustment(
+        color_adjustment if color_adjustment is not None else desc.get("color_adjustment")
+    )
+    path = _ref2va_final_segment_cache_path(data_path, idx, profile)
+    if _final_segment_cache_meta_matches(desc, profile, adjustment, path):
+        return manifest, path, False
+
+    own_decode = decoded_video is None
+    video = decoded_video
+    if own_decode:
+        _LOG.info(
+            "H3 final cache repair: decoding changed Ref2VA clip %d only", idx + 1
+        )
+        video, _ = _render_one_final_video_segment(
+            data_path, segments, idx, vae, progress=progress
+        )
+    elif progress is not None:
+        # The caller already paid the decode cost while producing the preview
+        # checkpoint, so there is no extra VAE progress step here.
+        pass
+
+    temp = path.with_name(path.stem + f".tmp_{uuid.uuid4().hex[:8]}" + path.suffix)
+    try:
+        _encode_final_segment_video(
+            ffmpeg,
+            video,
+            float(fps),
+            temp,
+            f"ref2va_final_{idx}_{uuid.uuid4().hex[:6]}",
+            profile,
+            adjustment,
+        )
+        os.replace(temp, path)
+        manifest, _ = _tag_ref2va_final_segment_cache(
+            manifest_path, manifest, idx, profile, adjustment
+        )
+        return manifest, path, bool(own_decode)
+    finally:
+        try:
+            temp.unlink(missing_ok=True)
+        except OSError:
+            pass
+        if own_decode and video is not None:
+            del video
 
 
 def _load_cached_decoded_audio(data_path, desc):
@@ -2361,11 +2718,11 @@ def _write_preview_pcm_audio(
     return int(sample_rate), int(channels), int(written_samples)
 
 
-def _concat_mp4_video_stream_copy(ffmpeg, inputs, output_path, log_path):
-    """Concatenate only H.264 video packets; audio is rebuilt from PCM."""
+def _concat_video_stream_copy(ffmpeg, inputs, output_path, log_path):
+    """Concatenate homogeneous video-only segments with zero video re-encode."""
     inputs = [Path(p) for p in inputs if p is not None and Path(p).exists()]
     if not inputs:
-        raise ValueError("H3 progressive preview video concat has no input.")
+        raise ValueError("H3 video concat has no input.")
 
     if len(inputs) == 1:
         if Path(output_path).resolve() != inputs[0].resolve():
@@ -2387,9 +2744,10 @@ def _concat_mp4_video_stream_copy(ffmpeg, inputs, output_path, log_path):
             "-map", "0:v:0",
             "-c:v", "copy",
             "-an",
-            "-movflags", "+faststart",
-            str(output_path),
         ]
+        if str(output_path).lower().endswith(".mp4"):
+            cmd += ["-movflags", "+faststart"]
+        cmd.append(str(output_path))
         with open(log_path, "wb") as log_f:
             p = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=log_f)
         if p.returncode != 0:
@@ -2401,8 +2759,7 @@ def _concat_mp4_video_stream_copy(ffmpeg, inputs, output_path, log_path):
             except Exception:
                 pass
             raise RuntimeError(
-                f"H3 progressive preview video concat failed with code "
-                f"{p.returncode}.\n{tail}"
+                f"H3 video stream-copy concat failed with code {p.returncode}.\n{tail}"
             )
     finally:
         try:
@@ -2410,6 +2767,11 @@ def _concat_mp4_video_stream_copy(ffmpeg, inputs, output_path, log_path):
                 list_path.unlink()
         except OSError:
             pass
+
+
+def _concat_mp4_video_stream_copy(ffmpeg, inputs, output_path, log_path):
+    """Backward-compatible preview wrapper for H.264 MP4 checkpoints."""
+    return _concat_video_stream_copy(ffmpeg, inputs, output_path, log_path)
 
 
 def _assemble_progressive_preview(
@@ -2597,6 +2959,395 @@ def _render_one_final_segment(
     )
     return video, audio, int(shift)
 
+def _export_final_from_exact_segment_caches(
+    ffmpeg,
+    segment_paths,
+    data_path,
+    segments,
+    fps,
+    output_path,
+    export_profile,
+    audio_bitrate,
+    token,
+):
+    """Mux a Full-Batch final from already-final video segments.
+
+    Video operations are strictly packet-copy: per-clip exact-profile caches are
+    concat-demuxed with ``-c:v copy`` and the resulting stream is copied again
+    while the lossless PCM cache is encoded to the requested audio format.
+    """
+    profile = normalize_full_batch_export_profile(export_profile)
+    root = _ensure_cache_root()
+    extension = _full_batch_export_profile_extension(profile)
+    joined_video = root / f"_{token}_joined_exact.{extension}"
+    raw_audio = root / f"_{token}_final_audio.f32le"
+    concat_log = root / f"_{token}_exact_concat.log"
+    mux_log = root / f"_{token}_final_mux.log"
+    try:
+        _concat_video_stream_copy(ffmpeg, segment_paths, joined_video, concat_log)
+        sr, channels, _ = _write_preview_pcm_audio(
+            ffmpeg,
+            data_path,
+            segments,
+            len(segments),
+            float(fps),
+            raw_audio,
+            token,
+        )
+        _mux_final(
+            ffmpeg,
+            joined_video,
+            raw_audio,
+            output_path,
+            sr,
+            channels,
+            profile["codec"],
+            audio_bitrate,
+            mux_log,
+        )
+        return "exact_segment_stream_copy"
+    finally:
+        for item in (joined_video, raw_audio, concat_log, mux_log):
+            try:
+                Path(item).unlink(missing_ok=True)
+            except OSError:
+                pass
+
+
+def _full_batch_manifest_export_profile(manifest, requested_profile=None):
+    stored = manifest.get("full_batch_export_profile") if isinstance(manifest, dict) else None
+    if isinstance(stored, dict):
+        return normalize_full_batch_export_profile(stored)
+    if requested_profile is not None:
+        return normalize_full_batch_export_profile(requested_profile)
+    return normalize_full_batch_export_profile()
+
+
+def _resolve_full_batch_export_profile(manifest_path, manifest, requested_profile, *, context="H3 Full Batch"):
+    """Resolve the active Full-Batch export profile.
+
+    An interrupted/in-progress checkpoint must keep the profile it already
+    started with so the resumed batch remains internally consistent. Outside an
+    active checkpoint, a new CRF/preset/codec selection is treated as the start
+    of a fresh Full Batch: the manifest adopts the requested profile and exact
+    final sidecars are rebuilt clip-by-clip on demand.
+    """
+    requested = normalize_full_batch_export_profile(requested_profile)
+    manifest = dict(manifest or {})
+    stored_raw = manifest.get("full_batch_export_profile")
+    if not isinstance(stored_raw, dict):
+        manifest["full_batch_export_profile"] = requested
+        manifest["updated_at"] = time.time()
+        _write_json_atomic(manifest_path, manifest)
+        return manifest, requested
+
+    stored = normalize_full_batch_export_profile(stored_raw)
+    stored_sig = _full_batch_export_profile_signature(stored)
+    requested_sig = _full_batch_export_profile_signature(requested)
+    if stored_sig == requested_sig:
+        return manifest, stored
+
+    checkpoint_active = bool(
+        manifest.get("batch_in_progress", False)
+        or manifest.get("batch_interrupted", False)
+    )
+    if checkpoint_active:
+        _LOG.warning(
+            "%s: keeping active checkpoint export profile %s CRF %s %s; "
+            "ignoring requested %s CRF %s %s until a fresh Full Batch starts.",
+            str(context),
+            stored["codec"], int(stored["crf"]), stored["preset"],
+            requested["codec"], int(requested["crf"]), requested["preset"],
+        )
+        return manifest, stored
+
+    manifest["full_batch_export_profile"] = requested
+    manifest["updated_at"] = time.time()
+    _write_json_atomic(manifest_path, manifest)
+    _LOG.info(
+        "%s: adopting new Full Batch export profile %s CRF %s %s "
+        "(previous %s CRF %s %s). Exact-final segment caches will be rebuilt clip-by-clip as needed.",
+        str(context),
+        requested["codec"], int(requested["crf"]), requested["preset"],
+        stored["codec"], int(stored["crf"]), stored["preset"],
+    )
+    return manifest, requested
+
+
+def cache_full_batch_ref2va_segment(
+    data_path,
+    manifest_path,
+    clip_index,
+    vae,
+    audio_vae,
+    fps,
+    export_profile=None,
+    color_adjustment=None,
+):
+    """Decode/cache one Ref2VA Full-Batch clip exactly once.
+
+    The decoded RGB result feeds two independent caches while it is still in
+    memory: a neutral H.264 browser-preview checkpoint and, when a Full-Batch
+    export profile is available, the exact final-profile sidecar. The latter is
+    what Final Decode concatenates with ``-c:v copy``.
+    """
+    data_path = Path(data_path)
+    manifest_path = Path(manifest_path)
+    manifest = _load_manifest_from_paths(data_path, manifest_path)
+    if manifest is None:
+        raise FileNotFoundError("H3 Full Batch cache: manifest disappeared.")
+
+    segments = [dict(x) for x in manifest.get("segments", [])]
+    idx = int(clip_index)
+    if idx < 0 or idx >= len(segments):
+        raise IndexError(f"H3 Full Batch cache: invalid clip index {idx}.")
+
+    desc = dict(segments[idx])
+    adjustment = _normalize_color_adjustment(
+        color_adjustment if color_adjustment is not None else desc.get("color_adjustment")
+    )
+    profile = (
+        normalize_full_batch_export_profile(export_profile)
+        if export_profile is not None
+        else None
+    )
+    is_tail = idx == len(segments) - 1
+    video_ready = isinstance(desc.get("decoded_mp4_blob"), dict)
+    shift_ready = idx == 0 or "decoded_seam_shift" in desc
+    cached_audio = _load_cached_decoded_audio(data_path, desc)
+    audio_ready = cached_audio is not None
+    if cached_audio is not None:
+        del cached_audio
+
+    # Ref2VA's embedded preview blob can only be rewritten safely at the physical
+    # tail. The exact-final sidecar is external, so even a legacy middle clip can
+    # be repaired independently without touching any following latent payload.
+    if not is_tail and not (video_ready and shift_ready):
+        if profile is not None:
+            ffmpeg = _find_ffmpeg()
+            manifest, _, _ = _ensure_ref2va_final_segment_cache(
+                data_path, manifest_path, manifest, idx, vae, float(fps), ffmpeg,
+                profile, color_adjustment=adjustment,
+            )
+        return manifest, {
+            "video_cached": bool(video_ready),
+            "audio_cached": bool(audio_ready),
+            "seam_shift": int(desc.get("decoded_seam_shift", 0) or 0),
+            "final_cached": bool(profile is not None),
+            "deferred": True,
+        }
+
+    rendered_video = None
+    rendered_audio = None
+    seam_shift = int(desc.get("decoded_seam_shift", 0) or 0)
+    temp_root = _ensure_cache_root()
+    token = f"fullbatch_ref_{idx}_{uuid.uuid4().hex[:8]}"
+    temp_mp4 = temp_root / f"_{token}.mp4"
+    ffmpeg = None
+
+    try:
+        if not video_ready or not shift_ready:
+            rendered_video, seam_shift = _render_one_final_video_segment(
+                data_path, segments, idx, vae
+            )
+            rendered_mp4 = None
+            video_profile = None
+            if not video_ready:
+                ffmpeg = _find_ffmpeg()
+                _encode_corrected_segment_video_mp4(
+                    ffmpeg,
+                    rendered_video,
+                    float(fps),
+                    temp_mp4,
+                    token,
+                    crf=FULL_BATCH_H264_CACHE_CRF,
+                    preset=FULL_BATCH_H264_CACHE_PRESET,
+                )
+                rendered_mp4 = temp_mp4
+                video_profile = FULL_BATCH_H264_CACHE_PROFILE
+
+            # Commit the neutral browser checkpoint first. This is the only
+            # write that touches the append-only .h3cache body.
+            manifest, desc = _cache_candidate_render(
+                data_path,
+                manifest_path,
+                manifest,
+                idx,
+                rendered_mp4=rendered_mp4,
+                seam_shift=int(seam_shift),
+                video_profile=video_profile,
+            )
+            segments = [dict(x) for x in manifest.get("segments", [])]
+            desc = dict(segments[idx])
+            video_ready = isinstance(desc.get("decoded_mp4_blob"), dict)
+            shift_ready = idx == 0 or "decoded_seam_shift" in desc
+
+        # While the decoded RGB tensor is still resident, encode the exact final
+        # segment directly. If the neutral preview was already cached, this helper
+        # decodes only this one clip when its final sidecar is missing/dirty.
+        if profile is not None:
+            if ffmpeg is None:
+                ffmpeg = _find_ffmpeg()
+            manifest, _final_path, _final_decoded = _ensure_ref2va_final_segment_cache(
+                data_path,
+                manifest_path,
+                manifest,
+                idx,
+                vae,
+                float(fps),
+                ffmpeg,
+                profile,
+                decoded_video=rendered_video,
+                color_adjustment=adjustment,
+            )
+            segments = [dict(x) for x in manifest.get("segments", [])]
+            desc = dict(segments[idx])
+
+        # Release the large VideoVAE RGB tensor before AudioVAE work starts.
+        if rendered_video is not None:
+            del rendered_video
+            rendered_video = None
+
+        can_cache_audio = bool(audio_vae is not None)
+        if can_cache_audio and idx > 0:
+            previous_audio = _load_cached_decoded_audio(data_path, segments[idx - 1])
+            can_cache_audio = previous_audio is not None
+            if previous_audio is not None:
+                del previous_audio
+        if can_cache_audio and not audio_ready:
+            rendered_audio = _render_one_final_audio_segment(
+                data_path,
+                segments,
+                idx,
+                audio_vae,
+                float(fps),
+                int(seam_shift),
+            )
+            manifest, desc = _cache_candidate_render(
+                data_path,
+                manifest_path,
+                manifest,
+                idx,
+                rendered_audio=rendered_audio,
+                seam_shift=int(seam_shift),
+            )
+            cached_audio = _load_cached_decoded_audio(data_path, desc)
+            audio_ready = cached_audio is not None
+            if cached_audio is not None:
+                del cached_audio
+
+        final_ready = False
+        if profile is not None:
+            latest_segments = [dict(x) for x in manifest.get("segments", [])]
+            latest_desc = latest_segments[idx]
+            final_path = _ref2va_final_segment_cache_path(data_path, idx, profile)
+            final_ready = _final_segment_cache_meta_matches(
+                latest_desc, profile, adjustment, final_path
+            )
+
+        return manifest, {
+            "video_cached": bool(video_ready),
+            "audio_cached": bool(audio_ready),
+            "final_cached": bool(final_ready),
+            "seam_shift": int(seam_shift),
+            "deferred": False,
+        }
+    finally:
+        if rendered_video is not None:
+            del rendered_video
+        if rendered_audio is not None:
+            del rendered_audio
+        try:
+            temp_mp4.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def _ensure_ref2va_audio_cache(
+    data_path,
+    manifest_path,
+    manifest,
+    vae,
+    audio_vae,
+    fps,
+    count=None,
+    progress=None,
+):
+    """Append only missing Ref2VA decoded PCM entries in timeline order.
+
+    Fresh resumable Full Batch runs normally create these entries while each
+    clip is completed. If ``audio_vae`` was not connected to the Extender, Final
+    Decode fills only the missing PCM here. Persisted ``decoded_seam_shift``
+    metadata means this path does not need VideoVAE again. Legacy clips without
+    that metadata may require a one-time video seam decode to recover the exact
+    shift.
+    """
+    if audio_vae is None:
+        raise ValueError("H3 Final Decode: audio_vae is required to build the audio cache.")
+
+    data_path = Path(data_path)
+    manifest_path = Path(manifest_path)
+    full_segments = [dict(x) for x in manifest.get("segments", [])]
+    target = len(full_segments) if count is None else max(0, min(int(count), len(full_segments)))
+    if target <= 0:
+        return manifest, []
+
+    audio_path = _decoded_audio_cache_path(data_path)
+    _ensure_audio_cache_file(audio_path)
+    changed = False
+
+    with open(audio_path, "ab", buffering=0) as acf:
+        for i in range(target):
+            desc = dict(full_segments[i])
+            cached = _load_cached_decoded_audio(data_path, desc)
+            if cached is not None:
+                del cached
+                continue
+
+            if i == 0:
+                seam_shift = 0
+            elif "decoded_seam_shift" in desc:
+                seam_shift = int(desc.get("decoded_seam_shift", 0) or 0)
+            else:
+                # Compatibility for old caches created before per-clip seam
+                # shifts were persisted. Repair this clip only; never replay the
+                # complete project through VideoVAE.
+                _LOG.info(
+                    "H3 incremental cache repair: recovering seam shift for Ref2VA clip %d only",
+                    i + 1,
+                )
+                video, seam_shift = _render_one_final_video_segment(
+                    data_path, full_segments, i, vae
+                )
+                del video
+                desc["decoded_seam_shift"] = int(seam_shift)
+
+            audio = _render_one_final_audio_segment(
+                data_path,
+                full_segments,
+                i,
+                audio_vae,
+                float(fps),
+                int(seam_shift),
+                progress=progress,
+            )
+            desc["decoded_audio"] = _decoded_audio_meta_from_waveform(acf, audio)
+            full_segments[i] = desc
+            changed = True
+            del audio
+
+        if changed:
+            acf.flush()
+            os.fsync(acf.fileno())
+
+    if changed:
+        manifest = dict(manifest)
+        manifest["segments"] = full_segments
+        manifest["build"] = BUILD
+        manifest["updated_at"] = time.time()
+        _write_json_atomic(manifest_path, manifest)
+    return manifest, [dict(x) for x in full_segments[:target]]
+
 def _sync_committed_preview(
     data_path,
     manifest_path,
@@ -2678,6 +3429,10 @@ def _sync_committed_preview(
                     raise RuntimeError(
                         "H3 progressive preview: decoded audio cache is missing."
                     )
+                _LOG.info(
+                    "H3 incremental cache repair: decoding missing Ref2VA clip %d only",
+                    i + 1,
+                )
                 video, _ = _render_one_final_video_segment(
                     data_path,
                     segments,
@@ -2761,6 +3516,7 @@ def _export_live_candidate_preview(
     ffmpeg,
     unique_id,
     progress=None,
+    export_profile=None,
 ):
     segments = [dict(x) for x in segments]
     if not segments:
@@ -2846,6 +3602,30 @@ def _export_live_candidate_preview(
             candidate_mp4,
             token,
         )
+
+        # Clip-by-Clip must leave behind the same exact-final sidecar that a
+        # Full Batch would create. Encode it NOW from the already resident RGB
+        # tensor, before releasing VideoVAE output. Switching a validated prefix
+        # to Full Batch can then reuse those clips with zero VideoVAE work.
+        if export_profile is not None:
+            adjustment = _normalize_color_adjustment(
+                segments[candidate_index].get("color_adjustment")
+            )
+            manifest, _final_path, _decoded_now = _ensure_ref2va_final_segment_cache(
+                data_path,
+                manifest_path,
+                manifest,
+                candidate_index,
+                vae,
+                float(fps),
+                ffmpeg,
+                export_profile,
+                progress=None,
+                decoded_video=current_video,
+                color_adjustment=adjustment,
+            )
+            segments = [dict(x) for x in manifest.get("segments", [])]
+
         del current_video
 
         current_audio = _render_one_final_audio_segment(
@@ -2866,6 +3646,7 @@ def _export_live_candidate_preview(
             candidate_index,
             candidate_mp4,
             current_audio,
+            seam_shift=int(seam_shift),
         )
 
         preview_path = _reserve_preview_temp_path(unique_id)
@@ -2959,6 +3740,17 @@ def _restore_cached_preview_without_decode(owner_id, final_id, generation_mode="
     segments = [dict(x) for x in manifest.get("segments", [])]
     if not segments:
         return None
+    project_total_clips = int(manifest.get("batch_total_clips", len(segments)) or len(segments))
+
+    # A cooperative Full Batch stop owns an immutable preview snapshot.  FL2VA
+    # may still have older cached plans after that prefix, so startup/project
+    # restore must publish exactly the prefix decoded at Stop rather than
+    # silently rebuilding a longer preview from unrelated old plan caches.
+    interrupted_snapshot = bool(manifest.get("batch_interrupted", False))
+    if interrupted_snapshot:
+        snapshot_count = int(manifest.get("batch_snapshot_count", len(segments)) or 0)
+        snapshot_count = max(1, min(len(segments), snapshot_count))
+        segments = segments[:snapshot_count]
 
     preview_path = None
     committed_path = _decoded_preview_cache_path(data_path)
@@ -2981,9 +3773,11 @@ def _restore_cached_preview_without_decode(owner_id, final_id, generation_mode="
         return {
             "path": preview_path,
             "clip_count": int(len(segments)),
-            "frame_count": int(manifest.get("final_frame_count", 0)),
+            "frame_count": int(_final_frame_count(segments)),
             "fps": float(manifest.get("fps", FPS)),
             "cache_mode": "committed_preview",
+            "interrupted": bool(interrupted_snapshot),
+            "project_total_clips": int(project_total_clips),
         }
 
     # Otherwise rebuild the full current preview from the per-clip decoded video
@@ -3039,9 +3833,11 @@ def _restore_cached_preview_without_decode(owner_id, final_id, generation_mode="
         return {
             "path": preview_path,
             "clip_count": int(len(segments)),
-            "frame_count": int(manifest.get("final_frame_count", 0)),
+            "frame_count": int(_final_frame_count(segments)),
             "fps": float(manifest.get("fps", FPS)),
             "cache_mode": "decoded_blobs",
+            "interrupted": bool(interrupted_snapshot),
+            "project_total_clips": int(project_total_clips),
         }
     finally:
         for tmp in segment_files:
@@ -3059,6 +3855,152 @@ def _restore_cached_preview_without_decode(owner_id, final_id, generation_mode="
 
 
 if web is not None and PromptServer is not None and getattr(PromptServer, "instance", None) is not None:
+    @PromptServer.instance.routes.post("/h3_extender/full_batch_interrupt")
+    async def h3_extender_full_batch_interrupt(request):
+        """Request a cooperative stop after the currently rendering clip."""
+        try:
+            body = await request.json()
+            owner_id = str(body.get("owner_id") or "").strip()
+            generation_mode = str(body.get("generation_mode") or "ref2va").lower()
+            if not owner_id:
+                return web.json_response({"ok": False, "error": "Missing owner id."}, status=400)
+            request_full_batch_interrupt(owner_id, generation_mode)
+            return web.json_response({"ok": True, "pending": True})
+        except Exception as exc:
+            _LOG.exception("H3 full-batch interrupt request failed")
+            return web.json_response({"ok": False, "error": str(exc)}, status=500)
+
+    @PromptServer.instance.routes.post("/h3_extender/discard_computed")
+    async def h3_extender_discard_computed(request):
+        """Discard one resumable Full-Batch checkpoint without touching preview.
+
+        Ref2VA is causal, so discarding clip N truncates N and every following
+        cached clip. FL2VA is random-access except for explicit Previous links:
+        discarding a plan immediately discards each consecutive cached follower
+        whose First frame depends on the preceding plan. This keeps COMPUTED UI
+        state truthful before the next execution instead of invalidating a hidden
+        dependency only after its predecessor has been rerendered.
+        """
+        try:
+            body = await request.json()
+            owner_id = str(body.get("owner_id") or "").strip()
+            generation_mode = str(body.get("generation_mode") or "ref2va").lower()
+            if not owner_id:
+                return web.json_response({"ok": False, "error": "Missing owner id."}, status=400)
+
+            if generation_mode == "fl2va":
+                clip_id = str(body.get("clip_id") or "").strip()
+                clip_ids = [str(x) for x in (body.get("clip_ids") or []) if str(x)]
+                if not clip_id or not clip_ids:
+                    return web.json_response({"ok": False, "error": "Missing FL2VA clip id/order."}, status=400)
+                from .fl2va_engine import cache_owner_id, drop_fl2va_cached_ids
+                cache_owner = cache_owner_id(owner_id)
+                data_path, manifest_path = _chain_paths(cache_owner)
+                manifest = _load_manifest_from_paths(data_path, manifest_path)
+                if manifest is None:
+                    return web.json_response({"ok": False, "error": "No FL2VA cache found."}, status=404)
+                target = next(
+                    (dict(x) for x in manifest.get("segments", []) if str(x.get("clip_id") or "") == clip_id),
+                    None,
+                )
+                if target is None or not bool(target.get("computed", False)) or bool(target.get("validated", False)):
+                    return web.json_response({"ok": False, "error": "This FL2VA clip is not a discardable computed checkpoint."}, status=400)
+                # FL2VA plans are independent unless a follower explicitly
+                # starts from Previous. If clip N is going to change, every
+                # consecutive cached Previous-linked follower already has stale
+                # conditioning and must stop advertising itself as COMPUTED now,
+                # not only after N has been rerendered.
+                segments_before = [dict(x) for x in manifest.get("segments", [])]
+                by_id = {
+                    str(x.get("clip_id") or ""): x
+                    for x in segments_before
+                    if str(x.get("clip_id") or "")
+                }
+                drop_ids = [clip_id]
+                try:
+                    start_pos = clip_ids.index(clip_id)
+                except ValueError:
+                    start_pos = -1
+                previous_id = clip_id
+                if start_pos >= 0:
+                    for follower_id in clip_ids[start_pos + 1:]:
+                        follower = by_id.get(str(follower_id))
+                        if follower is None:
+                            break
+                        if (
+                            str(follower.get("first_source") or "manual") == "previous_clip"
+                            and str(follower.get("previous_clip_id") or "") == str(previous_id)
+                        ):
+                            drop_ids.append(str(follower_id))
+                            previous_id = str(follower_id)
+                            continue
+                        break
+
+                data_path, manifest_path, manifest = drop_fl2va_cached_ids(
+                    owner_id, float(manifest.get("fps", FPS)), clip_ids, drop_ids,
+                    preserve_preview=True,
+                )
+                segments = [dict(x) for x in manifest.get("segments", [])]
+                computed_clip_ids = [
+                    str(x.get("clip_id")) for x in segments
+                    if str(x.get("clip_id") or "") and bool(x.get("computed", False)) and not bool(x.get("validated", False))
+                ]
+                validated_clip_ids = [
+                    str(x.get("clip_id")) for x in segments
+                    if str(x.get("clip_id") or "") and bool(x.get("validated", False))
+                ]
+                return web.json_response({
+                    "ok": True,
+                    "generation_mode": "fl2va",
+                    "cached_count": len(segments),
+                    "validated_count": len(validated_clip_ids),
+                    "cached_clip_ids": [str(x.get("clip_id")) for x in segments if str(x.get("clip_id") or "")],
+                    "validated_clip_ids": validated_clip_ids,
+                    "computed_clip_ids": computed_clip_ids,
+                    "computed_indices": [],
+                    "discarded_clip_ids": [str(x) for x in drop_ids],
+                    "checkpoint_active": bool(manifest.get("batch_in_progress", False) or manifest.get("batch_interrupted", False)),
+                    "checkpoint_interrupted": bool(manifest.get("batch_interrupted", False)),
+                    "checkpoint_snapshot_count": int(manifest.get("batch_snapshot_count", 0) or 0),
+                })
+
+            # Ref2VA: physical cache is a causal prefix.
+            idx = int(body.get("clip_index"))
+            cache_owner = f"extender_{_safe_name(owner_id)}"
+            data_path, manifest_path = _chain_paths(cache_owner)
+            manifest = _load_manifest_from_paths(data_path, manifest_path)
+            if manifest is None:
+                return web.json_response({"ok": False, "error": "No Ref2VA cache found."}, status=404)
+            segments = [dict(x) for x in manifest.get("segments", [])]
+            if idx < 0 or idx >= len(segments):
+                return web.json_response({"ok": False, "error": "This clip is not cached."}, status=400)
+            target = segments[idx]
+            if not bool(target.get("computed", False)) or bool(target.get("validated", False)):
+                return web.json_response({"ok": False, "error": "This Ref2VA clip is not a discardable computed checkpoint."}, status=400)
+            manifest = _truncate_chain(data_path, manifest_path, manifest, idx)
+            segments = [dict(x) for x in manifest.get("segments", [])]
+            validated_count = _validated_prefix_count(segments)
+            computed_indices = [
+                i for i, x in enumerate(segments)
+                if bool(x.get("computed", False)) and not bool(x.get("validated", False))
+            ]
+            return web.json_response({
+                "ok": True,
+                "generation_mode": "ref2va",
+                "cached_count": len(segments),
+                "validated_count": int(validated_count),
+                "cached_clip_ids": [],
+                "validated_clip_ids": [],
+                "computed_clip_ids": [],
+                "computed_indices": computed_indices,
+                "checkpoint_active": bool(manifest.get("batch_in_progress", False) or manifest.get("batch_interrupted", False)),
+                "checkpoint_interrupted": bool(manifest.get("batch_interrupted", False)),
+                "checkpoint_snapshot_count": int(manifest.get("batch_snapshot_count", 0) or 0),
+            })
+        except Exception as exc:
+            _LOG.exception("H3 discard computed checkpoint failed")
+            return web.json_response({"ok": False, "error": str(exc)}, status=500)
+
     @PromptServer.instance.routes.get("/h3_extender/color_editor_info")
     async def h3_extender_color_editor_info(request):
         owner_id = request.query.get("owner_id", "")
@@ -3123,6 +4065,7 @@ if web is not None and PromptServer is not None and getattr(PromptServer, "insta
             adjustment = _normalize_color_adjustment(body.get("adjustment"))
             desc = dict(segments[idx])
             desc["color_adjustment"] = adjustment
+            desc["final_video_dirty"] = True
             segments[idx] = desc
             manifest = dict(manifest)
             manifest["segments"] = segments
@@ -3242,6 +4185,14 @@ if web is not None and PromptServer is not None and getattr(PromptServer, "insta
             if is_fl2va:
                 from .fl2va_engine import continuity_signatures_for_segments
                 continuity_signatures = continuity_signatures_for_segments(data_path, segments)
+            computed_indices = [
+                i for i, x in enumerate(segments)
+                if bool(x.get("computed", False)) and not bool(x.get("validated", False))
+            ]
+            computed_clip_ids = [
+                str(x.get("clip_id")) for x in segments
+                if str(x.get("clip_id") or "") and bool(x.get("computed", False)) and not bool(x.get("validated", False))
+            ]
             return web.json_response({
                 "found": True,
                 "generation_mode": "fl2va" if is_fl2va else "ref2va",
@@ -3250,6 +4201,14 @@ if web is not None and PromptServer is not None and getattr(PromptServer, "insta
                 "cached_clip_ids": [str(x.get("clip_id")) for x in segments if str(x.get("clip_id") or "")],
                 "validated_clip_ids": [str(x.get("clip_id")) for x in segments if str(x.get("clip_id") or "") and bool(x.get("validated", False))],
                 "continuity_signatures": continuity_signatures,
+                "computed_indices": computed_indices,
+                "computed_clip_ids": computed_clip_ids,
+                "checkpoint_active": bool(
+                    manifest.get("batch_in_progress", False)
+                    or manifest.get("batch_interrupted", False)
+                ),
+                "checkpoint_interrupted": bool(manifest.get("batch_interrupted", False)),
+                "checkpoint_snapshot_count": int(manifest.get("batch_snapshot_count", 0) or 0),
                 "frame_count": int(manifest.get("final_frame_count", 0)),
                 "resolved_width": int(resolved_width),
                 "resolved_height": int(resolved_height),
@@ -3290,8 +4249,9 @@ if web is not None and PromptServer is not None and getattr(PromptServer, "insta
                 cache_owner = f"extender_{_safe_name(owner_id)}"
             data_path, manifest_path = _chain_paths(cache_owner)
             manifest = _load_manifest_from_paths(data_path, manifest_path)
+            restored_segments = list(manifest.get("segments", []) if manifest else [])[:int(restored["clip_count"])]
             color_timeline = _color_timeline(
-                manifest.get("segments", []) if manifest else [],
+                restored_segments,
                 float(manifest.get("fps", FPS)) if manifest else FPS,
             )
             return web.json_response({
@@ -3300,6 +4260,8 @@ if web is not None and PromptServer is not None and getattr(PromptServer, "insta
                 "clip_count": restored["clip_count"],
                 "frame_count": restored["frame_count"],
                 "cache_mode": restored["cache_mode"],
+                "interrupted": bool(restored.get("interrupted", False)),
+                "project_total_clips": int(restored.get("project_total_clips", restored["clip_count"])),
                 "color_timeline": color_timeline,
             })
         except Exception as exc:
@@ -3375,6 +4337,12 @@ class MiniMaxH3MotionContextDiskFinalDecode:
         segments = [dict(x) for x in manifest.get("segments", [])]
         if not segments:
             raise ValueError("Disk Final Decode: empty cache.")
+        interrupted = bool(cache.get("interrupted", False)) if isinstance(cache, dict) else False
+        project_total_clips = int(cache.get("project_total_clips", len(segments))) if isinstance(cache, dict) else len(segments)
+        snapshot_count = int(cache.get("snapshot_count", len(segments))) if isinstance(cache, dict) else len(segments)
+        if interrupted:
+            snapshot_count = max(1, min(len(segments), snapshot_count))
+            segments = segments[:snapshot_count]
         if str(manifest.get("sequence_mode") or "ref2va").lower() == "fl2va":
             from .fl2va_engine import export_fl2va_final
             return export_fl2va_final(
@@ -3402,6 +4370,9 @@ class MiniMaxH3MotionContextDiskFinalDecode:
         effective_mode = str(cache.get("run_mode", "full_batch")) if isinstance(cache, dict) else "full_batch"
         if effective_mode == "clip_by_clip":
             progress = _FinalDecodeNativeProgress(unique_id, total=6)
+            clip_by_clip_export_profile = normalize_full_batch_export_profile({
+                "codec": codec, "crf": crf, "preset": preset,
+            })
             (
                 preview_path,
                 preview_frames,
@@ -3419,6 +4390,7 @@ class MiniMaxH3MotionContextDiskFinalDecode:
                 ffmpeg=ffmpeg,
                 unique_id=unique_id,
                 progress=progress,
+                export_profile=clip_by_clip_export_profile,
             )
             progress.advance()  # preview encode/cache/concat completed
 
@@ -3462,257 +4434,114 @@ class MiniMaxH3MotionContextDiskFinalDecode:
                 "result": (_video_output_from_path(autosave_path),),
             }
 
-        extension = "mkv" if str(codec) == "FFV1 lossless" else "mp4"
-        output_path = _next_output_path(out_dir, filename_prefix, extension)
-        expected_frames = int(manifest["final_frame_count"])
-        decode_units = max(1, len(segments) - 1)
+        # Full Batch is strictly incremental and keeps a separate exact-final
+        # video sidecar per clip. CRF/preset/codec are frozen when the Extender
+        # starts the batch; Final Decode never transcodes an already compressed
+        # cache and never has a project-wide VideoVAE path.
         progress = _FinalDecodeNativeProgress(
-            unique_id, total=4 + (2 * decode_units) + (1 if _timeline_has_color(color_timeline) else 0)
+            unique_id, total=max(8, 5 + (2 * len(segments)))
         )
-        seam_shifts = {}
-        written_frames = 0
-        video_proc = None
-        video_log_f = None
+        requested_profile = normalize_full_batch_export_profile({
+            "codec": codec, "crf": crf, "preset": preset,
+        })
+        manifest, export_profile = _resolve_full_batch_export_profile(
+            manifest_path, manifest, requested_profile, context="H3 Final Decode"
+        )
 
-        # Temp artifacts are one set only and are always removed afterwards.
-        temp_root = _ensure_cache_root()
-        token = uuid.uuid4().hex[:10]
-        temp_video = temp_root / f"_export_{token}_video.{extension}"
-        raw_audio = temp_root / f"_export_{token}_audio.f32le"
-        temp_audio_cache = temp_root / f"_export_{token}_decoded_audio.h3cache"
-        video_log = temp_root / f"_export_{token}_video.log"
-        mux_log = temp_root / f"_export_{token}_mux.log"
-        color_temp = temp_root / f"_export_{token}_color.{extension}"
+        manifest, segments = _ensure_ref2va_audio_cache(
+            data_path,
+            manifest_path,
+            manifest,
+            vae,
+            audio_vae,
+            float(fps),
+            count=len(segments),
+            progress=progress,
+        )
+        if interrupted:
+            segments = [dict(x) for x in segments[:snapshot_count]]
+        color_timeline = _color_timeline(segments, float(fps))
+        token = f"full_exact_{_safe_name(unique_id)}_{uuid.uuid4().hex[:8]}"
 
-        try:
-            # VIDEO - strict constant-memory path: one clip for N=1, otherwise
-            # exactly one adjacent pair per seam. Nothing accumulated in IMAGE.
-            if len(segments) == 1:
-                v = _load_segment_video(data_path, segments[0])
-                decoded = vae.decode(v)
-                progress.advance()
-                if decoded.ndim == 5:
-                    decoded = decoded.reshape(-1, decoded.shape[-3], decoded.shape[-2], decoded.shape[-1])
-                expected0 = int(segments[0]["frames"])
-                if int(decoded.shape[0]) != expected0:
-                    raise RuntimeError(
-                        f"Disk Final Decode: VAE returned {decoded.shape[0]}, expected {expected0}."
-                    )
-                h, w = int(decoded.shape[1]), int(decoded.shape[2])
-                video_proc, video_log_f = _start_video_encoder(
-                    ffmpeg, temp_video, w, h, fps, codec, crf, preset, video_log
-                )
-                _write_image_frames(video_proc, decoded)
-                written_frames = int(decoded.shape[0])
-                del decoded, v
-            else:
-                for i in range(1, len(segments)):
-                    chain, meta = _build_pair_video(data_path, segments[i - 1], segments[i])
-                    decoded, previous_raw, current_raw, shift = _decode_pair_video(vae, chain, meta)
-                    # Free the latent pair before the RGB seam correction.
-                    del chain
-                    progress.advance()
-                    seam_shifts[i] = int(shift)
-
-                    if video_proc is None:
-                        h, w = int(previous_raw.shape[1]), int(previous_raw.shape[2])
-                        video_proc, video_log_f = _start_video_encoder(
-                            ffmpeg, temp_video, w, h, fps, codec, crf, preset, video_log
-                        )
-                        # First pair supplies clip 1 exactly once.
-                        _write_image_frames(video_proc, previous_raw)
-                        written_frames += int(previous_raw.shape[0])
-
-                    current_out = _correct_current_segment(previous_raw, current_raw)
-                    _write_image_frames(video_proc, current_out)
-                    written_frames += int(current_out.shape[0])
-                    del current_out, previous_raw, current_raw, decoded
-
-            if video_proc is None or video_log_f is None:
-                raise RuntimeError("Disk Final Decode: encoder never started.")
-            _finish_process(video_proc, video_log_f, video_log, "Disk Final Decode encoder")
-            progress.advance()
-            video_proc = None
-            video_log_f = None
-
-            if int(written_frames) != int(expected_frames):
-                raise RuntimeError(
-                    f"Disk Final Decode wrote {written_frames} frames, expected {expected_frames}."
-                )
-
-            # AUDIO - build the SAME primary per-clip PCM cache as Clip by Clip,
-            # then assemble the final Full Batch timeline through the exact same
-            # _write_preview_pcm_audio() seam path. There is only one definition
-            # of entry smoothing/declick and cumulative sample fitting now.
-            #
-            # Clip 1 is intentionally decoded on its own, matching the way it is
-            # cached when generated in Clip by Clip. Each later clip comes from
-            # its adjacent pair and matches gain against the previous UNSMOOTHED
-            # cached clip, again exactly like _render_one_final_segment().
-            sample_rate = None
-            channels = None
-            cached_audio_meta = [None] * len(segments)
-
-            with open(temp_audio_cache, "wb", buffering=0) as acf:
-                acf.write(_AUDIO_CACHE_MAGIC)
-
-                audio0 = _decode_single_audio(data_path, segments[0], audio_vae, fps)
-                progress.advance()
-                sample_rate = int(audio0["sample_rate"])
-                first_wave = audio0["waveform"]
-                channels = int(first_wave.shape[1])
-                cached_audio_meta[0] = _decoded_audio_meta_from_waveform(
-                    acf, {"waveform": first_wave, "sample_rate": sample_rate}
-                )
-                previous_clip_wave = first_wave.detach().to(device="cpu", dtype=torch.float32).contiguous()
-                del audio0, first_wave
-
-                for i in range(1, len(segments)):
-                    pair, prev_frames, curr_frames = _decode_pair_audio(
-                        data_path,
-                        segments[i - 1],
-                        segments[i],
-                        audio_vae,
-                        fps,
-                        int(seam_shifts.get(i, 0)),
-                    )
-                    progress.advance()
-                    sr = int(pair["sample_rate"])
-                    if sr != int(sample_rate):
-                        raise RuntimeError("Disk Final Decode: audio sample rate changed.")
-
-                    w = pair["waveform"]
-                    if int(w.shape[1]) != int(channels):
-                        raise RuntimeError("Disk Final Decode: audio channel count changed.")
-                    prev_n = int(round(float(prev_frames) / float(fps) * sr))
-                    pair_previous = w[..., :prev_n]
-                    current_audio = w[..., prev_n:]
-
-                    gain = _match_pair_gain_to_previous(
-                        previous_clip_wave, pair_previous, sr
-                    )
-                    if abs(gain - 1.0) > 1.0e-8:
-                        current_audio = current_audio * gain
-
-                    wanted = int(round(float(curr_frames) / float(fps) * sr))
-                    current_audio = _fit_audio_segment_to_cumulative(
-                        current_audio, wanted, 0
-                    )
-                    cached_audio_meta[i] = _decoded_audio_meta_from_waveform(
-                        acf, {"waveform": current_audio, "sample_rate": sr}
-                    )
-                    previous_clip_wave = current_audio.detach().to(device="cpu", dtype=torch.float32).contiguous()
-                    del pair, w, pair_previous, current_audio
-
-                acf.flush()
-                os.fsync(acf.fileno())
-
-            # Commit the complete primary cache before assembling the timeline,
-            # because _write_preview_pcm_audio() reads exactly these per-clip PCM
-            # entries. No fallback/recovery path and no second seam algorithm.
-            if any(meta is None for meta in cached_audio_meta):
-                raise RuntimeError("Disk Final Decode: incomplete decoded audio cache generation.")
-            audio_cache_path = _decoded_audio_cache_path(data_path)
-            os.replace(temp_audio_cache, audio_cache_path)
-            segments = [dict(x) for x in segments]
-            for i, meta in enumerate(cached_audio_meta):
-                segments[i]["decoded_audio"] = meta
-            manifest = dict(manifest)
-            manifest["segments"] = segments
-            manifest["build"] = BUILD
-            manifest["updated_at"] = time.time()
-            _write_json_atomic(manifest_path, manifest)
-
-            # One common seam assembler for both modes. This applies the same
-            # entry-level smoothing, declick and sample-exact cumulative fitting
-            # that Clip by Clip already uses for its progressive preview.
-            sample_rate, channels, written_samples = _write_preview_pcm_audio(
-                ffmpeg,
+        # Ensure only missing/dirty exact-final clips. Fresh v2.5.8 Full Batch
+        # runs already created all these files upstream from the first VAE decode,
+        # so this loop normally performs zero VideoVAE work.
+        exact_segment_paths = []
+        for i in range(len(segments)):
+            manifest, final_segment_path, _decoded_now = _ensure_ref2va_final_segment_cache(
                 data_path,
-                segments,
-                len(segments),
-                fps,
-                raw_audio,
-                f"{token}_full_pcm",
-            )
-
-            _mux_final(
+                manifest_path,
+                manifest,
+                i,
+                vae,
+                float(fps),
                 ffmpeg,
-                temp_video,
-                raw_audio,
-                output_path,
-                sample_rate,
-                channels,
-                codec,
-                audio_bitrate,
-                mux_log,
+                export_profile,
+                progress=progress,
             )
-            progress.advance()
+            exact_segment_paths.append(final_segment_path)
+        all_manifest_segments = [dict(x) for x in manifest.get("segments", [])]
+        segments = all_manifest_segments[:len(segments)]
+        color_timeline = _color_timeline(segments, float(fps))
 
-            # Publish the neutral seam-corrected decode to the browser first.
-            # The UI applies per-clip grading live, while the persistent output
-            # below receives the same settings baked in non-destructively.
-            preview_path = _publish_full_preview(output_path, unique_id)
-            if _timeline_has_color(color_timeline):
-                _apply_color_timeline_to_file(
-                    ffmpeg, output_path, color_temp, color_timeline,
-                    codec=codec, crf=crf, preset=preset,
-                )
-                os.replace(color_temp, output_path)
-                progress.advance()
+        # Browser preview remains neutral H.264 and independent of final quality.
+        # Its assembly is also video stream-copy from the preview checkpoints.
+        manifest, committed_path, _committed_video_path = _sync_committed_preview(
+            data_path,
+            manifest_path,
+            manifest,
+            len(segments),
+            vae,
+            audio_vae,
+            float(fps),
+            ffmpeg,
+            token,
+        )
+        progress.advance()
+        preview_path = _publish_full_preview(committed_path, unique_id)
+        expected_frames = int(_final_frame_count(segments))
 
-            _embed_final_metadata_in_place(output_path, workflow=workflow, prompt=prompt)
+        extension = _full_batch_export_profile_extension(export_profile)
+        output_path = _next_output_path(out_dir, filename_prefix, extension)
+        final_video_mode = _export_final_from_exact_segment_caches(
+            ffmpeg=ffmpeg,
+            segment_paths=exact_segment_paths,
+            data_path=data_path,
+            segments=segments,
+            fps=float(fps),
+            output_path=output_path,
+            export_profile=export_profile,
+            audio_bitrate=audio_bitrate,
+            token=token,
+        )
 
-            shifts_text = ",".join(
-                f"{i}:{int(seam_shifts.get(i, 0))}" for i in range(1, len(segments))
-            )
-            size = _cache_size_mb(data_path, manifest_path)
-            duration = float(expected_frames / float(fps))
-            _LOG.info(
-                "H3 Disk Final Decode: clips=%d frames=%d duration=%.3fs output=%s",
-                len(segments), expected_frames, duration, output_path,
-            )
+        _embed_final_metadata_in_place(output_path, workflow=workflow, prompt=prompt)
+        progress.advance()
 
-            item = _comfy_media_item(preview_path, fps, "temp")
-            progress.finish()
-
-            return {
-                "ui": {
-                    "h3_video": [item],
-                    "h3_preview_info": [{
-                        "mode": "full_batch",
-                        "clip": int(len(segments)),
-                        "preview_frames": int(expected_frames),
-                        "total_clips": int(len(segments)),
-                        "color_timeline": color_timeline,
-                        "color_preview_baked": False,
-                    }],
-                },
-                "result": (_video_output_from_path(output_path),),
-            }
-
-        finally:
-            if video_proc is not None:
-                try:
-                    if video_proc.stdin is not None:
-                        video_proc.stdin.close()
-                except Exception:
-                    pass
-                try:
-                    video_proc.kill()
-                except Exception:
-                    pass
-            if video_log_f is not None:
-                try:
-                    video_log_f.close()
-                except Exception:
-                    pass
-            for p in (temp_video, raw_audio, temp_audio_cache, video_log, mux_log, color_temp):
-                try:
-                    if Path(p).exists():
-                        Path(p).unlink()
-                except Exception:
-                    pass
+        _LOG.info(
+            "H3 incremental Full Decode: clips=%d frames=%d interrupted=%s video=%s output=%s",
+            len(segments), expected_frames, bool(interrupted), final_video_mode, output_path,
+        )
+        item = _comfy_media_item(preview_path, fps, "temp")
+        progress.finish()
+        return {
+            "ui": {
+                "h3_video": [item],
+                "h3_preview_info": [{
+                    "mode": "full_batch_incremental",
+                    "clip": int(len(segments)),
+                    "preview_frames": int(expected_frames),
+                    "total_clips": int(project_total_clips if interrupted else len(segments)),
+                    "preview_clips": int(len(segments)),
+                    "interrupted": bool(interrupted),
+                    "cache_mode": "decoded_segments_incremental",
+                    "final_video_mode": str(final_video_mode),
+                    "color_timeline": color_timeline,
+                    "color_preview_baked": False,
+                }],
+            },
+            "result": (_video_output_from_path(output_path),),
+        }
 
 
 NODE_CLASS_MAPPINGS = {

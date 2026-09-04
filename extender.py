@@ -18,6 +18,7 @@ import copy
 import datetime as _datetime
 import hashlib
 import json
+import logging
 import math
 import os
 import re
@@ -66,6 +67,11 @@ from .motion_context_disk import (
     _manifest_for_first,
     _truncate_chain,
     _final_frame_count,
+    clear_full_batch_interrupt,
+    full_batch_interrupt_requested,
+    cache_full_batch_ref2va_segment,
+    normalize_full_batch_export_profile,
+    _resolve_full_batch_export_profile,
 )
 from .fl2va_engine import (
     normalize_mode as _normalize_generation_mode,
@@ -84,9 +90,11 @@ from .fl2va_engine import (
     compact_fl2va_cache,
     fl2va_project_continuity_files,
     install_fl2va_project_continuity,
+    cache_full_batch_fl2va_plan,
 )
 
-BUILD = "minimax-h3-extender-v2.3.3"
+BUILD = "minimax-h3-extender-v2.5.16"
+_LOG = logging.getLogger(__name__)
 FPS = 24
 AUDIO_LATENT_FPS = 40
 CANVAS_MULTIPLE = 32
@@ -1872,6 +1880,168 @@ def _manifest_for_extender(owner_id, fps=24.0):
     return _manifest_for_first(f"extender_{owner_id}", fps)
 
 
+def _literal_prompt_value(value, default):
+    # Connected inputs are represented as [node_id, output_index]. Export
+    # profile widgets are normally literals; fall back safely if someone wires
+    # an external primitive into one of them.
+    if isinstance(value, (list, tuple)) and len(value) >= 2:
+        return default
+    return default if value is None else value
+
+
+def _final_decode_profile_from_prompt(prompt, extender_node_id):
+    """Read the connected Final Decode video profile before Full Batch starts.
+
+    ComfyUI executes the Extender upstream of Final Decode, so these settings
+    are not normal inputs of the Extender. The hidden PROMPT graph contains the
+    already-queued downstream node and lets us pin its literal codec/CRF/preset
+    before the first decoded clip is encoded.
+    """
+    defaults = normalize_full_batch_export_profile()
+    graph = prompt if isinstance(prompt, dict) else {}
+    candidates = []
+    direct = []
+    owner = str(extender_node_id)
+    for node_id, node in graph.items():
+        if not isinstance(node, dict):
+            continue
+        if str(node.get("class_type") or "") != "MiniMaxH3MotionContextDiskFinalDecode":
+            continue
+        inputs = node.get("inputs") if isinstance(node.get("inputs"), dict) else {}
+        candidates.append(inputs)
+        cache_link = inputs.get("cache")
+        if (
+            isinstance(cache_link, (list, tuple))
+            and len(cache_link) >= 1
+            and str(cache_link[0]) == owner
+        ):
+            direct.append(inputs)
+
+    source = direct[0] if direct else (candidates[0] if len(candidates) == 1 else None)
+    if source is None:
+        return defaults
+    return normalize_full_batch_export_profile({
+        "codec": _literal_prompt_value(source.get("codec"), defaults["codec"]),
+        "crf": _literal_prompt_value(source.get("crf"), defaults["crf"]),
+        "preset": _literal_prompt_value(source.get("preset"), defaults["preset"]),
+    })
+
+
+def _pin_full_batch_export_profile(manifest_path, manifest, run_mode, requested_profile):
+    """Resolve the video profile that the upcoming Full Batch should use.
+
+    - fresh Full Batch: adopt the currently queued Final Decode codec/CRF/preset;
+    - resumed/interrupted Full Batch: keep the profile already pinned in the
+      checkpoint so the remaining clips stay consistent with the cached prefix.
+    """
+    if str(run_mode) != "full_batch":
+        return manifest, None
+    requested = normalize_full_batch_export_profile(requested_profile)
+    return _resolve_full_batch_export_profile(
+        manifest_path, manifest, requested, context="H3 Extender"
+    )
+
+
+def _batch_checkpoint_active(manifest):
+    manifest = manifest if isinstance(manifest, dict) else {}
+    return bool(manifest.get("batch_in_progress", False) or manifest.get("batch_interrupted", False))
+
+
+def _begin_batch_checkpoint(manifest_path, manifest, run_mode):
+    """Start one Full-Batch transaction and report whether it is resumable.
+
+    A successful normal Full Batch clears this transient state before returning.
+    A cooperative stop, ComfyUI Kill, Python exception or process crash leaves the
+    already-written ``computed`` segment markers on disk, allowing the next Full
+    Batch execution to walk them without sampling again.
+    """
+    manifest = dict(manifest or {})
+    resume = bool(str(run_mode) == "full_batch" and _batch_checkpoint_active(manifest))
+    segments = [dict(x) for x in manifest.get("segments", [])]
+
+    if str(run_mode) == "full_batch":
+        manifest["batch_in_progress"] = True
+        manifest["batch_interrupted"] = False
+        manifest.pop("batch_snapshot_count", None)
+        manifest.pop("batch_total_clips", None)
+        manifest["batch_started_at"] = time.time()
+    else:
+        # Switching to Clip-by-Clip deliberately leaves the historical execution
+        # model. Any stale Full-Batch checkpoint markers must not alter its normal
+        # candidate/reroll semantics.
+        changed = False
+        for desc in segments:
+            if "computed" in desc:
+                desc.pop("computed", None)
+                changed = True
+        manifest["segments"] = segments
+        for key in (
+            "batch_in_progress",
+            "batch_interrupted",
+            "batch_snapshot_count",
+            "batch_total_clips",
+            "batch_started_at",
+        ):
+            if key in manifest:
+                manifest.pop(key, None)
+                changed = True
+        if not changed:
+            return manifest, False
+
+    manifest["updated_at"] = time.time()
+    _write_json_atomic(manifest_path, manifest)
+    return manifest, resume
+
+
+def _finish_batch_checkpoint(manifest_path, manifest):
+    """Clear resumable markers after a complete, non-interrupted Full Batch."""
+    manifest = dict(manifest or {})
+    segments = [dict(x) for x in manifest.get("segments", [])]
+    for desc in segments:
+        desc.pop("computed", None)
+    manifest["segments"] = segments
+    for key in (
+        "batch_in_progress",
+        "batch_interrupted",
+        "batch_snapshot_count",
+        "batch_total_clips",
+        "batch_started_at",
+    ):
+        manifest.pop(key, None)
+    manifest["updated_at"] = time.time()
+    _write_json_atomic(manifest_path, manifest)
+    return manifest
+
+
+def _interrupt_batch_checkpoint(manifest_path, manifest, snapshot_count, total_clips):
+    """Commit the current Full-Batch prefix as a resumable user checkpoint."""
+    manifest = dict(manifest or {})
+    manifest["batch_in_progress"] = False
+    manifest["batch_interrupted"] = True
+    manifest["batch_snapshot_count"] = max(0, int(snapshot_count))
+    manifest["batch_total_clips"] = max(0, int(total_clips))
+    manifest["updated_at"] = time.time()
+    _write_json_atomic(manifest_path, manifest)
+    return manifest
+
+
+def _ref2va_computed_indices(manifest):
+    return [
+        i for i, desc in enumerate((manifest or {}).get("segments", []))
+        if bool(desc.get("computed", False)) and not bool(desc.get("validated", False))
+    ]
+
+
+def _fl2va_computed_ids(manifest):
+    return [
+        str(desc.get("clip_id")) for desc in (manifest or {}).get("segments", [])
+        if str(desc.get("clip_id") or "")
+        and bool(desc.get("computed", False))
+        and not bool(desc.get("validated", False))
+    ]
+
+
+
 EXTENDER_PROGRESS_EVENT = "h3_extender_progress"
 EXTENDER_PROMPT_PACK_EVENT = "h3_extender_prompt_pack_import"
 EXTENDER_REF_PACK_EVENT = "h3_extender_ref_pack_import"
@@ -2301,6 +2471,31 @@ def _build_project_archive(owner_id, requested_name, project_payload, output_pat
         else []
     )
 
+    final_video_files = []
+    if snapshot is not None:
+        if generation_mode == "fl2va":
+            final_dir = Path(snapshot["data_path"]).with_suffix(".fl2va.video")
+            if final_dir.exists():
+                # Save/Load must preserve the exact runtime state of a COMPUTED
+                # Full-Batch checkpoint.  The neutral per-plan .mp4 cache is the
+                # decoded checkpoint used by _ensure_plan_video_cache(); saving
+                # only .final.* sidecars forced a VideoVAE rebuild after Load
+                # even though the plan still appeared COMPUTED in the UI.
+                #
+                # Keep all video containers for live plans (.mp4/.mkv), including
+                # neutral plan caches, trimmed .prev.mp4 helpers and exact-final
+                # sidecars. Continuity PNG/JSON are already archived separately.
+                final_video_files = sorted(
+                    [
+                        p for p in final_dir.iterdir()
+                        if p.is_file() and p.suffix.lower() in {".mp4", ".mkv"}
+                    ]
+                )
+        else:
+            final_dir = Path(snapshot["data_path"]).with_suffix(".final.video")
+            if final_dir.exists():
+                final_video_files = sorted([p for p in final_dir.iterdir() if p.is_file()])
+
     if snapshot is not None:
         cache_resolution = _resolution_from_manifest(snapshot.get("manifest"))
         if cache_resolution is not None:
@@ -2335,6 +2530,9 @@ def _build_project_archive(owner_id, requested_name, project_payload, output_pat
             "has_committed_preview": bool(snapshot and snapshot["preview_path"].exists()),
             "has_portable_full_preview": bool(snapshot and snapshot.get("preview_is_full", False)),
             "has_decoded_audio_cache": bool(snapshot and int(snapshot.get("audio_limit", 0)) > 0),
+            "final_video_files": [
+                f"cache/final_video/{path.name}" for path in final_video_files
+            ],
             "fl2va_continuity": [
                 {
                     "clip_id": str(item["clip_id"]),
@@ -2393,6 +2591,13 @@ def _build_project_archive(owner_id, requested_name, project_payload, output_pat
                 compress_type=zipfile.ZIP_DEFLATED,
             )
 
+        for path in final_video_files:
+            zf.write(
+                path,
+                arcname=f"cache/final_video/{path.name}",
+                compress_type=zipfile.ZIP_STORED,
+            )
+
         if snapshot is not None:
             manifest_bytes = json.dumps(
                 snapshot["manifest"],
@@ -2444,7 +2649,15 @@ def _zip_copy_member(zf, member_name, destination):
         os.fsync(dst.fileno())
 
 
-def _replace_cache_transaction(owner_id, new_data=None, new_manifest=None, new_preview=None, new_audio=None, generation_mode="ref2va"):
+def _replace_cache_transaction(
+    owner_id,
+    new_data=None,
+    new_manifest=None,
+    new_preview=None,
+    new_audio=None,
+    new_final_video_dir=None,
+    generation_mode="ref2va",
+):
     mode = _normalize_generation_mode(generation_mode)
     cache_owner = _fl2va_cache_owner_id(owner_id) if mode == "fl2va" else f"extender_{_safe_name(owner_id)}"
     target_data, target_manifest = _chain_paths(cache_owner)
@@ -2452,6 +2665,10 @@ def _replace_cache_transaction(owner_id, new_data=None, new_manifest=None, new_p
     target_preview_video = _decoded_preview_video_cache_path(target_data)
     target_audio = _decoded_audio_cache_path(target_data)
     target_fl2va_video_dir = target_data.with_suffix(".fl2va.video")
+    target_ref2va_final_video_dir = target_data.with_suffix(".final.video")
+    target_final_video_dir = (
+        target_fl2va_video_dir if mode == "fl2va" else target_ref2va_final_video_dir
+    )
     # The video-only preview prefix is derived and is intentionally not stored
     # in .ext. The decoded-audio cache is primary cache data and is restored
     # together with the latent chain when present.
@@ -2460,11 +2677,15 @@ def _replace_cache_transaction(owner_id, new_data=None, new_manifest=None, new_p
     token = uuid.uuid4().hex[:10]
 
     try:
-        # FL2VA per-plan decoded videos are a derived local speed cache, not part
-        # of the portable .ext payload. Never let files from the previously
-        # loaded project survive into a newly imported FL2VA latent cache.
-        if mode == "fl2va" and target_fl2va_video_dir.exists():
-            shutil.rmtree(target_fl2va_video_dir, ignore_errors=True)
+        # Exact-final sidecars are primary no-reencode cache data in v2.5.8.
+        # Move the whole directory aside transactionally so a failed project
+        # import can restore it just like the latent/audio files.
+        if target_final_video_dir.exists():
+            backup = target_final_video_dir.with_name(
+                target_final_video_dir.name + f".project_backup_{token}"
+            )
+            os.replace(target_final_video_dir, backup)
+            backups.append((target_final_video_dir, backup))
         for target in targets:
             if target.exists():
                 backup = target.with_name(target.name + f".project_backup_{token}")
@@ -2478,6 +2699,11 @@ def _replace_cache_transaction(owner_id, new_data=None, new_manifest=None, new_p
                 os.replace(str(new_preview), target_preview)
             if new_audio is not None and Path(new_audio).exists():
                 os.replace(str(new_audio), target_audio)
+            if new_final_video_dir is not None and Path(new_final_video_dir).exists():
+                target_final_video_dir.mkdir(parents=True, exist_ok=True)
+                for source in Path(new_final_video_dir).iterdir():
+                    if source.is_file():
+                        os.replace(str(source), target_final_video_dir / source.name)
         # No imported cache means an intentionally empty project. The old cache
         # remains only in backups until this transaction succeeds.
     except Exception:
@@ -2486,6 +2712,8 @@ def _replace_cache_transaction(owner_id, new_data=None, new_manifest=None, new_p
                 target.unlink(missing_ok=True)
             except Exception:
                 pass
+        if target_final_video_dir.exists():
+            shutil.rmtree(target_final_video_dir, ignore_errors=True)
         for target, backup in reversed(backups):
             if backup.exists():
                 os.replace(backup, target)
@@ -2493,7 +2721,10 @@ def _replace_cache_transaction(owner_id, new_data=None, new_manifest=None, new_p
     else:
         for _, backup in backups:
             try:
-                backup.unlink(missing_ok=True)
+                if backup.is_dir():
+                    shutil.rmtree(backup, ignore_errors=True)
+                else:
+                    backup.unlink(missing_ok=True)
             except Exception:
                 pass
 
@@ -2506,6 +2737,7 @@ def _import_project_archive(owner_id, archive_path):
     new_manifest = work_root / "chain.json"
     new_audio = work_root / "chain.audio.h3cache"
     new_preview = work_root / "chain.preview.mp4"
+    new_final_video_dir = work_root / "final_video"
     continuity_restore = []
 
     try:
@@ -2724,6 +2956,20 @@ def _import_project_archive(owner_id, archive_path):
                 if "cache/chain.preview.mp4" in names:
                     _zip_copy_member(zf, "cache/chain.preview.mp4", new_preview)
 
+                final_members = sorted(
+                    name for name in names
+                    if name.startswith("cache/final_video/") and not name.endswith("/")
+                )
+                if final_members:
+                    new_final_video_dir.mkdir(parents=True, exist_ok=True)
+                    for member in final_members:
+                        base = Path(member).name
+                        if not base or base != member.split("/")[-1]:
+                            raise ValueError(
+                                "MiniMax H3 Extender Project: invalid final video cache entry."
+                            )
+                        _zip_copy_member(zf, member, new_final_video_dir / base)
+
                 imported_manifest = _load_manifest_from_paths(new_data, new_manifest)
                 if imported_manifest is None:
                     raise ValueError("MiniMax H3 Extender Project: cache manifest is empty.")
@@ -2885,6 +3131,11 @@ def _import_project_archive(owner_id, archive_path):
                 new_manifest if imported_manifest is not None else None,
                 new_preview if imported_manifest is not None and new_preview.exists() else None,
                 new_audio if imported_manifest is not None and new_audio.exists() else None,
+                new_final_video_dir=(
+                    new_final_video_dir
+                    if imported_manifest is not None and new_final_video_dir.exists()
+                    else None
+                ),
                 generation_mode=generation_mode,
             )
 
@@ -2955,6 +3206,23 @@ def _import_project_archive(owner_id, archive_path):
                         str(x.get("clip_id")) for x in (imported_manifest or {}).get("segments", [])
                         if str(x.get("clip_id") or "") and bool(x.get("validated", False))
                     ],
+                    "computed_indices": [
+                        i for i, x in enumerate((imported_manifest or {}).get("segments", []))
+                        if bool(x.get("computed", False)) and not bool(x.get("validated", False))
+                    ],
+                    "computed_clip_ids": [
+                        str(x.get("clip_id")) for x in (imported_manifest or {}).get("segments", [])
+                        if str(x.get("clip_id") or "") and bool(x.get("computed", False)) and not bool(x.get("validated", False))
+                    ],
+                    "checkpoint_active": bool(
+                        imported_manifest
+                        and (
+                            imported_manifest.get("batch_in_progress", False)
+                            or imported_manifest.get("batch_interrupted", False)
+                        )
+                    ),
+                    "checkpoint_interrupted": bool(imported_manifest and imported_manifest.get("batch_interrupted", False)),
+                    "checkpoint_snapshot_count": int(imported_manifest.get("batch_snapshot_count", 0) or 0) if imported_manifest else 0,
                     "continuity_signatures": loaded_continuity_signatures,
                     "frame_count": int(imported_manifest.get("final_frame_count", 0)) if imported_manifest else 0,
                     "resolved_width": int(loaded_resolution["width"]) if loaded_resolution else 0,
@@ -3172,7 +3440,7 @@ class MiniMaxH3Extender:
         return {
             "required": required,
             "optional": optional,
-            "hidden": {"unique_id": "UNIQUE_ID"},
+            "hidden": {"unique_id": "UNIQUE_ID", "prompt": "PROMPT"},
         }
 
     RETURN_TYPES = (CACHE_TYPE, "INT", "INT", "STRING", "FLOAT", "STRING")
@@ -3226,6 +3494,7 @@ class MiniMaxH3Extender:
         fl2va_model,
         clip,
         vae,
+        audio_vae,
         run_mode,
         width,
         height,
@@ -3235,6 +3504,7 @@ class MiniMaxH3Extender:
         denoise,
         resolution_mode,
         megapixels,
+        export_profile,
     ):
         if fl2va_model is None:
             raise ValueError(
@@ -3302,10 +3572,26 @@ class MiniMaxH3Extender:
         # card ids, which is what makes insert/remove/reorder independent of the
         # physical append-only latent file.
         data_path, manifest_path, manifest = sync_fl2va_manifest(owner, FPS, clip_ids)
+        manifest, active_export_profile = _pin_full_batch_export_profile(
+            manifest_path, manifest, run_mode, export_profile
+        )
+        clear_full_batch_interrupt(owner, "fl2va")
+        manifest, _resume_checkpoint = _begin_batch_checkpoint(
+            manifest_path, manifest, run_mode
+        )
         cached_ids = cached_fl2va_ids(manifest)
         generated = []
         statuses = []
         previous_handle = None
+        interrupted = False
+        interrupted_after = 0
+
+        if str(run_mode) == "full_batch":
+            _LOG.info(
+                "H3 Full Batch FL2VA start: validated=%s cached_ids=%s",
+                [bool(c.get("validated", False)) for c in clips],
+                sorted(str(x) for x in cached_ids),
+            )
 
         def _dependent_indices(after_index):
             out = []
@@ -3330,6 +3616,18 @@ class MiniMaxH3Extender:
             cached_ids = cached_fl2va_ids(manifest)
 
         for i, cfg in enumerate(clips):
+            # A request can arrive immediately after the previous clip emitted
+            # its COMPLETE event. Check again before preparing the next card so
+            # "Interrupt" never starts one extra expensive sample by accident.
+            if (
+                str(run_mode) == "full_batch"
+                and i > 0
+                and full_batch_interrupt_requested(owner, "fl2va", consume=True)
+            ):
+                interrupted = True
+                interrupted_after = i
+                break
+
             clip_id = clip_ids[i]
             first_source = (
                 "previous_clip"
@@ -3373,13 +3671,56 @@ class MiniMaxH3Extender:
                 current_desc = None
                 cached = False
 
-            if bool(cfg.get("validated")) and cached:
+            if bool(cfg.get("validated", False)):
+                if not cached or current_desc is None:
+                    if first_frame is not None:
+                        del first_frame
+                    raise RuntimeError(
+                        f"MiniMax H3 Extender: FL2VA clip {i + 1} is marked Validated "
+                        "but its plan cache is missing. Refusing to rerender a validated clip. "
+                        "Uncheck Validated explicitly if you want this clip rendered again."
+                    )
+                _LOG.info(
+                    "H3 validated hard-skip: FL2VA clip %d exists on disk; sampler forbidden",
+                    i + 1,
+                )
                 if first_frame is not None:
                     del first_frame
                 continue
-            if bool(cfg.get("validated")) and not cached:
-                cfg["validated"] = False
 
+            if (
+                str(run_mode) == "full_batch"
+                and cached
+                and current_desc is not None
+                and bool(current_desc.get("computed", False))
+                and not bool(current_desc.get("validated", False))
+            ):
+                _LOG.info(
+                    "H3 COMPUTED hard-reuse: FL2VA clip %d exists on disk; sampler forbidden",
+                    i + 1,
+                )
+                _send_extender_progress(
+                    owner, i, len(clips), "sampling",
+                    f"Checking FL2VA checkpoint {i + 1}/{len(clips)}",
+                )
+                manifest, _cache_info = cache_full_batch_fl2va_plan(
+                    owner, float(FPS), clip_ids, clip_id, vae, audio_vae=audio_vae,
+                    export_profile=active_export_profile,
+                    color_adjustment=cfg.get("color_adjustment"),
+                    handoff_enabled=(
+                        i + 1 < len(clips)
+                        and str(clips[i + 1].get("first_source") or "manual") == "previous_clip"
+                    ),
+                )
+                statuses.append(f"FL2VA clip {i + 1} resumed from checkpoint")
+                if first_frame is not None:
+                    del first_frame
+                continue
+
+            if bool(cfg.get("validated", False)):
+                raise RuntimeError(
+                    f"MiniMax H3 Extender invariant: FL2VA clip {i + 1} reached the sampler path while Validated."
+                )
             _send_extender_progress(
                 owner, i, len(clips), "preparing",
                 f"Preparing FL2VA clip {i + 1}/{len(clips)}",
@@ -3441,11 +3782,40 @@ class MiniMaxH3Extender:
                 validated=False,
                 run_mode=str(run_mode),
                 dependency_meta=dependency_meta,
+                computed=(str(run_mode) == "full_batch"),
             )
             statuses.append(cache_status)
             cached_ids.add(clip_id)
             generated.append(i)
             cfg["validated"] = False
+
+            # Sampling is safely persisted now. Release the large generation
+            # tensors before staging VideoVAE for the resumable decoded cache.
+            del sampled, positive, latent, clip_model, clip_text_encoder
+            if first_frame is not None:
+                del first_frame
+            if last_frame is not None:
+                del last_frame
+            for guide_item in guide_frames:
+                guide_tensor = guide_item.get("frame") if isinstance(guide_item, dict) else None
+                if guide_tensor is not None:
+                    del guide_tensor
+            guide_frames.clear()
+
+            if str(run_mode) == "full_batch":
+                _send_extender_progress(
+                    owner, i, len(clips), "sampling",
+                    f"Caching FL2VA clip {i + 1}/{len(clips)}",
+                )
+                manifest, _cache_info = cache_full_batch_fl2va_plan(
+                    owner, float(FPS), clip_ids, clip_id, vae, audio_vae=audio_vae,
+                    export_profile=active_export_profile,
+                    color_adjustment=cfg.get("color_adjustment"),
+                    handoff_enabled=(
+                        i + 1 < len(clips)
+                        and str(clips[i + 1].get("first_source") or "manual") == "previous_clip"
+                    ),
+                )
 
             # Rerendering an upstream plan changes the real image used by every
             # consecutive Previous-linked follower. Their latent caches are now
@@ -3458,16 +3828,14 @@ class MiniMaxH3Extender:
                 owner, i, len(clips), "complete",
                 f"FL2VA clip {i + 1}/{len(clips)} complete",
             )
-            del sampled, positive, latent, clip_model, clip_text_encoder
-            if first_frame is not None:
-                del first_frame
-            if last_frame is not None:
-                del last_frame
-            for guide_item in guide_frames:
-                guide_tensor = guide_item.get("frame") if isinstance(guide_item, dict) else None
-                if guide_tensor is not None:
-                    del guide_tensor
-            guide_frames.clear()
+
+            if (
+                str(run_mode) == "full_batch"
+                and full_batch_interrupt_requested(owner, "fl2va", consume=True)
+            ):
+                interrupted = True
+                interrupted_after = i + 1
+                break
 
             if str(run_mode) == "clip_by_clip":
                 break
@@ -3480,6 +3848,22 @@ class MiniMaxH3Extender:
             owner, FPS, clip_ids, validation_by_id, run_mode=str(run_mode)
         )
 
+        if str(run_mode) == "full_batch":
+            if interrupted:
+                final_manifest = _interrupt_batch_checkpoint(
+                    manifest_path,
+                    final_manifest,
+                    interrupted_after,
+                    len(clips),
+                )
+                previous_handle = dict(previous_handle)
+                previous_handle["interrupted"] = True
+                previous_handle["snapshot_count"] = int(interrupted_after)
+                previous_handle["project_total_clips"] = int(len(clips))
+                previous_handle["status"] = f"interrupted after clip {int(interrupted_after)}"
+            else:
+                final_manifest = _finish_batch_checkpoint(manifest_path, final_manifest)
+
         # Keep per-plan color metadata aligned by stable clip id.
         color_segments = [dict(x) for x in final_manifest.get("segments", [])]
         clip_by_id = {clip_ids[i]: clips[i] for i in range(len(clips))}
@@ -3491,6 +3875,7 @@ class MiniMaxH3Extender:
             wanted = _normalize_color_adjustment(cfg.get("color_adjustment"))
             if desc.get("color_adjustment") != wanted:
                 desc["color_adjustment"] = wanted
+                desc["final_video_dirty"] = True
                 color_segments[idx] = desc
                 color_changed = True
         if color_changed:
@@ -3507,6 +3892,7 @@ class MiniMaxH3Extender:
         }
         cached_count = len(cached_ids)
         validated_count = len(validated_ids)
+        computed_clip_ids = _fl2va_computed_ids(final_manifest)
         continuity_signatures = continuity_signatures_for_segments(
             data_path, final_manifest.get("segments", [])
         )
@@ -3537,6 +3923,8 @@ class MiniMaxH3Extender:
                 if generated else "disk only"
             )
         )
+        if interrupted:
+            status += f" | INTERRUPTED after clip {int(interrupted_after)} | checkpoint saved"
         cache_mb = _cache_size_mb(data_path, manifest_path)
         final_cache_resolution = _resolution_from_manifest(final_manifest)
 
@@ -3549,6 +3937,11 @@ class MiniMaxH3Extender:
             "validated_count": validated_count,
             "cached_clip_ids": sorted(cached_ids),
             "validated_clip_ids": sorted(validated_ids),
+            "computed_clip_ids": sorted(computed_clip_ids),
+            "computed_indices": [],
+            "checkpoint_active": bool(interrupted),
+            "checkpoint_interrupted": bool(interrupted),
+            "checkpoint_snapshot_count": int(interrupted_after if interrupted else 0),
             "continuity_signatures": continuity_signatures,
             "generated": [i + 1 for i in generated],
             "status": status,
@@ -3607,6 +4000,7 @@ class MiniMaxH3Extender:
         prompt_pack=None,
         ref_pack=None,
         unique_id=None,
+        prompt=None,
         **kwargs,
     ):
         generation_mode = _normalize_generation_mode(generation_mode)
@@ -3624,6 +4018,8 @@ class MiniMaxH3Extender:
         if external_prompt_pack is None:
             active_prompt_pack_signature = ""
 
+        requested_export_profile = _final_decode_profile_from_prompt(prompt, owner)
+
         if generation_mode == "fl2va":
             return self._extend_fl2va(
                 owner=owner,
@@ -3635,6 +4031,7 @@ class MiniMaxH3Extender:
                 fl2va_model=kwargs.get("fl2va_model"),
                 clip=clip,
                 vae=vae,
+                audio_vae=kwargs.get("audio_vae"),
                 run_mode=run_mode,
                 width=width,
                 height=height,
@@ -3644,6 +4041,7 @@ class MiniMaxH3Extender:
                 denoise=denoise,
                 resolution_mode=resolution_mode,
                 megapixels=megapixels,
+                export_profile=requested_export_profile,
             )
 
         data_path, manifest_path, manifest = _manifest_for_extender(owner, FPS)
@@ -3656,14 +4054,10 @@ class MiniMaxH3Extender:
 
         segments = manifest.get("segments", [])
 
-        # A TRUE toggle can only validate a clip that actually exists on disk.
-        # This also protects old workflow JSON with stale downstream TRUE values.
-        if len(segments) < len(clips):
-            for i in range(len(segments), len(clips)):
-                if clips[i]["validated"]:
-                    for j in range(i, len(clips)):
-                        clips[j]["validated"] = False
-                    break
+        # Never silently turn a user-validated clip back into an active clip.
+        # The loop below enforces the hard invariant: Validated=True can only be
+        # reused from disk; if its cache is missing we stop with an explicit
+        # error instead of falling through to the sampler.
 
         refs = _parse_refs_json(refs_json)
         external_ref_pack = _normalize_external_ref_pack(ref_pack)
@@ -3754,6 +4148,14 @@ class MiniMaxH3Extender:
         manifest["updated_at"] = time.time()
         _write_json_atomic(manifest_path, manifest)
 
+        manifest, active_export_profile = _pin_full_batch_export_profile(
+            manifest_path, manifest, run_mode, requested_export_profile
+        )
+        clear_full_batch_interrupt(owner, "ref2va")
+        manifest, _resume_checkpoint = _begin_batch_checkpoint(
+            manifest_path, manifest, run_mode
+        )
+
         resolution_mismatch = False
 
         audio_vae = kwargs.get("audio_vae")
@@ -3794,17 +4196,50 @@ class MiniMaxH3Extender:
         previous_proxy = None
         generated = []
         statuses = []
+        interrupted = False
+        interrupted_after = 0
+
+        if str(run_mode) == "full_batch":
+            _LOG.info(
+                "H3 Full Batch Ref2VA start: validated=%s cached_segments=%d",
+                [bool(c.get("validated", False)) for c in clips],
+                len((_load_manifest_from_paths(data_path, manifest_path) or {}).get("segments", [])),
+            )
 
         # Walk the card list in order. Cached TRUE clips are metadata-only;
         # active clips sample and are written immediately to disk.
         for i, cfg in enumerate(clips):
+            if (
+                str(run_mode) == "full_batch"
+                and i > 0
+                and full_batch_interrupt_requested(owner, "ref2va", consume=True)
+            ):
+                interrupted = True
+                interrupted_after = i
+                break
+
             # Refresh manifest state every iteration because Disk Join can
             # truncate or append the physical chain.
             current_manifest = _load_manifest_from_paths(data_path, manifest_path)
             existing_count = len(current_manifest.get("segments", [])) if current_manifest else 0
             existing = i < existing_count
+            current_desc = (
+                dict(current_manifest.get("segments", [])[i])
+                if current_manifest is not None and existing
+                else None
+            )
 
-            if cfg["validated"] and existing:
+            if bool(cfg.get("validated", False)):
+                if not existing or current_desc is None:
+                    raise RuntimeError(
+                        f"MiniMax H3 Extender: Ref2VA clip {i + 1} is marked Validated "
+                        "but its disk cache is missing. Refusing to rerender a validated clip. "
+                        "Uncheck Validated explicitly if you want this clip rendered again."
+                    )
+                _LOG.info(
+                    "H3 validated hard-skip: Ref2VA clip %d exists on disk; sampler forbidden",
+                    i + 1,
+                )
                 result = disk_join.join(
                     samples=None,
                     trim_frames=None,
@@ -3818,6 +4253,49 @@ class MiniMaxH3Extender:
                 previous_proxy = result[1]
                 statuses.append(result[4])
                 continue
+
+            if (
+                str(run_mode) == "full_batch"
+                and existing
+                and current_desc is not None
+                and bool(current_desc.get("computed", False))
+                and not bool(current_desc.get("validated", False))
+            ):
+                _LOG.info(
+                    "H3 COMPUTED hard-reuse: Ref2VA clip %d exists on disk; sampler forbidden",
+                    i + 1,
+                )
+                result = disk_join.join(
+                    samples=None,
+                    trim_frames=None,
+                    validated=False,
+                    run_mode=str(run_mode),
+                    fps=float(FPS),
+                    previous_cache=previous_handle,
+                    unique_id=f"extender_{owner}",
+                    reuse_existing=True,
+                )
+                previous_handle = result[0]
+                previous_proxy = result[1]
+                statuses.append(result[4])
+                _send_extender_progress(
+                    owner, i, len(clips), "sampling",
+                    f"Checking Ref2VA checkpoint {i + 1}/{len(clips)}",
+                )
+                cache_full_batch_ref2va_segment(
+                    data_path, manifest_path, i, vae, audio_vae, float(FPS),
+                    export_profile=active_export_profile,
+                    color_adjustment=cfg.get("color_adjustment"),
+                )
+                continue
+
+            # Reaching this point with Validated=True is a programming error.
+            # Never recover by sampling: validated clips are immutable until the
+            # user explicitly unchecks them.
+            if bool(cfg.get("validated", False)):
+                raise RuntimeError(
+                    f"MiniMax H3 Extender invariant: Ref2VA clip {i + 1} reached the sampler path while Validated."
+                )
 
             # Any active clip is unvalidated. Make sure everything after it is
             # false in the serialized state as well.
@@ -3977,11 +4455,30 @@ class MiniMaxH3Extender:
                 fps=float(FPS),
                 previous_cache=previous_handle,
                 unique_id=f"extender_{owner}",
+                computed=(str(run_mode) == "full_batch"),
             )
             previous_handle = result[0]
             previous_proxy = result[1]
             statuses.append(result[4])
             generated.append(i)
+
+            # The sampled latent is safely on disk. Release generation tensors
+            # before VideoVAE is staged, then create the same decoded segment
+            # cache used by Clip-by-Clip. This turns every completed Full-Batch
+            # clip into a real resumable checkpoint rather than postponing one
+            # giant decode pass until the end.
+            del sampled, positive, latent, clip_model, clip_text_encoder
+
+            if str(run_mode) == "full_batch":
+                _send_extender_progress(
+                    owner, i, len(clips), "sampling",
+                    f"Caching Ref2VA clip {i + 1}/{len(clips)}",
+                )
+                cache_full_batch_ref2va_segment(
+                    data_path, manifest_path, i, vae, audio_vae, float(FPS),
+                    export_profile=active_export_profile,
+                    color_adjustment=cfg.get("color_adjustment"),
+                )
 
             _send_extender_progress(
                 owner,
@@ -3991,10 +4488,13 @@ class MiniMaxH3Extender:
                 f"Clip {i + 1}/{len(clips)} complete",
             )
 
-            # Drop full sampled/conditioning and card-local patched MODEL/CLIP
-            # references before the next clip. The incoming base model remains
-            # untouched, so a LoRA selected on one card cannot leak to another.
-            del sampled, positive, latent, clip_model, clip_text_encoder
+            if (
+                str(run_mode) == "full_batch"
+                and full_batch_interrupt_requested(owner, "ref2va", consume=True)
+            ):
+                interrupted = True
+                interrupted_after = i + 1
+                break
 
             if str(run_mode) == "clip_by_clip":
                 break
@@ -4007,6 +4507,22 @@ class MiniMaxH3Extender:
             raise RuntimeError("MiniMax H3 Extender: sequence produced no cache handle.")
 
         final_manifest = _load_manifest_from_paths(data_path, manifest_path)
+        if str(run_mode) == "full_batch" and final_manifest is not None:
+            if interrupted:
+                final_manifest = _interrupt_batch_checkpoint(
+                    manifest_path,
+                    final_manifest,
+                    interrupted_after,
+                    len(clips),
+                )
+                previous_handle = dict(previous_handle)
+                previous_handle["interrupted"] = True
+                previous_handle["snapshot_count"] = int(interrupted_after)
+                previous_handle["project_total_clips"] = int(len(clips))
+                previous_handle["status"] = f"interrupted after clip {int(interrupted_after)}"
+            else:
+                final_manifest = _finish_batch_checkpoint(manifest_path, final_manifest)
+
         # Color grading is montage metadata only. Keep it attached to each cached
         # decoded segment without invalidating latents or validation state.
         if final_manifest is not None:
@@ -4018,6 +4534,7 @@ class MiniMaxH3Extender:
                 wanted = _normalize_color_adjustment(clips[color_i].get("color_adjustment"))
                 if desc.get("color_adjustment") != wanted:
                     desc["color_adjustment"] = wanted
+                    desc["final_video_dirty"] = True
                     color_segments[color_i] = desc
                     color_changed = True
             if color_changed:
@@ -4034,6 +4551,7 @@ class MiniMaxH3Extender:
                 validated_count += 1
             else:
                 break
+        computed_indices = _ref2va_computed_indices(final_manifest)
 
         normalized_json = _state_json(clips, active_prompt_pack_signature, generation_mode)
         if resolution.get("mode") == "auto_from_ref" and resolution.get("guide_ref") is not None:
@@ -4075,6 +4593,8 @@ class MiniMaxH3Extender:
                 else "disk only"
             )
         )
+        if interrupted:
+            status += f" | INTERRUPTED after clip {int(interrupted_after)} | checkpoint saved"
         cache_mb = _cache_size_mb(data_path, manifest_path)
 
         _send_extender_progress(
@@ -4091,6 +4611,11 @@ class MiniMaxH3Extender:
             "clip_count": len(clips),
             "cached_count": cached_count,
             "validated_count": validated_count,
+            "computed_indices": computed_indices,
+            "computed_clip_ids": [],
+            "checkpoint_active": bool(interrupted),
+            "checkpoint_interrupted": bool(interrupted),
+            "checkpoint_snapshot_count": int(interrupted_after if interrupted else 0),
             "generated": [i + 1 for i in generated],
             "status": status,
             "resolved_width": resolved_width,

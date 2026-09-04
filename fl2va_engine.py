@@ -52,6 +52,11 @@ def cache_owner_id(owner_id) -> str:
     return f"extender_{_safe_name(owner_id)}_fl2va"
 
 
+def _safe_cache_name(value: str) -> str:
+    from .motion_context_disk import _safe_name
+    return _safe_name(value)
+
+
 def _plan_video_cache_dir(data_path: Path) -> Path:
     path = Path(data_path).with_suffix(".fl2va.video")
     path.mkdir(parents=True, exist_ok=True)
@@ -61,6 +66,12 @@ def _plan_video_cache_dir(data_path: Path) -> Path:
 def _plan_video_cache_path(data_path: Path, clip_id: str) -> Path:
     from .motion_context_disk import _safe_name
     return _plan_video_cache_dir(data_path) / f"{_safe_name(clip_id)}.mp4"
+
+
+def _plan_final_video_cache_path(data_path: Path, clip_id: str, export_profile) -> Path:
+    from .motion_context_disk import _safe_name, _full_batch_export_profile_extension
+    ext = _full_batch_export_profile_extension(export_profile)
+    return _plan_video_cache_dir(data_path) / f"{_safe_name(clip_id)}.final.{ext}"
 
 
 def _plan_last_frame_cache_path(data_path: Path, clip_id: str) -> Path:
@@ -587,7 +598,9 @@ def _cleanup_plan_video_cache(data_path: Path, wanted_clip_ids):
         wanted_names.add(f"{safe}.continuity.png")
         wanted_names.add(f"{safe}.continuity.json")
         wanted_names.add(f"{safe}.prev.mp4")
-    for pattern in ("*.mp4", "*.continuity.png", "*.continuity.json", "*.last.png"):
+        wanted_names.add(f"{safe}.final.mp4")
+        wanted_names.add(f"{safe}.final.mkv")
+    for pattern in ("*.mp4", "*.mkv", "*.continuity.png", "*.continuity.json", "*.last.png"):
         for path in root.glob(pattern):
             if path.name not in wanted_names:
                 try:
@@ -602,6 +615,8 @@ def _invalidate_plan_video_cache(data_path: Path, clip_id: str):
         _plan_last_frame_cache_path(data_path, clip_id),
         _plan_continuity_meta_path(data_path, clip_id),
         _plan_prev_video_cache_path(data_path, clip_id),
+        _plan_video_cache_dir(data_path) / f"{_safe_cache_name(clip_id)}.final.mp4",
+        _plan_video_cache_dir(data_path) / f"{_safe_cache_name(clip_id)}.final.mkv",
     ):
         try:
             path.unlink(missing_ok=True)
@@ -609,8 +624,25 @@ def _invalidate_plan_video_cache(data_path: Path, clip_id: str):
             pass
 
 
-def _ensure_plan_video_cache(data_path, desc, vae, fps, ffmpeg, progress=None):
-    """Return one neutral H.264 decoded-plan cache, decoding only if missing."""
+def _ensure_plan_video_cache(
+    data_path,
+    desc,
+    vae,
+    fps,
+    ffmpeg,
+    progress=None,
+    *,
+    encode_crf=17,
+    encode_preset="ultrafast",
+    final_export_profile=None,
+    final_color_adjustment=None,
+    final_handoff_enabled=False,
+):
+    """Ensure one FL2VA plan's preview and optional exact-final cache.
+
+    When either cache is missing/dirty, the latent is VideoVAE-decoded once and
+    the same decoded RGB tensor feeds every required encode before being freed.
+    """
     from . import motion_context_disk as d
     clip_id = str(desc.get("clip_id") or f"clip_{int(desc.get('index', 0)) + 1}")
     target = _plan_video_cache_path(data_path, clip_id)
@@ -621,13 +653,44 @@ def _ensure_plan_video_cache(data_path, desc, vae, fps, ffmpeg, progress=None):
         and last_target.stat().st_size > 0
         and _load_plan_continuity_meta(data_path, clip_id) is not None
     )
-    if video_ready and continuity_ready:
+
+    profile = (
+        d.normalize_full_batch_export_profile(final_export_profile)
+        if final_export_profile is not None
+        else None
+    )
+    adjustment = d._normalize_color_adjustment(
+        final_color_adjustment
+        if final_color_adjustment is not None
+        else desc.get("color_adjustment")
+    )
+    final_path = None
+    final_ready = profile is None
+    visible_frames = None
+    if profile is not None and continuity_ready:
+        visible_frames = _visible_frames_for_plan(
+            data_path, desc, handoff_enabled=bool(final_handoff_enabled)
+        )
+        final_path = _plan_final_video_cache_path(data_path, clip_id, profile)
+        final_ready = d._final_segment_cache_meta_matches(
+            desc, profile, adjustment, final_path, visible_frames=visible_frames
+        )
+
+    if video_ready and continuity_ready and final_ready:
         return target, False
 
     temp = target.with_name(target.stem + f".tmp_{os.urandom(4).hex()}.mp4")
     v = None
     decoded = None
     try:
+        d._LOG.info(
+            "FL2VA incremental cache repair: decoding plan %d only "
+            "(preview=%s continuity=%s final=%s)",
+            int(desc.get("index", 0)) + 1,
+            bool(video_ready),
+            bool(continuity_ready),
+            bool(final_ready),
+        )
         v = d._load_segment_video(data_path, desc)
         decoded = vae.decode(v)
         if progress is not None:
@@ -635,6 +698,7 @@ def _ensure_plan_video_cache(data_path, desc, vae, fps, ffmpeg, progress=None):
         if decoded.ndim == 5:
             decoded = decoded.reshape(-1, decoded.shape[-3], decoded.shape[-2], decoded.shape[-1])
         _save_plan_last_frame_cache(data_path, clip_id, decoded)
+        continuity_ready = True
         wanted = int(desc.get("frames", 0))
         if int(decoded.shape[0]) != wanted:
             raise RuntimeError(
@@ -643,10 +707,47 @@ def _ensure_plan_video_cache(data_path, desc, vae, fps, ffmpeg, progress=None):
             )
         if not video_ready:
             d._encode_corrected_segment_video_mp4(
-                ffmpeg, decoded, fps, temp, f"fl2va_{clip_id}_{os.urandom(3).hex()}"
+                ffmpeg,
+                decoded,
+                fps,
+                temp,
+                f"fl2va_{clip_id}_{os.urandom(3).hex()}",
+                crf=int(encode_crf),
+                preset=str(encode_preset),
             )
             os.replace(temp, target)
-        return target, not video_ready
+            video_ready = True
+
+        if profile is not None:
+            visible_frames = _visible_frames_for_plan(
+                data_path, desc, handoff_enabled=bool(final_handoff_enabled)
+            )
+            final_path = _plan_final_video_cache_path(data_path, clip_id, profile)
+            # Recheck against descriptor metadata. A color edit or changed visible
+            # handoff marks this plan only as requiring a fresh final encode.
+            if not d._final_segment_cache_meta_matches(
+                desc, profile, adjustment, final_path, visible_frames=visible_frames
+            ):
+                final_temp = final_path.with_name(
+                    final_path.stem + f".tmp_{os.urandom(4).hex()}" + final_path.suffix
+                )
+                try:
+                    d._encode_final_segment_video(
+                        ffmpeg,
+                        decoded[:int(visible_frames)],
+                        float(fps),
+                        final_temp,
+                        f"fl2va_final_{clip_id}_{os.urandom(3).hex()}",
+                        profile,
+                        adjustment,
+                    )
+                    os.replace(final_temp, final_path)
+                finally:
+                    try:
+                        final_temp.unlink(missing_ok=True)
+                    except OSError:
+                        pass
+        return target, True
     finally:
         try:
             temp.unlink(missing_ok=True)
@@ -656,6 +757,36 @@ def _ensure_plan_video_cache(data_path, desc, vae, fps, ffmpeg, progress=None):
             del decoded
         if v is not None:
             del v
+
+
+def _tag_fl2va_final_segment_cache(
+    manifest_path, manifest, clip_id, export_profile, color_adjustment, visible_frames
+):
+    from . import motion_context_disk as d
+    segments = [dict(x) for x in manifest.get("segments", [])]
+    wanted_id = str(clip_id)
+    found = False
+    for idx, item in enumerate(segments):
+        if str(item.get("clip_id") or "") != wanted_id:
+            continue
+        item = dict(item)
+        item["final_video_cache_version"] = int(d.FULL_BATCH_FINAL_CACHE_VERSION)
+        item["final_video_profile_signature"] = d._full_batch_export_profile_signature(export_profile)
+        item["final_video_color_signature"] = d._color_adjustment_signature(color_adjustment)
+        item["final_video_codec"] = d.normalize_full_batch_export_profile(export_profile)["codec"]
+        item["final_video_visible_frames"] = int(visible_frames)
+        item["color_adjustment"] = d._normalize_color_adjustment(color_adjustment)
+        item.pop("final_video_dirty", None)
+        segments[idx] = item
+        found = True
+        break
+    if not found:
+        raise ValueError(f"FL2VA final cache tag: plan {wanted_id!r} is missing.")
+    updated = dict(manifest)
+    updated["segments"] = segments
+    updated["updated_at"] = time.time()
+    d._write_json_atomic(manifest_path, updated)
+    return updated
 
 
 def _cache_decoded_plan_video(data_path, desc, decoded, fps, ffmpeg):
@@ -796,15 +927,31 @@ def _ensure_plan_timeline_video_cache(data_path, desc, full_path, ffmpeg, fps, *
             pass
 
 
-def _ensure_plan_audio_cache(data_path, manifest_path, manifest, audio_vae, fps, progress=None):
-    """Append only missing decoded PCM entries; unchanged plans are never re-decoded."""
+def _ensure_plan_audio_cache(
+    data_path,
+    manifest_path,
+    manifest,
+    audio_vae,
+    fps,
+    progress=None,
+    selected_clip_ids=None,
+):
+    """Append only missing decoded PCM entries; unchanged plans are never re-decoded.
+
+    ``selected_clip_ids`` is used by an interrupted Full Batch preview. It
+    decodes/returns only the snapshot prefix while preserving every later
+    logical FL2VA plan in the manifest.
+    """
     from . import motion_context_disk as d
     segments = [dict(x) for x in manifest.get("segments", [])]
+    selected = None if selected_clip_ids is None else {str(x) for x in selected_clip_ids}
     audio_path = d._decoded_audio_cache_path(data_path)
     d._ensure_audio_cache_file(audio_path)
     changed = False
     with open(audio_path, "ab", buffering=0) as acf:
         for i, desc in enumerate(segments):
+            if selected is not None and str(desc.get("clip_id") or "") not in selected:
+                continue
             cached = d._load_cached_decoded_audio(data_path, desc)
             if cached is not None:
                 del cached
@@ -825,7 +972,118 @@ def _ensure_plan_audio_cache(data_path, manifest_path, manifest, audio_vae, fps,
         manifest["segments"] = segments
         manifest["updated_at"] = time.time()
         d._write_json_atomic(manifest_path, manifest)
-    return manifest, segments
+    if selected is None:
+        return manifest, segments
+    return manifest, [
+        dict(x) for x in segments if str(x.get("clip_id") or "") in selected
+    ]
+
+
+def cache_full_batch_fl2va_plan(
+    owner_id,
+    fps,
+    clip_ids,
+    clip_id,
+    vae,
+    audio_vae=None,
+    export_profile=None,
+    color_adjustment=None,
+    handoff_enabled=False,
+):
+    """Secure one FL2VA Full-Batch plan as preview + exact-final caches."""
+    from . import motion_context_disk as d
+
+    data_path, manifest_path, manifest = sync_fl2va_manifest(owner_id, fps, clip_ids)
+    wanted_id = str(clip_id)
+    desc = next(
+        (dict(x) for x in manifest.get("segments", []) if str(x.get("clip_id") or "") == wanted_id),
+        None,
+    )
+    if desc is None:
+        raise ValueError(f"FL2VA Full Batch cache: plan {wanted_id!r} is missing.")
+
+    adjustment = d._normalize_color_adjustment(
+        color_adjustment if color_adjustment is not None else desc.get("color_adjustment")
+    )
+    profile = (
+        d.normalize_full_batch_export_profile(export_profile)
+        if export_profile is not None
+        else None
+    )
+    # Feed the requested color into readiness checks even before the final
+    # end-of-run metadata synchronization writes it to the manifest.
+    cache_desc = dict(desc)
+    cache_desc["color_adjustment"] = adjustment
+
+    ffmpeg = d._find_ffmpeg()
+    video_path, decoded_now = _ensure_plan_video_cache(
+        data_path,
+        cache_desc,
+        vae,
+        float(fps),
+        ffmpeg,
+        encode_crf=d.FULL_BATCH_H264_CACHE_CRF,
+        encode_preset=d.FULL_BATCH_H264_CACHE_PRESET,
+        final_export_profile=profile,
+        final_color_adjustment=adjustment,
+        final_handoff_enabled=bool(handoff_enabled),
+    )
+
+    manifest = d._load_manifest_from_paths(data_path, manifest_path) or manifest
+    tagged_segments = [dict(x) for x in manifest.get("segments", [])]
+    for item in tagged_segments:
+        if str(item.get("clip_id") or "") == wanted_id:
+            item["decoded_video_profile"] = d.FULL_BATCH_H264_CACHE_PROFILE
+            item["color_adjustment"] = adjustment
+            break
+    manifest = dict(manifest)
+    manifest["segments"] = tagged_segments
+    manifest["updated_at"] = time.time()
+    d._write_json_atomic(manifest_path, manifest)
+
+    final_cached = False
+    if profile is not None:
+        manifest = d._load_manifest_from_paths(data_path, manifest_path) or manifest
+        current_desc = next(
+            dict(x) for x in manifest.get("segments", [])
+            if str(x.get("clip_id") or "") == wanted_id
+        )
+        visible_frames = _visible_frames_for_plan(
+            data_path, current_desc, handoff_enabled=bool(handoff_enabled)
+        )
+        final_path = _plan_final_video_cache_path(data_path, wanted_id, profile)
+        # The encode has already happened in _ensure_plan_video_cache from the
+        # same decoded RGB tensor. Persist its identity only after the file is
+        # safely in place.
+        if final_path.exists() and final_path.stat().st_size > 0:
+            manifest = _tag_fl2va_final_segment_cache(
+                manifest_path, manifest, wanted_id, profile, adjustment, visible_frames
+            )
+            final_cached = True
+
+    audio_cached = False
+    if audio_vae is not None:
+        manifest = d._load_manifest_from_paths(data_path, manifest_path) or manifest
+        manifest, selected = _ensure_plan_audio_cache(
+            data_path,
+            manifest_path,
+            manifest,
+            audio_vae,
+            float(fps),
+            selected_clip_ids=[wanted_id],
+        )
+        if selected:
+            cached_audio = d._load_cached_decoded_audio(data_path, selected[0])
+            audio_cached = cached_audio is not None
+            if cached_audio is not None:
+                del cached_audio
+
+    return manifest, {
+        "video_cached": bool(Path(video_path).exists() and Path(video_path).stat().st_size > 0),
+        "video_decoded_now": bool(decoded_now),
+        "final_cached": bool(final_cached),
+        "audio_cached": bool(audio_cached),
+    }
 
 
 
@@ -881,8 +1139,14 @@ def resolve_fl2va_previous_frame(owner_id, fps, clip_ids, previous_clip_id, vae)
             del v
 
 
-def drop_fl2va_cached_ids(owner_id, fps, clip_ids, drop_ids):
-    """Drop stale logical plans without rewriting the append-only latent file."""
+def drop_fl2va_cached_ids(owner_id, fps, clip_ids, drop_ids, preserve_preview=False):
+    """Drop stale logical plans without rewriting the append-only latent file.
+
+    ``preserve_preview`` is used only by the explicit COMPUTED discard action:
+    the Stop preview is an immutable snapshot and must remain watchable even if
+    the user later chooses to rerender one plan. Normal edits keep the historical
+    behavior and invalidate derived preview files.
+    """
     from .motion_context_disk import _final_frame_count, _write_json_atomic
 
     drop = {str(x) for x in (drop_ids or []) if str(x)}
@@ -897,7 +1161,8 @@ def drop_fl2va_cached_ids(owner_id, fps, clip_ids, drop_ids):
 
     for clip_id in drop:
         _invalidate_plan_video_cache(data_path, clip_id)
-    manifest = _invalidate_derived_preview(data_path, manifest)
+    if not bool(preserve_preview):
+        manifest = _invalidate_derived_preview(data_path, manifest)
     for idx, desc in enumerate(segments):
         desc["index"] = idx
         desc["trim_frames"] = 0
@@ -1103,7 +1368,7 @@ def cached_fl2va_ids(manifest) -> set[str]:
     }
 
 
-def store_fl2va_segment(owner_id, fps, clip_ids, clip_index, clip_id, samples, validated=False, run_mode="full_batch", dependency_meta=None):
+def store_fl2va_segment(owner_id, fps, clip_ids, clip_index, clip_id, samples, validated=False, run_mode="full_batch", dependency_meta=None, computed=False):
     """Append a new latent blob and atomically replace/insert one logical plan."""
     from .motion_context_disk import (
         _append_segment,
@@ -1135,6 +1400,8 @@ def store_fl2va_segment(owner_id, fps, clip_ids, clip_index, clip_id, samples, v
     desc["clip_id"] = clip_id
     desc["index"] = clip_index
     desc["trim_frames"] = 0
+    if bool(computed) and not bool(validated):
+        desc["computed"] = True
     dependency_meta = dependency_meta if isinstance(dependency_meta, dict) else {}
     first_source = str(dependency_meta.get("first_source") or "manual").lower().strip()
     desc["first_source"] = "previous_clip" if first_source == "previous_clip" else "manual"
@@ -1212,6 +1479,9 @@ def set_fl2va_validation(owner_id, fps, clip_ids, validation_by_id, run_mode="fu
         if bool(desc.get("validated", False)) != value:
             desc["validated"] = value
             changed = True
+        if value and bool(desc.get("computed", False)):
+            desc.pop("computed", None)
+            changed = True
     if changed:
         manifest = dict(manifest)
         manifest["segments"] = segments
@@ -1272,8 +1542,9 @@ def export_fl2va_final(
     Clip-by-clip uses one persistent decoded H.264 cache per logical plan plus
     the shared primary PCM cache. Adding/replacing one plan therefore VAE-decodes
     only that plan; unchanged plans are concatenated from their decoded caches.
-    Full Batch still renders the requested final codec directly from latents,
-    but opportunistically populates the same per-plan caches during that decode.
+    Full Batch also stores one exact-final sidecar per plan while its decoded RGB
+    tensor is resident. Final Decode concatenates those sidecars by stream copy;
+    changed color/plan pixels rebuild only the affected plan.
     """
     from . import motion_context_disk as d
 
@@ -1281,6 +1552,13 @@ def export_fl2va_final(
     segments = [dict(x) for x in manifest.get("segments", [])]
     if not segments:
         raise ValueError("FL2VA Final Decode: empty cache.")
+    interrupted = bool(cache.get("interrupted", False)) if isinstance(cache, dict) else False
+    project_total_clips = int(cache.get("project_total_clips", len(segments))) if isinstance(cache, dict) else len(segments)
+    snapshot_count = int(cache.get("snapshot_count", len(segments))) if isinstance(cache, dict) else len(segments)
+    if interrupted:
+        snapshot_count = max(1, min(len(segments), snapshot_count))
+        segments = segments[:snapshot_count]
+    selected_clip_ids = [str(x.get("clip_id") or "") for x in segments if str(x.get("clip_id") or "")]
     if abs(float(manifest.get("fps", fps)) - float(fps)) > 1e-6:
         raise ValueError(f"FL2VA Final Decode fps is {manifest.get('fps')}, export requested {fps}.")
 
@@ -1303,21 +1581,75 @@ def export_fl2va_final(
     # ------------------------------------------------------------------
     if effective_mode == "clip_by_clip":
         progress = d._FinalDecodeNativeProgress(unique_id, total=max(4, 2 + len(segments) * 2))
+        clip_by_clip_export_profile = d.normalize_full_batch_export_profile({
+            "codec": codec, "crf": crf, "preset": preset,
+        })
 
         video_inputs = []
         for i, desc in enumerate(segments):
+            handoff_enabled = _next_uses_previous(segments, i)
+            adjustment = d._normalize_color_adjustment(desc.get("color_adjustment"))
             path, _ = _ensure_plan_video_cache(
-                data_path, desc, vae, float(fps), ffmpeg, progress=progress
+                data_path,
+                desc,
+                vae,
+                float(fps),
+                ffmpeg,
+                progress=progress,
+                final_export_profile=clip_by_clip_export_profile,
+                final_color_adjustment=adjustment,
+                final_handoff_enabled=handoff_enabled,
             )
+
+            # Persist the identity of the exact-final sidecar created from the
+            # same decoded RGB tensor. A later switch to Full Batch can now
+            # skip every already validated Clip-by-Clip plan completely.
+            current_manifest = d._load_manifest_from_paths(data_path, manifest_path) or manifest
+            current_desc = next(
+                (dict(x) for x in current_manifest.get("segments", [])
+                 if str(x.get("clip_id") or "") == str(desc.get("clip_id") or "")),
+                dict(desc),
+            )
+            visible_frames = _visible_frames_for_plan(
+                data_path, current_desc, handoff_enabled=handoff_enabled
+            )
+            final_path = _plan_final_video_cache_path(
+                data_path, str(desc.get("clip_id") or ""), clip_by_clip_export_profile
+            )
+            if final_path.exists() and final_path.stat().st_size > 0:
+                manifest = _tag_fl2va_final_segment_cache(
+                    manifest_path,
+                    current_manifest,
+                    str(desc.get("clip_id") or ""),
+                    clip_by_clip_export_profile,
+                    adjustment,
+                    visible_frames,
+                )
+
             video_inputs.append(
                 _ensure_plan_timeline_video_cache(
                     data_path, desc, path, ffmpeg, float(fps),
-                    handoff_enabled=_next_uses_previous(segments, i),
+                    handoff_enabled=handoff_enabled,
                 )
             )
 
+        final_profile_count = sum(
+            1 for desc in segments
+            if str(desc.get("decoded_video_profile") or "") == d.FULL_BATCH_H264_CACHE_PROFILE
+        )
+        d._LOG.info(
+            "FL2VA cached Full Decode: clips=%d final-profile=%d legacy/reused=%d interrupted=%s",
+            len(segments), final_profile_count, len(segments) - final_profile_count, bool(interrupted),
+        )
+
         manifest, segments = _ensure_plan_audio_cache(
-            data_path, manifest_path, manifest, audio_vae, float(fps), progress=progress
+            data_path,
+            manifest_path,
+            manifest,
+            audio_vae,
+            float(fps),
+            progress=progress,
+            selected_clip_ids=selected_clip_ids if interrupted else None,
         )
         timeline_segments = _timeline_segments(data_path, segments)
         expected_frames = sum(int(x.get("frames", 0)) for x in timeline_segments)
@@ -1384,104 +1716,128 @@ def export_fl2va_final(
         }
 
     # ------------------------------------------------------------------
-    # Full Batch: final-quality direct decode, while filling plan caches.
+    # Full Batch: every plan owns an exact-final video sidecar encoded directly
+    # from its VideoVAE RGB result. Final Decode only packet-concatenates those
+    # sidecars and muxes audio; compressed video is never transcoded again.
     # ------------------------------------------------------------------
-    extension = "mkv" if str(codec) == "FFV1 lossless" else "mp4"
-    output_path = d._next_output_path(out_dir, filename_prefix, extension)
-    progress = d._FinalDecodeNativeProgress(unique_id, total=max(4, 2 + len(segments) * 2))
-    temp_root = d._ensure_cache_root()
-    token = os.urandom(5).hex()
-    temp_video = temp_root / f"_fl2va_{token}_video.{extension}"
-    raw_audio = temp_root / f"_fl2va_{token}_audio.f32le"
-    video_log = temp_root / f"_fl2va_{token}_video.log"
-    mux_log = temp_root / f"_fl2va_{token}_mux.log"
-    color_temp = temp_root / f"_fl2va_{token}_color.{extension}"
-    video_proc = None
-    video_log_f = None
+    progress = d._FinalDecodeNativeProgress(
+        unique_id, total=max(8, 5 + len(segments) * 2)
+    )
+    requested_profile = d.normalize_full_batch_export_profile({
+        "codec": codec, "crf": crf, "preset": preset,
+    })
+    manifest, export_profile = d._resolve_full_batch_export_profile(
+        manifest_path, manifest, requested_profile, context="FL2VA Final Decode"
+    )
 
-    try:
-        written_frames = 0
-        plan_video_paths = []
-        for i, desc in enumerate(segments):
-            v = d._load_segment_video(data_path, desc)
-            decoded = vae.decode(v)
-            progress.advance()
-            if decoded.ndim == 5:
-                decoded = decoded.reshape(-1, decoded.shape[-3], decoded.shape[-2], decoded.shape[-1])
-            wanted = int(desc.get("frames", 0))
-            if int(decoded.shape[0]) != wanted:
-                raise RuntimeError(
-                    f"FL2VA Final Decode: clip {i + 1} returned {decoded.shape[0]} frames, expected {wanted}."
-                )
-            # Select/cache the handoff image from this decode before deciding
-            # the visible timeline prefix. This is free: no second VAE pass.
-            _save_plan_last_frame_cache(data_path, str(desc.get("clip_id") or f"clip_{i + 1}"), decoded)
-            visible_frames = _visible_frames_for_plan(
-                data_path, desc, handoff_enabled=_next_uses_previous(segments, i)
+    video_inputs = []
+    exact_segment_paths = []
+    for i, desc in enumerate(segments):
+        handoff_enabled = _next_uses_previous(segments, i)
+        adjustment = d._normalize_color_adjustment(desc.get("color_adjustment"))
+        path, _decoded_now = _ensure_plan_video_cache(
+            data_path,
+            desc,
+            vae,
+            float(fps),
+            ffmpeg,
+            progress=progress,
+            encode_crf=d.FULL_BATCH_H264_CACHE_CRF,
+            encode_preset=d.FULL_BATCH_H264_CACHE_PRESET,
+            final_export_profile=export_profile,
+            final_color_adjustment=adjustment,
+            final_handoff_enabled=handoff_enabled,
+        )
+
+        # The helper may have decoded/rebuilt this plan only. Once the exact
+        # sidecar is safely present, persist its profile/color/visible-frame id.
+        current_manifest = d._load_manifest_from_paths(data_path, manifest_path) or manifest
+        current_desc = next(
+            (dict(x) for x in current_manifest.get("segments", [])
+             if str(x.get("clip_id") or "") == str(desc.get("clip_id") or "")),
+            dict(desc),
+        )
+        visible_frames = _visible_frames_for_plan(
+            data_path, current_desc, handoff_enabled=handoff_enabled
+        )
+        final_path = _plan_final_video_cache_path(
+            data_path, str(desc.get("clip_id") or ""), export_profile
+        )
+        if not final_path.exists() or final_path.stat().st_size <= 0:
+            raise RuntimeError(
+                f"FL2VA final cache: exact segment for clip {i + 1} was not created."
             )
-            visible_frames = max(1, min(int(decoded.shape[0]), int(visible_frames)))
-            if video_proc is None:
-                h, w = int(decoded.shape[1]), int(decoded.shape[2])
-                video_proc, video_log_f = d._start_video_encoder(
-                    ffmpeg, temp_video, w, h, fps, codec, crf, preset, video_log
-                )
-            d._write_image_frames(video_proc, decoded[:visible_frames])
-            # Keep the neutral per-plan cache complete; the assembled preview
-            # receives a derived exact prefix only when the next plan uses Prev.
-            full_plan_path = _cache_decoded_plan_video(data_path, desc, decoded, float(fps), ffmpeg)
-            plan_video_paths.append(
-                _ensure_plan_timeline_video_cache(
-                    data_path, desc, full_plan_path, ffmpeg, float(fps),
-                    handoff_enabled=_next_uses_previous(segments, i),
-                )
+        manifest = _tag_fl2va_final_segment_cache(
+            manifest_path,
+            current_manifest,
+            str(desc.get("clip_id") or ""),
+            export_profile,
+            adjustment,
+            visible_frames,
+        )
+        exact_segment_paths.append(final_path)
+
+        # Neutral H.264 preview remains independent and can trim to the selected
+        # Previous handoff frame without affecting the final video bitstream.
+        video_inputs.append(
+            _ensure_plan_timeline_video_cache(
+                data_path,
+                current_desc,
+                path,
+                ffmpeg,
+                float(fps),
+                handoff_enabled=handoff_enabled,
             )
-            written_frames += visible_frames
-            del decoded, v
-
-        if video_proc is None or video_log_f is None:
-            raise RuntimeError("FL2VA Final Decode: encoder never started.")
-        d._finish_process(video_proc, video_log_f, video_log, "FL2VA Final Decode encoder")
-        video_proc = None
-        video_log_f = None
-        timeline_segments = _timeline_segments(data_path, segments)
-        expected_frames = sum(int(x.get("frames", 0)) for x in timeline_segments)
-        color_timeline = d._color_timeline(timeline_segments, float(fps))
-        if written_frames != expected_frames:
-            raise RuntimeError(f"FL2VA Final Decode wrote {written_frames} frames, expected {expected_frames}.")
-        progress.advance()
-
-        # Same primary decoded PCM cache used by Clip by Clip. Only plans whose
-        # current descriptor lacks PCM are Audio-VAE decoded.
-        manifest, segments = _ensure_plan_audio_cache(
-            data_path, manifest_path, manifest, audio_vae, float(fps), progress=progress
         )
-        timeline_segments = _timeline_segments(data_path, segments)
-        expected_frames = sum(int(x.get("frames", 0)) for x in timeline_segments)
-        color_timeline = d._color_timeline(timeline_segments, float(fps))
-        timeline_signature = _timeline_signature(data_path, segments)
-        sample_rate, channels, _ = d._write_preview_pcm_audio(
-            ffmpeg, data_path, timeline_segments, len(timeline_segments), fps, raw_audio, f"{token}_fl_pcm"
-        )
-        d._mux_final(
-            ffmpeg, temp_video, raw_audio, output_path,
-            sample_rate, channels, codec, audio_bitrate, mux_log,
-        )
-        progress.advance()
 
-        # Keep a neutral H.264 assembled preview for instant workflow/project
-        # restore. Build it from the per-plan caches instead of copying the final
-        # user-selected codec (which may be HEVC or FFV1/MKV). No VAE decode is
-        # involved here.
-        committed_path = d._decoded_preview_cache_path(data_path)
+    segments = [dict(x) for x in manifest.get("segments", [])]
+    if interrupted:
+        segments = segments[:snapshot_count]
+        exact_segment_paths = exact_segment_paths[:snapshot_count]
+        video_inputs = video_inputs[:snapshot_count]
+        selected_clip_ids = [
+            str(x.get("clip_id") or "") for x in segments if str(x.get("clip_id") or "")
+        ]
+
+    manifest, audio_segments = _ensure_plan_audio_cache(
+        data_path,
+        manifest_path,
+        manifest,
+        audio_vae,
+        float(fps),
+        progress=progress,
+        selected_clip_ids=selected_clip_ids if interrupted else None,
+    )
+    if interrupted:
+        segments = [dict(x) for x in audio_segments]
+    else:
+        segments = [dict(x) for x in manifest.get("segments", [])]
+    timeline_segments = _timeline_segments(data_path, segments)
+    expected_frames = sum(int(x.get("frames", 0)) for x in timeline_segments)
+    color_timeline = d._color_timeline(timeline_segments, float(fps))
+    timeline_signature = _timeline_signature(data_path, segments)
+
+    committed_path = d._decoded_preview_cache_path(data_path)
+    committed_count = int(manifest.get("preview_committed_count", 0) or 0)
+    committed_mode = str(manifest.get("preview_audio_mode") or "")
+    committed_signature = str(manifest.get("preview_fl2va_timeline_signature") or "")
+    needs_assemble = (
+        not committed_path.exists()
+        or committed_count != len(segments)
+        or committed_mode != d.PREVIEW_AUDIO_MODE
+        or committed_signature != timeline_signature
+    )
+    token = f"fl2va_full_exact_{os.urandom(5).hex()}"
+    if needs_assemble:
         d._assemble_progressive_preview(
             ffmpeg,
-            plan_video_paths,
+            video_inputs,
             data_path,
             timeline_segments,
             len(timeline_segments),
             float(fps),
             committed_path,
-            f"{token}_fl_committed",
+            token,
         )
         manifest = dict(manifest)
         manifest["preview_committed_count"] = len(segments)
@@ -1489,52 +1845,46 @@ def export_fl2va_final(
         manifest["preview_fl2va_timeline_signature"] = timeline_signature
         manifest["updated_at"] = time.time()
         d._write_json_atomic(manifest_path, manifest)
+    progress.advance()
 
-        preview_path = d._publish_full_preview(output_path, unique_id)
-        if d._timeline_has_color(color_timeline):
-            d._apply_color_timeline_to_file(
-                ffmpeg, output_path, color_temp, color_timeline,
-                codec=codec, crf=crf, preset=preset,
-            )
-            os.replace(color_temp, output_path)
+    preview_path = d._publish_full_preview(committed_path, unique_id)
+    extension = d._full_batch_export_profile_extension(export_profile)
+    output_path = d._next_output_path(out_dir, filename_prefix, extension)
+    final_video_mode = d._export_final_from_exact_segment_caches(
+        ffmpeg=ffmpeg,
+        segment_paths=exact_segment_paths,
+        data_path=data_path,
+        segments=timeline_segments,
+        fps=float(fps),
+        output_path=output_path,
+        export_profile=export_profile,
+        audio_bitrate=audio_bitrate,
+        token=token,
+    )
 
-        d._embed_final_metadata_in_place(output_path, workflow=workflow, prompt=prompt)
-
-        item = d._comfy_media_item(preview_path, fps, "temp")
-        progress.finish()
-        return {
-            "ui": {
-                "h3_video": [item],
-                "h3_preview_info": [{
-                    "mode": "fl2va_full_batch",
-                    "clip": len(segments),
-                    "preview_frames": expected_frames,
-                    "total_clips": len(segments),
-                    "color_timeline": color_timeline,
-                    "color_preview_baked": False,
-                }],
-            },
-            "result": (d._video_output_from_path(output_path),),
-        }
-    finally:
-        if video_proc is not None:
-            try:
-                if video_proc.stdin is not None:
-                    video_proc.stdin.close()
-            except Exception:
-                pass
-            try:
-                video_proc.kill()
-            except Exception:
-                pass
-        if video_log_f is not None:
-            try:
-                video_log_f.close()
-            except Exception:
-                pass
-        for p in (temp_video, raw_audio, video_log, mux_log, color_temp):
-            try:
-                Path(p).unlink(missing_ok=True)
-            except Exception:
-                pass
-
+    d._embed_final_metadata_in_place(output_path, workflow=workflow, prompt=prompt)
+    progress.advance()
+    d._LOG.info(
+        "FL2VA incremental Full Decode: clips=%d frames=%d interrupted=%s video=%s output=%s",
+        len(segments), expected_frames, bool(interrupted), final_video_mode, output_path,
+    )
+    item = d._comfy_media_item(preview_path, fps, "temp")
+    progress.finish()
+    return {
+        "ui": {
+            "h3_video": [item],
+            "h3_preview_info": [{
+                "mode": "fl2va_full_batch_incremental",
+                "clip": len(segments),
+                "preview_frames": expected_frames,
+                "total_clips": int(project_total_clips if interrupted else len(segments)),
+                "preview_clips": len(segments),
+                "interrupted": bool(interrupted),
+                "cache_mode": "decoded_plans_incremental",
+                "final_video_mode": str(final_video_mode),
+                "color_timeline": color_timeline,
+                "color_preview_baked": False,
+            }],
+        },
+        "result": (d._video_output_from_path(output_path),),
+    }
