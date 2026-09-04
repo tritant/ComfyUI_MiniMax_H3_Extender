@@ -423,14 +423,19 @@ async function restorePreviewOnLoad(node, state, attempt = 0) {
 
         const clips = Number(payload.clip_count || 0);
         const frames = Number(payload.frame_count || 0);
-        state.label.textContent =
-            `RESTORED PREVIEW — ${clips} clip${clips === 1 ? "" : "s"} (${frames} frames)`;
+        const totalClips = Number(payload.project_total_clips || clips);
+        const interrupted = Boolean(payload.interrupted);
+        state.label.textContent = interrupted
+            ? `INTERRUPTED PREVIEW — ${clips}/${totalClips} clips (${frames} frames)`
+            : `RESTORED PREVIEW — ${clips} clip${clips === 1 ? "" : "s"} (${frames} frames)`;
 
         state.currentVideoInfo = { ...payload.video };
         state.currentPreviewMeta = {
             clip_count: clips,
             frame_count: frames,
-            mode: "restored",
+            mode: interrupted ? "interrupted_restored" : "restored",
+            interrupted,
+            total_clips: totalClips,
         };
         state.currentFps = Number(payload.video?.frame_rate || state.currentFps || 24);
         state.colorTimeline = Array.isArray(payload.color_timeline) ? payload.color_timeline : [];
@@ -961,7 +966,12 @@ app.registerExtension({
             state.liveLoaded = true;
             const meta = message?.h3_preview_info?.[0];
 
-            if (meta?.mode === "clip_by_clip") {
+            if (meta?.interrupted) {
+                const shown = Number(meta?.preview_clips || meta?.clip || 0);
+                const total = Number(meta?.total_clips || shown || 0);
+                state.label.textContent =
+                    `INTERRUPTED PREVIEW — ${shown}/${total} clips (${meta.preview_frames} frames)`;
+            } else if (meta?.mode === "clip_by_clip") {
                 const s = Number(meta.seam_shift || 0);
                 state.label.textContent =
                     `FULL LIVE PREVIEW — ${meta.total_clips} clip${meta.total_clips > 1 ? "s" : ""} — shift ${s >= 0 ? "+" : ""}${s}`;
@@ -974,7 +984,7 @@ app.registerExtension({
 
             state.currentVideoInfo = { ...info };
             state.currentPreviewMeta = {
-                clip_count: Number(meta?.total_clips || 0),
+                clip_count: Number(meta?.preview_clips || meta?.total_clips || 0),
                 frame_count: Number(meta?.preview_frames || 0),
                 mode: String(meta?.mode || ""),
             };

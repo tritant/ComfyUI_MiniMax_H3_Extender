@@ -691,6 +691,11 @@ function parseState(raw) {
             generation_mode: generationMode,
             load_token: String(payload?.project_load_token || ""),
             prompt_pack_signature: String(payload?.prompt_pack_signature || ""),
+            // Execution-only cache-buster persisted in the native clips_json widget.
+            // It changes only after a resumable Full Batch stop so a fixed seed
+            // cannot make ComfyUI reuse the just-finished Extender output instead
+            // of entering the backend again to resume the checkpoint.
+            resume_nonce: String(payload?.resume_nonce || ""),
             clips: activeClips,
             mode_clips: {
                 ref2va: ref2vaClips,
@@ -704,6 +709,7 @@ function parseState(raw) {
         generation_mode: "ref2va",
         load_token: "",
         prompt_pack_signature: "",
+        resume_nonce: "",
         clips: ref2vaClips,
         mode_clips: { ref2va: ref2vaClips, fl2va: blankModeClips() },
     };
@@ -724,6 +730,7 @@ function serializeState(state) {
     };
     if (state?.load_token) payload.project_load_token = String(state.load_token);
     if (state?.prompt_pack_signature) payload.prompt_pack_signature = String(state.prompt_pack_signature);
+    if (state?.resume_nonce) payload.resume_nonce = String(state.resume_nonce);
     return JSON.stringify(payload);
 }
 
@@ -737,6 +744,7 @@ function serializeProjectState(state) {
     const payload = { version: 2, generation_mode: mode, clips: state.clips };
     if (state?.load_token) payload.project_load_token = String(state.load_token);
     if (state?.prompt_pack_signature) payload.prompt_pack_signature = String(state.prompt_pack_signature);
+    if (state?.resume_nonce) payload.resume_nonce = String(state.resume_nonce);
     return JSON.stringify(payload);
 }
 
@@ -757,6 +765,7 @@ function mergeActiveStateJson(runtime, raw, explicitMode = null) {
     runtime.state.clips = runtime.state.mode_clips[mode];
     runtime.state.load_token = incoming.load_token || runtime.state.load_token || "";
     runtime.state.prompt_pack_signature = incoming.prompt_pack_signature || "";
+    runtime.state.resume_nonce = incoming.resume_nonce || runtime.state.resume_nonce || "";
     return runtime.state;
 }
 
@@ -821,6 +830,17 @@ async function restoreCacheState(node, runtime) {
         runtime.validatedCount = Number(payload.validated_count || 0);
         runtime.cachedClipIds = new Set(Array.isArray(payload.cached_clip_ids) ? payload.cached_clip_ids.map(String) : []);
         runtime.validatedClipIds = new Set(Array.isArray(payload.validated_clip_ids) ? payload.validated_clip_ids.map(String) : []);
+        runtime.computedIndices = new Set(
+            Array.isArray(payload.computed_indices)
+                ? payload.computed_indices.map((value) => Number(value)).filter((value) => Number.isInteger(value) && value >= 0)
+                : []
+        );
+        runtime.computedClipIds = new Set(
+            Array.isArray(payload.computed_clip_ids) ? payload.computed_clip_ids.map(String) : []
+        );
+        runtime.checkpointActive = Boolean(payload.checkpoint_active);
+        runtime.checkpointInterrupted = Boolean(payload.checkpoint_interrupted);
+        runtime.checkpointSnapshotCount = Number(payload.checkpoint_snapshot_count || 0);
         runtime.continuitySignatures = new Map(
             Object.entries(payload?.continuity_signatures || {}).map(([key, value]) => [String(key), String(value || "")]).filter(([, value]) => Boolean(value))
         );
@@ -850,7 +870,8 @@ async function restoreCacheState(node, runtime) {
             : "";
         runtime.statusText =
             `Restored cache${resolutionText} | cached ${runtime.cachedCount}/${runtime.state.clips.length} | ` +
-            `validated ${runtime.validatedCount}`;
+            `validated ${runtime.validatedCount}` +
+            (runtime.checkpointActive ? ` | resumable checkpoint ${runtime.checkpointSnapshotCount || ""}` : "");
         syncResolutionAndInvalidate(node, runtime);
         render(node, runtime);
         node.graph?.setDirtyCanvas(true, true);
@@ -858,6 +879,124 @@ async function restoreCacheState(node, runtime) {
         // Cache-state restoration is visual convenience only. Never block UI load.
     } finally {
         runtime.cacheStateRequestRunning = false;
+    }
+}
+
+async function discardComputedClip(node, runtime, clipIndex) {
+    if (!node || !runtime || runtime.discardComputedBusy) return;
+    const index = Number(clipIndex);
+    const clip = runtime.state?.clips?.[index];
+    if (!clip || !Number.isInteger(index) || index < 0) return;
+
+    runtime.discardComputedBusy = true;
+    render(node, runtime);
+    try {
+        const generationMode = String(runtime.state?.generation_mode || "ref2va") === "fl2va" ? "fl2va" : "ref2va";
+        const body = {
+            owner_id: String(node.id),
+            generation_mode: generationMode,
+            clip_index: index,
+            clip_id: String(clip.id || ""),
+            clip_ids: (runtime.state?.clips || []).map((item) => String(item?.id || "")),
+        };
+        const response = await fetch(api.apiURL("/h3_extender/discard_computed"), {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(body),
+        });
+        const payload = await response.json().catch(() => ({}));
+        if (!response.ok || !payload?.ok) {
+            throw new Error(payload?.error || `Discard checkpoint failed (${response.status})`);
+        }
+
+        runtime.cachedCount = Number(payload.cached_count || 0);
+        runtime.validatedCount = Number(payload.validated_count || 0);
+        runtime.cachedClipIds = new Set(Array.isArray(payload.cached_clip_ids) ? payload.cached_clip_ids.map(String) : []);
+        runtime.validatedClipIds = new Set(Array.isArray(payload.validated_clip_ids) ? payload.validated_clip_ids.map(String) : []);
+        runtime.computedIndices = new Set(
+            Array.isArray(payload.computed_indices)
+                ? payload.computed_indices.map((value) => Number(value)).filter((value) => Number.isInteger(value) && value >= 0)
+                : []
+        );
+        runtime.computedClipIds = new Set(
+            Array.isArray(payload.computed_clip_ids) ? payload.computed_clip_ids.map(String) : []
+        );
+        runtime.checkpointActive = Boolean(payload.checkpoint_active);
+        runtime.checkpointInterrupted = Boolean(payload.checkpoint_interrupted);
+        runtime.checkpointSnapshotCount = Number(payload.checkpoint_snapshot_count || 0);
+
+        if (generationMode === "ref2va") {
+            // Ref2VA Motion Context is causal: rerolling this checkpoint makes
+            // every following cached result unusable.
+            invalidateFrom(runtime.state, index);
+        } else {
+            // FL2VA is random-access except for explicit Previous chains. The
+            // backend returns the exact cascade it discarded so the badges and
+            // serialized card state become truthful immediately.
+            const discardedIds = new Set(
+                Array.isArray(payload.discarded_clip_ids)
+                    ? payload.discarded_clip_ids.map(String)
+                    : [String(clip.id || "")]
+            );
+            for (const item of runtime.state?.clips || []) {
+                if (discardedIds.has(String(item?.id || ""))) {
+                    item.validated = false;
+                    runtime.validatedClipIds.delete(String(item.id));
+                }
+            }
+        }
+        // The discard happened through an HTTP route, outside ComfyUI's executor.
+        // The visible clip state can remain byte-identical (computed clips are
+        // already unvalidated), so bump the same harmless nonce used by resume
+        // to guarantee the next Queue sees the mutated disk checkpoint.
+        runtime.state.resume_nonce = `${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
+        updateHidden(node, runtime);
+        const discardedCount = Array.isArray(payload.discarded_clip_ids)
+            ? payload.discarded_clip_ids.length
+            : 1;
+        runtime.statusText = generationMode === "ref2va"
+            ? `Clip ${index + 1} checkpoint discarded — Ref2VA will rerender from this clip`
+            : (discardedCount > 1
+                ? `FL2VA clip ${index + 1} checkpoint discarded — ${discardedCount - 1} Previous-linked dependent clip(s) also decomputed`
+                : `FL2VA clip ${index + 1} checkpoint discarded — this plan will rerender`);
+    } catch (error) {
+        runtime.statusText = `Checkpoint discard failed: ${String(error?.message || error)}`;
+    } finally {
+        runtime.discardComputedBusy = false;
+        render(node, runtime);
+        node.graph?.setDirtyCanvas(true, true);
+    }
+}
+
+async function requestFullBatchInterrupt(node, runtime) {
+    if (!node || !runtime || runtime.interruptRequested || runtime.interruptRequestBusy) return;
+    const runMode = String(getWidget(node, "run_mode")?.value || "clip_by_clip");
+    const active = ["preparing", "sampling", "complete"].includes(String(runtime.activePhase || ""));
+    if (runMode !== "full_batch" || !active) return;
+
+    runtime.interruptRequestBusy = true;
+    runtime.interruptRequested = true;
+    runtime.statusText = "Interrupt requested — finishing current clip safely…";
+    render(node, runtime);
+    try {
+        const response = await fetch(api.apiURL("/h3_extender/full_batch_interrupt"), {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+                owner_id: String(node.id),
+                generation_mode: String(runtime.state?.generation_mode || "ref2va"),
+            }),
+        });
+        const payload = await response.json().catch(() => ({}));
+        if (!response.ok || !payload?.ok) {
+            throw new Error(payload?.error || `Interrupt request failed (${response.status})`);
+        }
+    } catch (error) {
+        runtime.interruptRequested = false;
+        runtime.statusText = `Interrupt request failed: ${String(error?.message || error)}`;
+    } finally {
+        runtime.interruptRequestBusy = false;
+        render(node, runtime);
     }
 }
 
@@ -1121,7 +1260,8 @@ function wrapResolutionWidgetCallbacks(node, runtime) {
     const style = document.createElement("style");
     style.id = "h3-extender-hide-state-json";
     style.textContent = `
-        .lg-node-widget:has(> [node-type="${TARGET}"] > textarea) {
+        .lg-node-widget:has(> [node-type="${TARGET}"] > textarea),
+        .lg-node-widget:has(button[data-testid="widget-select-default-trigger"][aria-label="generation_mode"]) {
             display: none !important;
         }
     `;
@@ -1268,6 +1408,11 @@ function invalidateForResolutionChange(node, runtime) {
     for (const clip of runtime.state.clips) clip.validated = false;
     runtime.validatedCount = 0;
     runtime.cachedCount = 0;
+    runtime.computedIndices = new Set();
+    runtime.computedClipIds = new Set();
+    runtime.checkpointActive = false;
+    runtime.checkpointInterrupted = false;
+    runtime.checkpointSnapshotCount = 0;
     runtime.resolutionInvalidated = true;
     runtime.statusText =
         `Resolution changed: ${expectedW}x${expectedH} → ${current.width}x${current.height} | ` +
@@ -1316,6 +1461,10 @@ function cardStatus(runtime, clip, index) {
         ? runtime.cachedClipIds?.has(String(clip.id))
         : index < Number(runtime.cachedCount || 0);
     if (clip.validated && cached) return "validated";
+    const computed = fl2va
+        ? runtime.computedClipIds?.has(String(clip.id))
+        : runtime.computedIndices?.has(index);
+    if (computed && cached) return "computed";
     const firstOpen = runtime.state.clips.findIndex((c) => !c.validated);
     if (index === firstOpen) return cached ? "candidate" : "current";
     if (cached) return "cached";
@@ -2511,6 +2660,17 @@ async function loadProjectFile(node, runtime, file) {
         runtime.validatedCount = Number(payload?.cache?.validated_count || 0);
         runtime.cachedClipIds = new Set(Array.isArray(payload?.cache?.cached_clip_ids) ? payload.cache.cached_clip_ids.map(String) : []);
         runtime.validatedClipIds = new Set(Array.isArray(payload?.cache?.validated_clip_ids) ? payload.cache.validated_clip_ids.map(String) : []);
+        runtime.computedIndices = new Set(
+            Array.isArray(payload?.cache?.computed_indices)
+                ? payload.cache.computed_indices.map((value) => Number(value)).filter((value) => Number.isInteger(value) && value >= 0)
+                : []
+        );
+        runtime.computedClipIds = new Set(
+            Array.isArray(payload?.cache?.computed_clip_ids) ? payload.cache.computed_clip_ids.map(String) : []
+        );
+        runtime.checkpointActive = Boolean(payload?.cache?.checkpoint_active);
+        runtime.checkpointInterrupted = Boolean(payload?.cache?.checkpoint_interrupted);
+        runtime.checkpointSnapshotCount = Number(payload?.cache?.checkpoint_snapshot_count || 0);
         runtime.continuitySignatures = new Map(
             Object.entries(payload?.cache?.continuity_signatures || {}).map(([key, value]) => [String(key), String(value || "")]).filter(([, value]) => Boolean(value))
         );
@@ -2988,15 +3148,41 @@ function renderFl2vaFrames(node, runtime) {
 }
 
 
+function syncFl2vaHorizontalScroll(runtime) {
+    if (!runtime?.refsRow || !runtime?.cards) return;
+    if (runtime.state?.generation_mode !== "fl2va") return;
+
+    // The clip cards are the single horizontal-scroll owner in FL2VA.
+    // First/Last is a passive aligned strip: programmatic scroll only.
+    const left = Number(runtime.cards.scrollLeft) || 0;
+    if (Math.abs((Number(runtime.refsRow.scrollLeft) || 0) - left) < 0.5) return;
+    runtime.refsRow.scrollLeft = left;
+}
+
 function renderMediaStrip(node, runtime, fl2vaMode) {
     if (runtime?.refsHeader) {
         runtime.refsHeader.textContent = fl2vaMode
             ? "FL2VA FIRST / LAST FRAMES — per-clip IMAGE GUIDES are inside each card"
             : "REFERENCE IMAGES — double-click a thumbnail to edit";
     }
-    if (runtime?.refsRow) runtime.refsRow.style.gap = fl2vaMode ? "9px" : "7px";
-    if (fl2vaMode) renderFl2vaFrames(node, runtime);
-    else renderReferences(node, runtime);
+    if (runtime?.refsRow) {
+        runtime.refsRow.style.gap = fl2vaMode ? "9px" : "7px";
+        // FL2VA uses a single scrollbar: the clip-card row. Hiding overflow
+        // here still allows scrollLeft to be driven programmatically, while
+        // preventing a second scrollbar and reciprocal scroll-event flicker.
+        runtime.refsRow.style.overflowX = fl2vaMode ? "hidden" : "auto";
+        runtime.refsRow.style.scrollbarGutter = fl2vaMode ? "auto" : "stable";
+    }
+    if (fl2vaMode) {
+        renderFl2vaFrames(node, runtime);
+        // First/Last groups and clip cards represent the same FL2VA plans. Keep
+        // their horizontal position locked even after rerenders/mode switches.
+        if (runtime?.refsRow && runtime?.cards) {
+            runtime.refsRow.scrollLeft = runtime.cards.scrollLeft;
+        }
+    } else {
+        renderReferences(node, runtime);
+    }
 }
 
 function render(node, runtime) {
@@ -3011,6 +3197,13 @@ function render(node, runtime) {
     }
     if (runtime.generationModeWidget) runtime.generationModeWidget.value = fl2vaMode ? "fl2va" : "ref2va";
     if (runtime.refsSection) runtime.refsSection.style.display = "block";
+    if (runtime.interruptButton) {
+        const active = ["preparing", "sampling", "complete"].includes(String(runtime.activePhase || ""));
+        const fullBatch = String(getWidget(node, "run_mode")?.value || "clip_by_clip") === "full_batch";
+        runtime.interruptButton.style.display = active && fullBatch ? "inline-block" : "none";
+        runtime.interruptButton.disabled = !active || !fullBatch || Boolean(runtime.interruptRequested || runtime.interruptRequestBusy);
+        runtime.interruptButton.textContent = runtime.interruptRequested ? "Stopping…" : "Interrupt";
+    }
     counter.textContent = fl2vaMode
         ? `${state.clips.length} plan${state.clips.length > 1 ? "s" : ""} • FL2VA`
         : `${state.clips.length} clip${state.clips.length > 1 ? "s" : ""} • ${refCount(runtime)} ref${refCount(runtime) === 1 ? "" : "s"}`;
@@ -3038,7 +3231,7 @@ function render(node, runtime) {
             card.style.background = "rgba(24,40,46,.88)";
         } else if (st === "validated") {
             card.style.borderColor = "rgba(80,210,120,.8)";
-        } else if (st === "candidate" || st === "current") {
+        } else if (st === "computed" || st === "candidate" || st === "current") {
             card.style.borderColor = "rgba(255,180,60,.9)";
         } else if (st === "cached") {
             card.style.borderColor = "rgba(90,155,230,.65)";
@@ -3132,6 +3325,7 @@ function render(node, runtime) {
                             : "▶ RENDERING"
                 ) :
             st === "validated" ? "VALIDATED" :
+            st === "computed" ? "● COMPUTED" :
             st === "candidate" ? "● CANDIDATE" :
             st === "current" ? "● NEXT" :
             st === "cached" ? "CACHE" : "○";
@@ -3653,17 +3847,48 @@ function render(node, runtime) {
                 }
             }
             updateHidden(node, runtime);
+            // Nodes 2.0 captures native control edits around pointer events.
+            // Validation is a custom DOM checkbox that mutates clips_json after
+            // that capture point, so commit the new hidden-widget value now.
+            // Otherwise immediately changing run_mode can resurrect the previous
+            // validation snapshot and send a validated clip back to the sampler.
+            captureNativeWorkflowState(node, runtime);
             render(node, runtime);
         });
         validateLabel.append(validated, document.createTextNode("Validated"));
+
+        const infoWrap = document.createElement("div");
+        infoWrap.style.display = "flex";
+        infoWrap.style.alignItems = "center";
+        infoWrap.style.gap = "6px";
+
+        if (st === "computed") {
+            const reroll = document.createElement("button");
+            reroll.type = "button";
+            reroll.textContent = "↻";
+            reroll.title = fl2vaMode
+                ? "Discard this computed checkpoint so this FL2VA plan is rendered again"
+                : "Discard this computed checkpoint; Ref2VA will rerender this clip and the following chain";
+            reroll.style.width = "27px";
+            reroll.style.height = "22px";
+            reroll.style.padding = "0";
+            reroll.disabled = Boolean(runtime.discardComputedBusy || ["preparing", "sampling", "complete"].includes(String(runtime.activePhase || "")));
+            reroll.addEventListener("click", (event) => {
+                event.preventDefault();
+                event.stopPropagation();
+                if (!reroll.disabled) discardComputedClip(node, runtime, index);
+            });
+            infoWrap.appendChild(reroll);
+        }
 
         const info = document.createElement("span");
         const aligned = h3FrameCountForDuration(clip.duration);
         info.textContent = `${aligned}f / ${(aligned / 24).toFixed(3)}s`;
         info.style.fontSize = "10px";
         info.style.opacity = ".65";
+        infoWrap.appendChild(info);
 
-        foot.append(validateLabel, info);
+        foot.append(validateLabel, infoWrap);
         card.appendChild(foot);
         cards.appendChild(card);
     });
@@ -3923,6 +4148,11 @@ function buildUi(node) {
         generationModeWidget.value = next;
         runtime.cachedClipIds = new Set();
         runtime.validatedClipIds = new Set();
+        runtime.computedIndices = new Set();
+        runtime.computedClipIds = new Set();
+        runtime.checkpointActive = false;
+        runtime.checkpointInterrupted = false;
+        runtime.checkpointSnapshotCount = 0;
         runtime.cachedCount = 0;
         runtime.validatedCount = 0;
         runtime.cacheStateRestored = false;
@@ -3985,6 +4215,16 @@ function buildUi(node) {
         projectFileInput.click();
     });
 
+    const interruptButton = document.createElement("button");
+    interruptButton.type = "button";
+    interruptButton.textContent = "Interrupt";
+    interruptButton.title = "Finish the current Full Batch clip, save a resumable checkpoint, then decode the partial preview";
+    interruptButton.style.display = "none";
+    interruptButton.addEventListener("click", (e) => {
+        e.preventDefault();
+        requestFullBatchInterrupt(node, runtime);
+    });
+
     const counter = document.createElement("span");
     counter.style.fontSize = "11px";
     counter.style.opacity = ".8";
@@ -3998,7 +4238,7 @@ function buildUi(node) {
     status.style.textOverflow = "ellipsis";
     status.style.maxWidth = "55%";
 
-    toolbar.append(modeButton, add, remove, saveProjectButton, loadProjectButton, counter, status, projectFileInput);
+    toolbar.append(modeButton, add, remove, saveProjectButton, loadProjectButton, interruptButton, counter, status, projectFileInput);
 
     const refFileInput = document.createElement("input");
     refFileInput.type = "file";
@@ -4073,6 +4313,7 @@ function buildUi(node) {
         status,
         saveProjectButton,
         loadProjectButton,
+        interruptButton,
         projectFileInput,
         refFileInput,
         frameFileInput,
@@ -4129,6 +4370,15 @@ function buildUi(node) {
         loraListError: "",
         cachedClipIds: new Set(),
         validatedClipIds: new Set(),
+        computedIndices: new Set(),
+        computedClipIds: new Set(),
+        checkpointActive: false,
+        checkpointInterrupted: false,
+        checkpointSnapshotCount: 0,
+        discardComputedBusy: false,
+        interruptRequested: false,
+        interruptRequestBusy: false,
+        syncingFl2vaScroll: false,
         continuitySignatures: new Map(),
         continuitySignatureRequests: new Set(),
         modeValidationState: {
@@ -4204,6 +4454,11 @@ function buildUi(node) {
     });
     runtime.domWidget = domWidget;
     node.__h3Extender = runtime;
+
+    // FL2VA uses one horizontal scrollbar only: the card row. First/Last follows
+    // it passively, which avoids the feedback/repaint flicker of two synchronized
+    // scroll containers while keeping every keyframe aligned with its card.
+    cards.addEventListener("scroll", () => syncFl2vaHorizontalScroll(runtime), { passive: true });
 
     installInvalidationHooks(node, runtime);
     wrapResolutionWidgetCallbacks(node, runtime);
@@ -4306,10 +4561,19 @@ function clearTransientRenderingState(statusText = null) {
 
         runtime.activeClipIndex = -1;
         runtime.activePhase = "idle";
+        runtime.interruptRequested = false;
+        runtime.interruptRequestBusy = false;
         if (statusText) runtime.statusText = statusText;
 
         render(node, runtime);
         node.graph?.setDirtyCanvas(true, true);
+        if (statusText) {
+            // If ComfyUI itself was killed or an execution failed, the backend
+            // may still have safely checkpointed every clip completed before
+            // the failure. Refresh only card/cache state; never regenerate or
+            // replace the preview here.
+            setTimeout(() => restoreCacheState(node, runtime), 100);
+        }
     }
 }
 
@@ -4518,16 +4782,41 @@ app.registerExtension({
                 }
             }
 
-            // Critical: persist the next seed into clips_json. This changes the
-            // node input hash, so pressing Queue again really re-executes it.
-            if (generated.length) {
-                updateHidden(this, runtime);
-            }
+            // Defer clips_json persistence until checkpoint state is known below.
+            // Random/increment/decrement seed modes already change the hash here;
+            // fixed seed needs the resumable nonce added after an interruption.
+            let persistExecutionState = generated.length > 0;
 
             runtime.cachedCount = Number(info.cached_count || 0);
             runtime.validatedCount = Number(info.validated_count || 0);
             runtime.cachedClipIds = new Set(Array.isArray(info.cached_clip_ids) ? info.cached_clip_ids.map(String) : []);
             runtime.validatedClipIds = new Set(Array.isArray(info.validated_clip_ids) ? info.validated_clip_ids.map(String) : []);
+            runtime.computedIndices = new Set(
+                Array.isArray(info.computed_indices)
+                    ? info.computed_indices.map((value) => Number(value)).filter((value) => Number.isInteger(value) && value >= 0)
+                    : []
+            );
+            runtime.computedClipIds = new Set(
+                Array.isArray(info.computed_clip_ids) ? info.computed_clip_ids.map(String) : []
+            );
+            runtime.checkpointActive = Boolean(info.checkpoint_active);
+            runtime.checkpointInterrupted = Boolean(info.checkpoint_interrupted);
+            runtime.checkpointSnapshotCount = Number(info.checkpoint_snapshot_count || 0);
+            if (runtime.checkpointActive || runtime.checkpointInterrupted) {
+                // A stopped Full Batch is a completed ComfyUI node execution.
+                // With fixed per-clip seeds the visible generation inputs may be
+                // byte-identical, so force one harmless native-widget hash change
+                // to guarantee the next Queue actually resumes the checkpoint.
+                runtime.state.resume_nonce = `${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
+                persistExecutionState = true;
+            } else if (runtime.state.resume_nonce) {
+                // Successful completion no longer needs the transaction nonce.
+                runtime.state.resume_nonce = "";
+                persistExecutionState = true;
+            }
+            if (persistExecutionState) {
+                updateHidden(this, runtime);
+            }
             runtime.continuitySignatures = new Map(
                 Object.entries(info?.continuity_signatures || {}).map(([key, value]) => [String(key), String(value || "")]).filter(([, value]) => Boolean(value))
             );
@@ -4550,6 +4839,8 @@ app.registerExtension({
             }
             runtime.activeClipIndex = -1;
             runtime.activePhase = "idle";
+            runtime.interruptRequested = false;
+            runtime.interruptRequestBusy = false;
             runtime.statusText = String(info.status || "Ready");
             if (runtime.resolutionMismatch && Number(info.cache_width || 0) > 0) {
                 runtime.statusText +=
