@@ -6,6 +6,18 @@ The node combines **Ref2VA conditioning, Motion Context, disk caching, multi-cli
 
 ---
 
+### 🆕 Full Batch: Interrupt, Save & Resume
+
+Full Batch workflows are now much safer and easier to manage.
+
+You can interrupt a long Full Batch, keep the clips that are already computed, save the project, close ComfyUI, reload it later, and resume from where you stopped without losing completed work.
+
+This also works with project Save/Load, so long generations can now be split across multiple sessions instead of needing to finish in one run.
+
+Available for both **Ref2VA** and **FL2VA**.
+
+---
+
 ## 🆕 News — Dynamic FL2VA Guides & Native VIDEO Output
 
 ### 🎯 Dynamic Image Guides for FL2VA
