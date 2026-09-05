@@ -4393,6 +4393,20 @@ function buildUi(node) {
         ready: false,
     };
 
+    const oldAfterQueued = jsonWidget.afterQueued;
+    jsonWidget.afterQueued = function (...args) {
+        oldAfterQueued?.apply(this, args);
+        // ComfyUI can serialize batch items before the previous ones execute.
+        // Prepare the next seeds here so queued prompts have distinct inputs.
+        // serializeState also synchronizes the active mode_clips entry; the
+        // inactive mode is an independent timeline and must stay untouched.
+        for (const clip of runtime.state.clips) {
+            if (!clip.validated) advanceSeedAfterGenerate(clip);
+        }
+        updateHidden(node, runtime);
+        render(node, runtime);
+    };
+
     refFileInput.addEventListener("change", async () => {
         const file = refFileInput.files?.[0];
         const slot = Number(runtime.pendingRefSlot);
@@ -4751,13 +4765,18 @@ app.registerExtension({
             const info = message?.h3_extender_state?.[0];
             if (!info) return;
 
+            const mode = info.generation_mode || runtime.state.generation_mode || "ref2va";
+            const nextSeeds = new Map(
+                (runtime.state.mode_clips?.[mode] || [])
+                    .filter((clip) => !clip.validated)
+                    .map((clip) => [clip.id, { seed: clip.seed, seed_mode: clip.seed_mode }]),
+            );
             if (info.clips_json) {
                 runtime.state = mergeActiveStateJson(
                     runtime,
                     info.clips_json,
                     info.generation_mode || runtime.state?.generation_mode || "ref2va",
                 );
-                runtime.jsonWidget.value = serializeState(runtime.state);
             }
             if (info.generation_mode) {
                 activateModeState(
@@ -4772,18 +4791,23 @@ app.registerExtension({
             }
     
             const generated = Array.isArray(info.generated) ? info.generated : [];
-            for (const humanIndex of generated) {
-                const i = Number(humanIndex) - 1;
-                const clip = runtime.state.clips[i];
-                // Only prepare a next seed for a candidate. A validated cached
-                // clip is never touched by this automatic seed behavior.
-                if (clip && !clip.validated) {
+            for (const [i, clip] of runtime.state.clips.entries()) {
+                if (clip.validated) continue;
+                const next = nextSeeds.get(clip.id);
+                if (next && next.seed_mode === clip.seed_mode) {
+                    // Completion may describe an older queued run. Keep the
+                    // seeds already prepared by afterQueued, including clips
+                    // that this execution did not reach.
+                    clip.seed = next.seed;
+                } else if (generated.some((index) => Number(index) === i + 1)) {
+                    // A backend-imported clip may not have existed at queue time.
                     advanceSeedAfterGenerate(clip);
                 }
             }
+            runtime.jsonWidget.value = serializeState(runtime.state);
 
             // Defer clips_json persistence until checkpoint state is known below.
-            // Random/increment/decrement seed modes already change the hash here;
+            // Random/increment/decrement seed modes change the hash after queueing;
             // fixed seed needs the resumable nonce added after an interruption.
             let persistExecutionState = generated.length > 0;
 
