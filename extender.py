@@ -95,8 +95,12 @@ from .fl2va_engine import (
     install_fl2va_project_continuity,
     cache_full_batch_fl2va_plan,
 )
+from .ref2va_independent import (
+    cache_owner_id as _ref2va_independent_cache_owner_id,
+    run as _run_ref2va_independent,
+)
 
-BUILD = "minimax-h3-extender-v2.6.2"
+BUILD = "minimax-h3-extender-v2.7.1"
 _LOG = logging.getLogger(__name__)
 FPS = 24
 AUDIO_LATENT_FPS = 40
@@ -125,6 +129,7 @@ class _LazyUnconnected:
 
 _LAZY_UNCONNECTED = _LazyUnconnected()
 MAX_REF_AUDIO_SECONDS = 15.0
+REF_AUDIO_TIMELINE_SPLIT_SECONDS = 5.0
 MAX_CLIPS = 512
 MAX_FL2VA_GUIDES = 3
 DEFAULT_DURATION = 10.0
@@ -133,8 +138,8 @@ MAX_RESOLUTION = 4096
 DEFAULT_SEED_MAX = (1 << 53) - 1  # exact integer range in browser JS
 
 PROJECT_FORMAT = "MiniMax H3 Extender Project"
-PROJECT_FORMAT_VERSION = 3
-PROJECT_SUPPORTED_VERSIONS = {1, 2, 3}
+PROJECT_FORMAT_VERSION = 4
+PROJECT_SUPPORTED_VERSIONS = {1, 2, 3, 4}
 PROJECT_JSON_MAX_BYTES = 16 * 1024 * 1024
 PROJECT_DOWNLOAD_TTL_SECONDS = 2 * 60 * 60
 PROJECT_COPY_CHUNK = 8 * 1024 * 1024
@@ -1237,9 +1242,9 @@ def _prepare_standalone_audio_refs(
 ):
     """Build per-clip standalone audio refs without reusing illegal long audio.
 
-    Native-sized refs (<=15s) remain reusable references: they start at 0 for
-    every clip and are cropped to the current clip duration when useful. A long
-    source (>15s) is treated as a timeline and automatically advanced by the
+    Short refs (<=5s) remain reusable references: they start at 0 for every
+    clip and are cropped to the current clip duration when useful. A source
+    longer than 5s is treated as a timeline and automatically advanced by the
     cumulative H3-aligned duration of preceding cards that selected the same
     logical Audio slot.
     """
@@ -1268,7 +1273,7 @@ def _prepare_standalone_audio_refs(
     for slot, audio in active:
         label = f"ref_audio_{slot}"
         source_duration = _audio_duration_seconds(audio)
-        timeline_mode = source_duration > MAX_REF_AUDIO_SECONDS + 1e-6
+        timeline_mode = source_duration > REF_AUDIO_TIMELINE_SPLIT_SECONDS + 1e-6
 
         if timeline_mode:
             if clip_duration_seconds > MAX_REF_AUDIO_SECONDS + 1e-6:
@@ -1964,7 +1969,7 @@ def _normalize_fl2va_guides(raw_guides, legacy_frame=None, legacy_idx=0):
         })
     return guides
 
-def _parse_clips_json(value: str, generation_mode="ref2va"):
+def _parse_clips_json(value: str, generation_mode="ref2va", motion_context=True):
     try:
         payload = json.loads(value or "{}")
     except Exception as exc:
@@ -2033,7 +2038,7 @@ def _parse_clips_json(value: str, generation_mode="ref2va"):
     # Ref2VA + Motion Context is causal, so validation must remain a continuous
     # prefix. FL2VA plans are independent and deliberately keep per-card
     # validation without forcing downstream cards open.
-    if _normalize_generation_mode(generation_mode) == "ref2va":
+    if _normalize_generation_mode(generation_mode) == "ref2va" and bool(motion_context):
         found_open = False
         for clip in out:
             if found_open:
@@ -2060,10 +2065,12 @@ def _prompt_pack_signature_from_state(value):
     return signature
 
 
-def _state_json(clips, prompt_pack_signature="", generation_mode=None):
+def _state_json(clips, prompt_pack_signature="", generation_mode=None, motion_context=None):
     payload = {"version": 1, "clips": clips}
     if generation_mode is not None:
         payload["generation_mode"] = _normalize_generation_mode(generation_mode)
+    if motion_context is not None:
+        payload["motion_context"] = bool(motion_context)
     signature = str(prompt_pack_signature or "").lower().strip()
     if len(signature) == 64 and all(ch in "0123456789abcdef" for ch in signature):
         payload["prompt_pack_signature"] = signature
@@ -2433,6 +2440,51 @@ def _generation_mode_from_project_payload(project_payload):
     return _normalize_generation_mode(value or "ref2va")
 
 
+def _motion_context_from_project_payload(project_payload):
+    """Return the saved Ref2VA Motion Context toggle (True for old projects)."""
+    extender = project_payload.get("extender", {}) if isinstance(project_payload, dict) else {}
+    if not isinstance(extender, dict):
+        return True
+    value = extender.get("motion_context")
+    if value is None:
+        settings = extender.get("settings", {})
+        if isinstance(settings, dict):
+            value = settings.get("motion_context")
+    return True if value is None else bool(value)
+
+
+def _project_cache_owner_id(owner_id, generation_mode="ref2va", motion_context=True):
+    mode = _normalize_generation_mode(generation_mode)
+    if mode == "fl2va":
+        return _fl2va_cache_owner_id(owner_id)
+    if not bool(motion_context):
+        return _ref2va_independent_cache_owner_id(owner_id)
+    return f"extender_{_safe_name(owner_id)}"
+
+
+def _causal_lineage_from_project_payload(project_payload):
+    """Read the last known causal Ref2VA clip-id order from clips_json.
+
+    v2.7 stores this frontend-only lineage so a v2.6.x positional cache can be
+    made safe after the user temporarily switches to independent Ref2VA and
+    inserts/deletes cards before ever executing Motion Context again.
+    """
+    extender = project_payload.get("extender", {}) if isinstance(project_payload, dict) else {}
+    raw = extender.get("clips_json") if isinstance(extender, dict) else None
+    if not isinstance(raw, str) or not raw.strip():
+        return []
+    try:
+        payload = json.loads(raw)
+    except Exception:
+        return []
+    if not isinstance(payload, dict):
+        return []
+    lineage = payload.get("causal_lineage")
+    if not isinstance(lineage, list):
+        return []
+    return [str(value) for value in lineage if str(value)]
+
+
 def _prompt_pack_signature_from_project_payload(project_payload):
     extender = project_payload.get("extender", {}) if isinstance(project_payload, dict) else {}
     raw = extender.get("clips_json")
@@ -2455,20 +2507,23 @@ def _clips_from_project_payload(project_payload):
             raw = json.dumps({"version": 1, "clips": clips}, ensure_ascii=False)
     if not isinstance(raw, str) or not raw.strip():
         raw = _state_json([_default_clip(0)])
-    return _parse_clips_json(raw, generation_mode)
+    return _parse_clips_json(raw, generation_mode, _motion_context_from_project_payload(project_payload))
 
 
 def _write_clips_to_project_payload(project_payload, clips, generation_mode=None):
     mode = _normalize_generation_mode(generation_mode or _generation_mode_from_project_payload(project_payload))
+    motion_context = _motion_context_from_project_payload(project_payload)
     signature = _prompt_pack_signature_from_project_payload(project_payload)
-    raw = _state_json(clips, signature, mode)
+    raw = _state_json(clips, signature, mode, motion_context=motion_context)
     extender = project_payload.setdefault("extender", {})
     extender["generation_mode"] = mode
+    extender["motion_context"] = bool(motion_context)
     extender["clips_json"] = raw
     extender["clips"] = copy.deepcopy(clips)
     settings = extender.setdefault("settings", {})
     if isinstance(settings, dict):
         settings["generation_mode"] = mode
+        settings["motion_context"] = bool(motion_context)
         settings["clips_json"] = raw
     return raw
 
@@ -2520,11 +2575,9 @@ def _project_cache_snapshot(owner_id, project_payload):
     intentionally excluded from the project.
     """
     generation_mode = _generation_mode_from_project_payload(project_payload)
-    cache_owner = (
-        _fl2va_cache_owner_id(owner_id)
-        if generation_mode == "fl2va"
-        else f"extender_{_safe_name(owner_id)}"
-    )
+    motion_context = _motion_context_from_project_payload(project_payload)
+    random_access = generation_mode == "fl2va" or (generation_mode == "ref2va" and not motion_context)
+    cache_owner = _project_cache_owner_id(owner_id, generation_mode, motion_context)
     data_path, manifest_path = _chain_paths(cache_owner)
     if not data_path.exists() or not manifest_path.exists():
         return None
@@ -2541,7 +2594,7 @@ def _project_cache_snapshot(owner_id, project_payload):
         clips = _clips_from_project_payload(project_payload)
     except Exception:
         clips = []
-    if generation_mode == "fl2va":
+    if random_access:
         order_by_id = {str(c.get("id")): i for i, c in enumerate(clips)}
         valid_by_id = {str(c.get("id")): bool(c.get("validated", False)) for c in clips}
         segments = [
@@ -2555,6 +2608,26 @@ def _project_cache_snapshot(owner_id, project_payload):
             desc["validated"] = bool(valid_by_id.get(str(desc.get("clip_id") or ""), False))
         manifest["final_frame_count"] = _final_frame_count(segments)
     else:
+        # Classic Ref2VA is positional/causal. If the card order was edited while
+        # independent Ref2VA was active, only the unchanged clip-id prefix can be
+        # safely packaged from the old causal cache. Older manifests without this
+        # metadata fall back to the frontend causal lineage stored in clips_json.
+        lineage = [str(x) for x in list(manifest.get("extender_clip_ids") or []) if str(x)]
+        if not lineage:
+            # Migration fallback for a causal cache created by v2.6.x: the
+            # frontend keeps the pre-edit causal order in clips_json even while
+            # independent Ref2VA is active. Use it when the old manifest cannot
+            # identify its positional segments itself.
+            lineage = _causal_lineage_from_project_payload(project_payload)
+        if lineage:
+            current_ids = [str(c.get("id") or "") for c in clips]
+            common = 0
+            while common < len(lineage) and common < len(current_ids) and lineage[common] == current_ids[common]:
+                common += 1
+            safe_count = min(common, len(segments))
+            segments = segments[:safe_count]
+            manifest["extender_clip_ids"] = lineage[:safe_count]
+            manifest["final_frame_count"] = _final_frame_count(segments)
         for i, desc in enumerate(segments):
             desc["validated"] = bool(i < len(clips) and clips[i].get("validated", False))
     manifest["segments"] = segments
@@ -2662,11 +2735,15 @@ def _zip_write_prefix(zf, arcname, source_path, byte_limit):
 def _build_project_archive(owner_id, requested_name, project_payload, output_path):
     project_payload = copy.deepcopy(project_payload)
     generation_mode = _generation_mode_from_project_payload(project_payload)
+    motion_context = _motion_context_from_project_payload(project_payload)
+    random_access = generation_mode == "fl2va" or (generation_mode == "ref2va" and not motion_context)
     extender_meta = project_payload.setdefault("extender", {})
     extender_meta["generation_mode"] = generation_mode
+    extender_meta["motion_context"] = bool(motion_context)
     settings_meta = extender_meta.setdefault("settings", {})
     if isinstance(settings_meta, dict):
         settings_meta["generation_mode"] = generation_mode
+        settings_meta["motion_context"] = bool(motion_context)
     refs = _refs_from_project_payload(project_payload)
     refs = _write_refs_to_project_payload(project_payload, refs)
 
@@ -2770,6 +2847,12 @@ def _build_project_archive(owner_id, requested_name, project_payload, output_pat
             # an mmap handle open on the cache. In that rare case the archive is
             # still correct; it may simply include unreclaimed stale bytes.
             print(f"[WARNING] MiniMax H3 Extender: FL2VA Save Project compaction skipped: {exc}")
+    elif generation_mode == "ref2va" and not motion_context:
+        try:
+            from .ref2va_independent import compact_cache as compact_ref2va_independent_cache
+            compact_ref2va_independent_cache(owner_id, force=True)
+        except Exception as exc:
+            print(f"[WARNING] MiniMax H3 Extender: independent Ref2VA Save Project compaction skipped: {exc}")
 
     snapshot = _project_cache_snapshot(owner_id, project_payload)
     continuity_files = (
@@ -2782,7 +2865,7 @@ def _build_project_archive(owner_id, requested_name, project_payload, output_pat
 
     final_video_files = []
     if snapshot is not None:
-        if generation_mode == "fl2va":
+        if random_access:
             final_dir = Path(snapshot["data_path"]).with_suffix(".fl2va.video")
             if final_dir.exists():
                 # Save/Load must preserve the exact runtime state of a COMPUTED
@@ -2981,9 +3064,11 @@ def _replace_cache_transaction(
     new_audio=None,
     new_final_video_dir=None,
     generation_mode="ref2va",
+    motion_context=True,
 ):
     mode = _normalize_generation_mode(generation_mode)
-    cache_owner = _fl2va_cache_owner_id(owner_id) if mode == "fl2va" else f"extender_{_safe_name(owner_id)}"
+    random_access = mode == "fl2va" or (mode == "ref2va" and not bool(motion_context))
+    cache_owner = _project_cache_owner_id(owner_id, mode, motion_context)
     target_data, target_manifest = _chain_paths(cache_owner)
     target_preview = _decoded_preview_cache_path(target_data)
     target_preview_video = _decoded_preview_video_cache_path(target_data)
@@ -2991,7 +3076,7 @@ def _replace_cache_transaction(
     target_fl2va_video_dir = target_data.with_suffix(".fl2va.video")
     target_ref2va_final_video_dir = target_data.with_suffix(".final.video")
     target_final_video_dir = (
-        target_fl2va_video_dir if mode == "fl2va" else target_ref2va_final_video_dir
+        target_fl2va_video_dir if random_access else target_ref2va_final_video_dir
     )
     # The video-only preview prefix is derived and is intentionally not stored
     # in .ext. The decoded-audio cache is primary cache data and is restored
@@ -3095,9 +3180,14 @@ def _import_project_archive(owner_id, archive_path):
             if not isinstance(project_payload, dict):
                 raise ValueError("MiniMax H3 Extender Project: invalid project metadata.")
             generation_mode = _generation_mode_from_project_payload(project_payload)
-            # Archives created before FL2VA have no mode marker and are always Ref2VA.
+            motion_context = _motion_context_from_project_payload(project_payload)
+            random_access = generation_mode == "fl2va" or (generation_mode == "ref2va" and not motion_context)
+            # Archives created before FL2VA/Motion toggle have no markers and are
+            # therefore classic causal Ref2VA with Motion Context enabled.
             project_payload.setdefault("extender", {})["generation_mode"] = generation_mode
+            project_payload["extender"]["motion_context"] = bool(motion_context)
             project_payload["extender"].setdefault("settings", {})["generation_mode"] = generation_mode
+            project_payload["extender"]["settings"]["motion_context"] = bool(motion_context)
             clips = _clips_from_project_payload(project_payload)
             project_prompt_pack_signature = _prompt_pack_signature_from_project_payload(project_payload)
 
@@ -3356,13 +3446,13 @@ def _import_project_archive(owner_id, archive_path):
                 # Ref2VA projects retain the portable sequential prefix. FL2VA
                 # projects use stable clip ids and therefore filter/reorder the
                 # manifest without rewriting the append-only latent bytes.
-                if generation_mode == "ref2va" and len(imported_manifest.get("segments", [])) > len(clips):
+                if generation_mode == "ref2va" and motion_context and len(imported_manifest.get("segments", [])) > len(clips):
                     imported_manifest = _truncate_chain(
                         new_data, new_manifest, imported_manifest, len(clips)
                     )
 
                 segments = [dict(x) for x in imported_manifest.get("segments", [])]
-                if generation_mode == "fl2va":
+                if random_access:
                     order = {str(c.get("id")): i for i, c in enumerate(clips)}
                     valid = {str(c.get("id")): bool(c.get("validated", False)) for c in clips}
                     segments = [x for x in segments if str(x.get("clip_id") or "") in order]
@@ -3377,11 +3467,12 @@ def _import_project_archive(owner_id, archive_path):
                 imported_manifest = dict(imported_manifest)
                 imported_manifest["segments"] = segments
                 imported_manifest["final_frame_count"] = _final_frame_count(segments)
-                imported_manifest["sequence_mode"] = generation_mode
-                imported_manifest["owner_id"] = (
-                    _fl2va_cache_owner_id(owner_id)
-                    if generation_mode == "fl2va"
-                    else f"extender_{_safe_name(owner_id)}"
+                imported_manifest["sequence_mode"] = (
+                    "fl2va" if generation_mode == "fl2va"
+                    else ("ref2va_independent" if not motion_context else "ref2va")
+                )
+                imported_manifest["owner_id"] = _project_cache_owner_id(
+                    owner_id, generation_mode, motion_context
                 )
                 imported_manifest["imported_at"] = time.time()
                 imported_manifest["updated_at"] = time.time()
@@ -3459,7 +3550,7 @@ def _import_project_archive(owner_id, archive_path):
 
             cached_count = int(len(imported_manifest.get("segments", []))) if imported_manifest else 0
             # A clip can only remain validated when its physical cached segment is present.
-            if generation_mode == "fl2va":
+            if random_access:
                 cached_ids = {
                     str(x.get("clip_id")) for x in (imported_manifest or {}).get("segments", [])
                     if str(x.get("clip_id") or "")
@@ -3477,14 +3568,18 @@ def _import_project_archive(owner_id, archive_path):
                     elif not clip_cfg["validated"]:
                         found_open = True
 
-            normalized_clips_json = _state_json(clips, project_prompt_pack_signature, generation_mode)
+            normalized_clips_json = _state_json(
+                clips, project_prompt_pack_signature, generation_mode, motion_context=motion_context
+            )
             extender_payload = project_payload.setdefault("extender", {})
             extender_payload["generation_mode"] = generation_mode
+            extender_payload["motion_context"] = bool(motion_context)
             extender_payload["clips_json"] = normalized_clips_json
             extender_payload["clips"] = clips
             settings = extender_payload.setdefault("settings", {})
             if isinstance(settings, dict):
                 settings["generation_mode"] = generation_mode
+                settings["motion_context"] = bool(motion_context)
                 settings["clips_json"] = normalized_clips_json
 
             _replace_cache_transaction(
@@ -3499,21 +3594,36 @@ def _import_project_archive(owner_id, archive_path):
                     else None
                 ),
                 generation_mode=generation_mode,
+                motion_context=motion_context,
             )
 
-            # Portable .ext projects are intentionally single-mode. The frontend
+            # Portable .ext projects are intentionally single-mode/context. The frontend
             # also resets the inactive card timeline when importing one, so an
             # old cache from the opposite mode must not survive on disk. If it
             # did, a later frontend/default-mode mistake could resurrect a stale
             # preview from a completely different project after F5/restart.
-            inactive_mode = "ref2va" if generation_mode == "fl2va" else "fl2va"
-            try:
-                _replace_cache_transaction(owner_id, generation_mode=inactive_mode)
-            except Exception as exc:
-                print(
-                    f"[WARNING] MiniMax H3 Extender: could not clear stale {inactive_mode} "
-                    f"cache while loading project: {exc}"
-                )
+            active_cache_key = (generation_mode, bool(motion_context) if generation_mode == "ref2va" else False)
+            inactive_cache_keys = [
+                ("ref2va", True),
+                ("ref2va", False),
+                ("fl2va", False),
+            ]
+            for inactive_mode, inactive_motion in inactive_cache_keys:
+                if (inactive_mode, inactive_motion) == active_cache_key:
+                    continue
+                try:
+                    _replace_cache_transaction(
+                        owner_id, generation_mode=inactive_mode, motion_context=inactive_motion
+                    )
+                except Exception as exc:
+                    label = (
+                        "ref2va-motion" if inactive_mode == "ref2va" and inactive_motion
+                        else ("ref2va-independent" if inactive_mode == "ref2va" else "fl2va")
+                    )
+                    print(
+                        f"[WARNING] MiniMax H3 Extender: could not clear stale {label} "
+                        f"cache while loading project: {exc}"
+                    )
 
             if generation_mode == "fl2va" and imported_manifest is not None and continuity_restore:
                 target_data, _ = _chain_paths(_fl2va_cache_owner_id(owner_id))
@@ -3540,7 +3650,7 @@ def _import_project_archive(owner_id, archive_path):
 
             validated_count = 0
             if imported_manifest is not None:
-                if generation_mode == "fl2va":
+                if random_access:
                     validated_count = sum(bool(x.get("validated", False)) for x in imported_manifest.get("segments", []))
                 else:
                     for desc in imported_manifest.get("segments", []):
@@ -3675,6 +3785,12 @@ class MiniMaxH3Extender:
             "generation_mode": (
                 ["ref2va", "fl2va"],
                 {"default": "ref2va"},
+            ),
+            # Appended after every legacy widget. The frontend hides this native
+            # boolean and exposes a compact Ref2VA-only MOTION toggle.
+            "motion_context": (
+                "BOOLEAN",
+                {"default": True, "tooltip": "Ref2VA only: chain clips with Motion Context. Disable for independent random-access clips."},
             ),
         }
 
@@ -4029,7 +4145,19 @@ class MiniMaxH3Extender:
                         or str(current_desc.get("previous_frame_signature") or "") != str(dependency_meta["previous_frame_signature"])
                     )
             if stale_dependency:
-                _drop_stale_indices([i] + _dependent_indices(i))
+                stale_indices = [i] + _dependent_indices(i)
+                locked = [idx for idx in stale_indices if bool(clips[idx].get("validated", False))]
+                if locked:
+                    if first_frame is not None:
+                        del first_frame
+                    labels = ", ".join(str(idx + 1) for idx in locked)
+                    raise RuntimeError(
+                        "MiniMax H3 Extender: FL2VA Previous dependency changed for "
+                        f"Validated clip(s) {labels}. Refusing to invalidate or rerender "
+                        "a validated clip automatically. Uncheck Validated explicitly on "
+                        "the affected clip(s) before rerunning."
+                    )
+                _drop_stale_indices(stale_indices)
                 current_desc = None
                 cached = False
 
@@ -4083,6 +4211,25 @@ class MiniMaxH3Extender:
                 raise RuntimeError(
                     f"MiniMax H3 Extender invariant: FL2VA clip {i + 1} reached the sampler path while Validated."
                 )
+
+            # Rerendering this plan changes the actual frame inherited by every
+            # consecutive Previous-linked follower. A Validated follower is a
+            # hard user lock: never clear it after sampling behind the user's
+            # back. Require explicit de-validation before the upstream rerender.
+            dependent = _dependent_indices(i)
+            locked_dependents = [
+                idx for idx in dependent if bool(clips[idx].get("validated", False))
+            ]
+            if locked_dependents:
+                if first_frame is not None:
+                    del first_frame
+                labels = ", ".join(str(idx + 1) for idx in locked_dependents)
+                raise RuntimeError(
+                    f"MiniMax H3 Extender: rerendering FL2VA clip {i + 1} would invalidate "
+                    f"Validated Previous-linked clip(s) {labels}. Refusing to rerender. "
+                    "Uncheck Validated explicitly on the affected dependent clip(s) first."
+                )
+
             _send_extender_progress(
                 owner, i, len(clips), "preparing",
                 f"Preparing FL2VA clip {i + 1}/{len(clips)}",
@@ -4359,6 +4506,7 @@ class MiniMaxH3Extender:
         megapixels=DEFAULT_MEGAPIXELS,
         refs_json=None,
         generation_mode="ref2va",
+        motion_context=True,
         prompt_pack=None,
         ref_pack=None,
         unique_id=None,
@@ -4366,8 +4514,9 @@ class MiniMaxH3Extender:
         **kwargs,
     ):
         generation_mode = _normalize_generation_mode(generation_mode)
+        motion_context = bool(motion_context)
         stored_prompt_pack_signature = _prompt_pack_signature_from_state(clips_json)
-        clips = _parse_clips_json(clips_json, generation_mode)
+        clips = _parse_clips_json(clips_json, generation_mode, motion_context)
         external_prompt_pack = _normalize_external_prompt_pack(prompt_pack)
         clips, active_prompt_pack_signature, prompt_pack_imported, _prompt_pack_count_changed = (
             _sync_clips_from_prompt_pack(
@@ -4404,6 +4553,21 @@ class MiniMaxH3Extender:
                 resolution_mode=resolution_mode,
                 megapixels=megapixels,
                 export_profile=requested_export_profile,
+            )
+
+        if not motion_context:
+            return _run_ref2va_independent(
+                self, owner=owner, clips=clips,
+                active_prompt_pack_signature=active_prompt_pack_signature,
+                prompt_pack_imported=prompt_pack_imported,
+                external_prompt_pack=external_prompt_pack,
+                model=model, clip=clip, vae=vae, audio_vae=kwargs.get("audio_vae"),
+                run_mode=run_mode, width=width, height=height,
+                ref_image_size=ref_image_size, steps=steps,
+                sampler_name=sampler_name, scheduler=scheduler, denoise=denoise,
+                resolution_mode=resolution_mode, megapixels=megapixels,
+                refs_json=refs_json, ref_pack=ref_pack,
+                export_profile=requested_export_profile, kwargs=kwargs,
             )
 
         data_path, manifest_path, manifest = _manifest_for_extender(owner, FPS)
@@ -4964,6 +5128,19 @@ class MiniMaxH3Extender:
             else:
                 final_manifest = _finish_batch_checkpoint(manifest_path, final_manifest)
 
+        # Persist the causal clip-id order as metadata only. This does not alter
+        # Motion Context execution; it lets the frontend detect a timeline edit
+        # made while independent Ref2VA was active and avoid restoring an old
+        # positional validation onto a newly inserted card.
+        if final_manifest is not None:
+            causal_cached_count = len(final_manifest.get("segments", []))
+            wanted_lineage = [str(cfg.get("id") or f"clip_{idx + 1}") for idx, cfg in enumerate(clips[:causal_cached_count])]
+            if list(final_manifest.get("extender_clip_ids") or []) != wanted_lineage:
+                final_manifest = dict(final_manifest)
+                final_manifest["extender_clip_ids"] = wanted_lineage
+                final_manifest["updated_at"] = time.time()
+                _write_json_atomic(manifest_path, final_manifest)
+
         # Color grading is montage metadata only. Keep it attached to each cached
         # decoded segment without invalidating latents or validation state.
         if final_manifest is not None:
@@ -4994,7 +5171,7 @@ class MiniMaxH3Extender:
                 break
         computed_indices = _ref2va_computed_indices(final_manifest)
 
-        normalized_json = _state_json(clips, active_prompt_pack_signature, generation_mode)
+        normalized_json = _state_json(clips, active_prompt_pack_signature, generation_mode, motion_context=True)
         if resolution.get("mode") == "auto_from_ref" and resolution.get("guide_ref") is not None:
             resolution_text = (
                 f"{resolved_width}x{resolved_height} from ref_{int(resolution['guide_ref'])} "
@@ -5057,6 +5234,8 @@ class MiniMaxH3Extender:
             "clip_count": len(clips),
             "cached_count": cached_count,
             "validated_count": validated_count,
+            "cached_clip_ids": [str(x) for x in list((final_manifest or {}).get("extender_clip_ids") or [])[:cached_count] if str(x)],
+            "validated_clip_ids": [str(x) for x in list((final_manifest or {}).get("extender_clip_ids") or [])[:validated_count] if str(x)],
             "computed_indices": computed_indices,
             "computed_clip_ids": [],
             "checkpoint_active": bool(interrupted),

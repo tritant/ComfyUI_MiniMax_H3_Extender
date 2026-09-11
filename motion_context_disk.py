@@ -61,7 +61,7 @@ from .motion_context_ram import (
     _streams_from_latent,
 )
 
-BUILD = "motion-context-disk-v2.6.2"
+BUILD = "motion-context-disk-v2.7.1"
 PREVIEW_AUDIO_MODE = "pcm_single_aac_gain_chain_v3_entry_ramp"
 CACHE_VERSION = 12
 PREVIEW_ROTATION_SLOTS = 3
@@ -135,6 +135,217 @@ def _color_adjustment_signature(value):
 # in the manifest, so a later restart does not depend on this in-memory flag.
 _FULL_BATCH_INTERRUPT_LOCK = threading.Lock()
 _FULL_BATCH_INTERRUPT_REQUESTS = set()
+
+
+def _request_bool(value, default=True):
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return bool(default)
+    text = str(value).strip().lower()
+    if text in {"0", "false", "off", "no"}:
+        return False
+    if text in {"1", "true", "on", "yes"}:
+        return True
+    return bool(default)
+
+
+def _extender_runtime_mode(generation_mode="ref2va", motion_context=True):
+    mode = str(generation_mode or "ref2va").lower().strip()
+    if mode == "fl2va":
+        return "fl2va"
+    if mode == "ref2va_independent" or not bool(motion_context):
+        return "ref2va_independent"
+    return "ref2va"
+
+
+def _extender_cache_owner_id(owner_id, generation_mode="ref2va", motion_context=True):
+    mode = _extender_runtime_mode(generation_mode, motion_context)
+    if mode == "fl2va":
+        from .fl2va_engine import cache_owner_id
+        return cache_owner_id(owner_id)
+    if mode == "ref2va_independent":
+        from .ref2va_independent import cache_owner_id
+        return cache_owner_id(owner_id)
+    return f"extender_{_safe_name(owner_id)}"
+
+
+def _copy_path_to_temp(source, suffix=""):
+    source = Path(source)
+    if not source.exists():
+        return None
+    token = uuid.uuid4().hex[:10]
+    temp = source.with_name(source.name + f".bootstrap_{token}{suffix}")
+    if source.is_dir():
+        shutil.copytree(source, temp)
+    else:
+        shutil.copy2(source, temp)
+    return temp
+
+
+def _prefix_validated_ids(clip_entries):
+    out = []
+    for item in clip_entries:
+        if not bool(item.get("validated", False)):
+            break
+        clip_id = str(item.get("id") or "").strip()
+        if not clip_id:
+            break
+        out.append(clip_id)
+    return out
+
+
+def _bootstrap_ref2va_manifest(manifest, runtime_mode, clip_entries):
+    manifest = dict(manifest or {})
+    source_sequence_mode = str(manifest.get("sequence_mode") or "ref2va").lower().strip()
+    source_checkpoint_interrupted = bool(manifest.get("batch_interrupted", False))
+    source_checkpoint_snapshot_count = int(manifest.get("batch_snapshot_count", 0) or 0)
+    source_checkpoint_total_clips = int(manifest.get("batch_total_clips", 0) or 0)
+    source_segments = [dict(x) for x in manifest.get("segments", [])]
+    clip_entries = [
+        {"id": str(x.get("id") or "").strip(), "validated": bool(x.get("validated", False))}
+        for x in (clip_entries or [])
+        if str(x.get("id") or "").strip()
+    ]
+    clip_order = [x["id"] for x in clip_entries]
+    validated_lookup = {x["id"]: bool(x.get("validated", False)) for x in clip_entries}
+    prefix_ids = set(_prefix_validated_ids(clip_entries))
+
+    if runtime_mode == "ref2va_independent":
+        source_ids = [str(x) for x in list(manifest.get("extender_clip_ids") or [])]
+        rebuilt = []
+        for idx, seg in enumerate(source_segments):
+            desc = dict(seg)
+            clip_id = str(desc.get("clip_id") or "").strip()
+            if not clip_id and idx < len(source_ids):
+                clip_id = str(source_ids[idx] or "").strip()
+            if not clip_id and idx < len(clip_order):
+                clip_id = clip_order[idx]
+            if not clip_id:
+                continue
+            desc["clip_id"] = clip_id
+            desc["validated"] = bool(validated_lookup.get(clip_id, desc.get("validated", False)))
+
+            # Motion ON stores the full causal latent geometry in ``frames`` and
+            # removes ``trim_frames`` only when producing the visible corrected
+            # video/audio segment.  Motion OFF is random-access and has no causal
+            # trim, so preserve both geometries explicitly when crossing ON->OFF:
+            # ``source_frames`` remains the VideoVAE/audio-latent decode size,
+            # while ``frames`` becomes the actual visible timeline duration.
+            # ``visible_offset`` lets a later cache repair crop a full source
+            # decode instead of silently reintroducing the overlap frames.
+            if source_sequence_mode != "ref2va_independent":
+                source_frames = int(desc.get("frames", 0) or 0)
+                source_trim = int(desc.get("trim_frames", 0) or 0)
+                visible_frames = int(source_frames - source_trim)
+                if source_frames <= 0 or source_trim < 0 or visible_frames <= 0:
+                    raise ValueError(
+                        "MiniMax H3 Extender: invalid causal frame geometry while "
+                        f"bootstrapping Motion OFF (frames={source_frames}, trim={source_trim})."
+                    )
+                desc["source_frames"] = int(source_frames)
+                desc["source_trim_frames"] = int(source_trim)
+                desc["visible_offset"] = int(source_trim)
+                desc["frames"] = int(visible_frames)
+                desc["trim_frames"] = 0
+            rebuilt.append(desc)
+        manifest["segments"] = rebuilt
+        manifest["sequence_mode"] = "ref2va_independent"
+        manifest["extender_clip_ids"] = [str(x.get("clip_id") or "") for x in rebuilt if str(x.get("clip_id") or "")]
+    else:
+        by_clip_id = {}
+        source_ids = [str(x) for x in list(manifest.get("extender_clip_ids") or [])]
+        for idx, seg in enumerate(source_segments):
+            desc = dict(seg)
+            clip_id = str(desc.get("clip_id") or "").strip()
+            if not clip_id and idx < len(source_ids):
+                clip_id = str(source_ids[idx] or "").strip()
+            if clip_id:
+                desc["clip_id"] = clip_id
+                by_clip_id[clip_id] = desc
+        rebuilt = []
+        for clip_id in clip_order:
+            desc = by_clip_id.get(clip_id)
+            if desc is None:
+                break
+            item = dict(desc)
+            item["clip_id"] = clip_id
+            item["validated"] = clip_id in prefix_ids
+            rebuilt.append(item)
+        manifest["segments"] = rebuilt
+        manifest["sequence_mode"] = "ref2va"
+        manifest["extender_clip_ids"] = [str(x.get("clip_id") or "") for x in rebuilt]
+
+    # Recompute from the target-mode descriptor semantics.  In particular, an
+    # ON->OFF bridge must count only the already-visible continuation frames,
+    # not the overlap still present in each source latent.
+    manifest["final_frame_count"] = _final_frame_count(manifest.get("segments", []))
+    manifest["updated_at"] = time.time()
+    manifest["batch_in_progress"] = False
+    if source_checkpoint_interrupted:
+        # A Motion ON/OFF toggle is not a new generation run. Preserve an
+        # explicit user Interrupt checkpoint so COMPUTED keeps its exact
+        # checkpoint semantics after crossing the Ref2VA motion toggle.
+        manifest["batch_interrupted"] = True
+        manifest["batch_snapshot_count"] = int(source_checkpoint_snapshot_count)
+        if source_checkpoint_total_clips > 0:
+            manifest["batch_total_clips"] = int(source_checkpoint_total_clips)
+    else:
+        manifest["batch_interrupted"] = False
+        manifest.pop("batch_snapshot_count", None)
+        manifest.pop("batch_total_clips", None)
+    return manifest
+
+
+def _bootstrap_ref2va_motion_on_to_independent_video_dir(source_data, normalized_manifest):
+    """Build Motion-OFF random-access sidecars from Motion-ON caches without VAE.
+
+    Causal Ref2VA stores the neutral H.264 per-clip preview inside the .h3cache
+    as ``decoded_mp4_blob`` and exact-final Full-Batch files as
+    ``.final.video/ref2va_XXXX.<ext>``. Independent Ref2VA expects both caches
+    in ``.fl2va.video`` under stable clip-id names. Materialize/remap those
+    existing encoded bytes only; never decode or re-encode them here.
+    """
+    source_data = Path(source_data)
+    token = uuid.uuid4().hex[:10]
+    staged_dir = source_data.with_name(source_data.name + f".bootstrap_random_video_{token}.tmp")
+    staged_dir.mkdir(parents=True, exist_ok=False)
+    source_final_dir = source_data.with_suffix(".final.video")
+    copied_any = False
+    try:
+        for idx, desc in enumerate(normalized_manifest.get("segments", [])):
+            clip_id = str(desc.get("clip_id") or "").strip()
+            if not clip_id:
+                continue
+            safe_id = _safe_name(clip_id)
+
+            blob = desc.get("decoded_mp4_blob")
+            if isinstance(blob, dict) and "offset" in blob and "nbytes" in blob:
+                preview_target = staged_dir / f"{safe_id}.mp4"
+                _copy_blob_to_file(source_data, blob, preview_target)
+                copied_any = True
+
+            # Preserve the exact-final bitstream produced during the causal
+            # Full Batch, simply renaming it to the random-access clip-id form.
+            if source_final_dir.exists():
+                matches = sorted(source_final_dir.glob(f"ref2va_{idx:04d}.*"))
+                for source_final in matches:
+                    if not source_final.is_file() or source_final.stat().st_size <= 0:
+                        continue
+                    final_target = staged_dir / f"{safe_id}.final{source_final.suffix}"
+                    shutil.copy2(source_final, final_target)
+                    copied_any = True
+                    # Independent Ref2VA has no handoff frame trimming. The
+                    # causal final cache covers this clip's full visible frame
+                    # count, so make its existing cache metadata compatible with
+                    # the random-access cache validator.
+                    desc["final_video_visible_frames"] = int(desc.get("frames", 0) or 0)
+                    break
+
+        return staged_dir if copied_any else None
+    except Exception:
+        shutil.rmtree(staged_dir, ignore_errors=True)
+        raise
 
 
 def _full_batch_interrupt_key(owner_id, generation_mode="ref2va"):
@@ -1460,7 +1671,27 @@ def _decode_audio_latent(audio_vae, latent, frames, fps):
 
 def _decode_single_audio(data_path, desc, audio_vae, fps):
     latent = _load_segment_audio(data_path, desc)
-    return _decode_audio_latent(audio_vae, latent, int(desc["frames"]), fps)
+    source_frames = int(desc.get("source_frames", desc.get("frames", 0)) or 0)
+    visible_frames = int(desc.get("frames", source_frames) or source_frames)
+    visible_offset = int(desc.get("visible_offset", 0) or 0)
+    if source_frames <= 0 or visible_frames <= 0 or visible_offset < 0:
+        raise ValueError("H3 audio decode: invalid source/visible frame geometry.")
+    if visible_offset + visible_frames > source_frames:
+        raise ValueError(
+            "H3 audio decode: visible window lies outside source latent "
+            f"({visible_offset}+{visible_frames}>{source_frames})."
+        )
+
+    decoded = _decode_audio_latent(audio_vae, latent, source_frames, fps)
+    if visible_offset == 0 and visible_frames == source_frames:
+        return decoded
+
+    sr = int(decoded["sample_rate"])
+    start = int(round(float(visible_offset) / float(fps) * sr))
+    count = int(round(float(visible_frames) / float(fps) * sr))
+    wave = decoded["waveform"][..., start:start + count]
+    visible = {"waveform": wave, "sample_rate": sr}
+    return _audio_exact_frames(visible, visible_frames, fps)
 
 
 def _decode_pair_audio(data_path, prev_desc, curr_desc, audio_vae, fps, seam_shift):
@@ -3704,7 +3935,7 @@ def _export_live_candidate_preview(
 
 
 
-def _restore_cached_preview_without_decode(owner_id, final_id, generation_mode="ref2va"):
+def _restore_cached_preview_without_decode(owner_id, final_id, generation_mode="ref2va", motion_context=True):
     """
     Rebuild the current full preview using ONLY already cached decoded MP4 blobs.
 
@@ -3715,11 +3946,8 @@ def _restore_cached_preview_without_decode(owner_id, final_id, generation_mode="
     owner = _safe_name(owner_id)
     final = _safe_name(final_id)
 
-    if str(generation_mode or "ref2va").lower() == "fl2va":
-        from .fl2va_engine import cache_owner_id
-        cache_owner = cache_owner_id(owner_id)
-    else:
-        cache_owner = f"extender_{owner}"
+    requested_mode = _extender_runtime_mode(generation_mode, motion_context)
+    cache_owner = _extender_cache_owner_id(owner_id, generation_mode, motion_context)
     data_path, manifest_path = _chain_paths(cache_owner)
     if not data_path.exists() or not manifest_path.exists():
         return None
@@ -3728,8 +3956,11 @@ def _restore_cached_preview_without_decode(owner_id, final_id, generation_mode="
     if manifest is None:
         return None
 
-    requested_mode = "fl2va" if str(generation_mode or "ref2va").lower() == "fl2va" else "ref2va"
-    cached_mode = "fl2va" if str(manifest.get("sequence_mode") or "ref2va").lower() == "fl2va" else "ref2va"
+    cached_sequence = str(manifest.get("sequence_mode") or "ref2va").lower()
+    cached_mode = (
+        "fl2va" if cached_sequence == "fl2va"
+        else ("ref2va_independent" if cached_sequence == "ref2va_independent" else "ref2va")
+    )
     if cached_mode != requested_mode:
         _LOG.warning(
             "H3 restore preview refused mode mismatch: requested=%s cached=%s owner=%s",
@@ -3870,32 +4101,125 @@ if web is not None and PromptServer is not None and getattr(PromptServer, "insta
             _LOG.exception("H3 full-batch interrupt request failed")
             return web.json_response({"ok": False, "error": str(exc)}, status=500)
 
+    @PromptServer.instance.routes.post("/h3_extender/bootstrap_ref2va_motion_cache")
+    async def h3_extender_bootstrap_ref2va_motion_cache(request):
+        """Clone already-rendered Ref2VA cache when switching Motion ON/OFF."""
+        try:
+            body = await request.json()
+            owner_id = str(body.get("owner_id") or "").strip()
+            generation_mode = str(body.get("generation_mode") or "ref2va").lower().strip()
+            source_motion = _request_bool(body.get("source_motion_context"), True)
+            target_motion = _request_bool(body.get("target_motion_context"), True)
+            clip_entries = body.get("clips") or []
+            if not owner_id:
+                return web.json_response({"ok": False, "error": "Missing owner id."}, status=400)
+            if generation_mode != "ref2va":
+                return web.json_response({"ok": True, "bootstrapped": False, "found": False, "reason": "unsupported_mode"})
+            if bool(source_motion) == bool(target_motion):
+                return web.json_response({"ok": True, "bootstrapped": False, "found": False, "reason": "same_mode"})
+
+            source_owner = _extender_cache_owner_id(owner_id, "ref2va", source_motion)
+            target_owner = _extender_cache_owner_id(owner_id, "ref2va", target_motion)
+            source_data, source_manifest_path = _chain_paths(source_owner)
+            target_data, target_manifest_path = _chain_paths(target_owner)
+
+            # ON -> OFF is a one-way handoff of the CURRENT causal timeline.
+            # Any older independent cache belongs to a previous OFF branch and
+            # must not be resurrected.  Let _replace_cache_transaction() replace
+            # it transactionally after the source cache has been validated.
+            replace_existing_target = bool(source_motion) and not bool(target_motion)
+            if (
+                target_data.exists()
+                and target_manifest_path.exists()
+                and not replace_existing_target
+            ):
+                return web.json_response({"ok": True, "bootstrapped": False, "found": True, "reason": "target_exists"})
+            if not source_data.exists() or not source_manifest_path.exists():
+                return web.json_response({"ok": True, "bootstrapped": False, "found": False, "reason": "source_missing"})
+
+            source_manifest = _load_manifest_from_paths(source_data, source_manifest_path)
+            if source_manifest is None:
+                return web.json_response({"ok": True, "bootstrapped": False, "found": False, "reason": "source_invalid"})
+
+            normalized_manifest = _bootstrap_ref2va_manifest(
+                source_manifest,
+                "ref2va" if target_motion else "ref2va_independent",
+                clip_entries,
+            )
+
+            token = uuid.uuid4().hex[:10]
+            staged_manifest = source_manifest_path.with_name(source_manifest_path.name + f".bootstrap_manifest_{token}.tmp")
+            _write_json_atomic(staged_manifest, normalized_manifest)
+            staged_data = _copy_path_to_temp(source_data, suffix=".tmp")
+            staged_preview = _copy_path_to_temp(_decoded_preview_cache_path(source_data), suffix=".tmp")
+            staged_audio = _copy_path_to_temp(_decoded_audio_cache_path(source_data), suffix=".tmp")
+            staged_final_dir = None
+            if source_motion and not target_motion:
+                # Motion ON -> OFF needs a layout conversion, not a raw folder
+                # copy: causal caches are positional/embedded while independent
+                # Ref2VA looks them up by stable clip ID.
+                staged_final_dir = _bootstrap_ref2va_motion_on_to_independent_video_dir(
+                    source_data, normalized_manifest
+                )
+                # The helper may add random-access-only final cache metadata.
+                _write_json_atomic(staged_manifest, normalized_manifest)
+            else:
+                for candidate in (source_data.with_suffix(".final.video"), source_data.with_suffix(".fl2va.video")):
+                    if candidate.exists():
+                        staged_final_dir = _copy_path_to_temp(candidate, suffix=".tmp")
+                        break
+
+            from .extender import _replace_cache_transaction
+            _replace_cache_transaction(
+                owner_id,
+                staged_data,
+                staged_manifest,
+                staged_preview,
+                staged_audio,
+                staged_final_dir,
+                generation_mode="ref2va",
+                motion_context=target_motion,
+            )
+            if staged_final_dir is not None:
+                shutil.rmtree(staged_final_dir, ignore_errors=True)
+            validated_count = (
+                _validated_prefix_count(normalized_manifest.get("segments", []))
+                if target_motion
+                else sum(bool(x.get("validated", False)) for x in normalized_manifest.get("segments", []))
+            )
+            return web.json_response({
+                "ok": True,
+                "bootstrapped": True,
+                "found": True,
+                "cached_count": int(len(normalized_manifest.get("segments", []))),
+                "validated_count": int(validated_count),
+            })
+        except Exception as exc:
+            _LOG.exception("H3 Ref2VA motion-toggle cache bootstrap failed")
+            return web.json_response({"ok": False, "error": str(exc)}, status=500)
+
     @PromptServer.instance.routes.post("/h3_extender/local_ref_invalidate")
     async def h3_extender_local_ref_invalidate(request):
-        """Persist clip invalidation caused by a clip-local reference edit.
+        """Persist validation state changes that must survive cache restore.
 
-        Local refs live in clips_json, but cache_state is restored from the disk
-        manifest after a browser refresh. Keep the manifest validation flags in
-        sync immediately so F5 cannot resurrect validations that the local-ref
-        edit already cleared in the serialized card state.
+        Local refs still use this route to invalidate clips. Both Ref2VA modes
+        also use it for explicit manual Validated on/off changes because their
+        disk manifests are authoritative after a browser refresh. FL2VA keeps
+        the historical invalidation-only behavior.
         """
         try:
             body = await request.json()
             owner_id = str(body.get("owner_id") or "").strip()
             generation_mode = str(body.get("generation_mode") or "ref2va").lower()
+            motion_context = _request_bool(body.get("motion_context"), True)
+            runtime_mode = _extender_runtime_mode(generation_mode, motion_context)
             clip_index = int(body.get("clip_index", -1))
             clip_id = str(body.get("clip_id") or "").strip()
+            requested_validated = _request_bool(body.get("validated"), False)
             if not owner_id:
                 return web.json_response({"ok": False, "error": "Missing owner id."}, status=400)
 
-            if generation_mode == "fl2va":
-                # Local clip refs are currently Ref2VA-only, but keep this route
-                # harmless if a future UI calls it for FL2VA.
-                from .fl2va_engine import cache_owner_id
-                cache_owner = cache_owner_id(owner_id)
-            else:
-                cache_owner = f"extender_{_safe_name(owner_id)}"
-
+            cache_owner = _extender_cache_owner_id(owner_id, generation_mode, motion_context)
             data_path, manifest_path = _chain_paths(cache_owner)
             manifest = _load_manifest_from_paths(data_path, manifest_path)
             if manifest is None:
@@ -3904,7 +4228,16 @@ if web is not None and PromptServer is not None and getattr(PromptServer, "insta
                 return web.json_response({"ok": True, "found": False})
 
             segments = [dict(x) for x in manifest.get("segments", [])]
-            if generation_mode == "fl2va":
+            if runtime_mode == "ref2va_independent":
+                target = None
+                if clip_id:
+                    target = next((x for x in segments if str(x.get("clip_id") or "") == clip_id), None)
+                elif 0 <= clip_index < len(segments):
+                    target = segments[clip_index]
+                if target is not None:
+                    target["validated"] = bool(requested_validated)
+            elif runtime_mode == "fl2va":
+                # Preserve the historical FL2VA route behavior.
                 if clip_id:
                     started = False
                     for desc in segments:
@@ -3915,10 +4248,38 @@ if web is not None and PromptServer is not None and getattr(PromptServer, "insta
                 elif 0 <= clip_index < len(segments):
                     segments[clip_index]["validated"] = False
             else:
-                if clip_index < 0:
+                # Ref2VA Motion ON is causal: validation is a contiguous prefix.
+                # Manual unvalidation clears the selected clip and everything
+                # after it. Manual validation may only extend the existing
+                # validated prefix by the selected cached segment.
+                if clip_index < 0 or clip_index >= len(segments):
                     return web.json_response({"ok": False, "error": "Invalid clip index."}, status=400)
-                for i in range(min(clip_index, len(segments)), len(segments)):
-                    segments[i]["validated"] = False
+                if requested_validated:
+                    if any(not bool(segments[i].get("validated", False)) for i in range(clip_index)):
+                        return web.json_response({
+                            "ok": False,
+                            "error": "Ref2VA Motion Context validation must remain a contiguous prefix.",
+                        }, status=400)
+                    segments[clip_index]["validated"] = True
+                    # Validating an interrupted Full-Batch candidate commits that
+                    # exact clip. Its transient COMPUTED checkpoint must not stay
+                    # hidden under Validated and reappear after a later unvalidate.
+                    segments[clip_index].pop("computed", None)
+                    # Never allow a stale true flag beyond the first open clip.
+                    open_prefix = False
+                    for i, desc in enumerate(segments):
+                        if open_prefix:
+                            desc["validated"] = False
+                        elif not bool(desc.get("validated", False)):
+                            open_prefix = True
+                else:
+                    for i in range(clip_index, len(segments)):
+                        segments[i]["validated"] = False
+                        # Motion Context is causal. Once clip N is explicitly
+                        # invalidated, no interrupted checkpoint at N or later is
+                        # reusable/truthful anymore, even though its cache files
+                        # may remain on disk for preview/history purposes.
+                        segments[i].pop("computed", None)
 
             manifest = dict(manifest)
             manifest["segments"] = segments
@@ -3929,12 +4290,12 @@ if web is not None and PromptServer is not None and getattr(PromptServer, "insta
                 "found": True,
                 "validated_count": int(
                     sum(bool(x.get("validated", False)) for x in segments)
-                    if generation_mode == "fl2va"
+                    if runtime_mode in {"fl2va", "ref2va_independent"}
                     else _validated_prefix_count(segments)
                 ),
             })
         except Exception as exc:
-            _LOG.exception("H3 local-ref validation invalidation failed")
+            _LOG.exception("H3 validation persistence failed")
             return web.json_response({"ok": False, "error": str(exc)}, status=500)
 
     @PromptServer.instance.routes.post("/h3_extender/discard_computed")
@@ -3952,10 +4313,57 @@ if web is not None and PromptServer is not None and getattr(PromptServer, "insta
             body = await request.json()
             owner_id = str(body.get("owner_id") or "").strip()
             generation_mode = str(body.get("generation_mode") or "ref2va").lower()
+            motion_context = _request_bool(body.get("motion_context"), True)
+            runtime_mode = _extender_runtime_mode(generation_mode, motion_context)
             if not owner_id:
                 return web.json_response({"ok": False, "error": "Missing owner id."}, status=400)
 
-            if generation_mode == "fl2va":
+            if runtime_mode == "ref2va_independent":
+                clip_id = str(body.get("clip_id") or "").strip()
+                clip_ids = [str(x) for x in (body.get("clip_ids") or []) if str(x)]
+                if not clip_id or not clip_ids:
+                    return web.json_response({"ok": False, "error": "Missing independent Ref2VA clip id/order."}, status=400)
+                from .ref2va_independent import cache_owner_id, drop_cached_ids
+                cache_owner = cache_owner_id(owner_id)
+                data_path, manifest_path = _chain_paths(cache_owner)
+                manifest = _load_manifest_from_paths(data_path, manifest_path)
+                if manifest is None:
+                    return web.json_response({"ok": False, "error": "No independent Ref2VA cache found."}, status=404)
+                target = next(
+                    (dict(x) for x in manifest.get("segments", []) if str(x.get("clip_id") or "") == clip_id),
+                    None,
+                )
+                if target is None or not bool(target.get("computed", False)) or bool(target.get("validated", False)):
+                    return web.json_response({"ok": False, "error": "This independent Ref2VA clip is not a discardable computed checkpoint."}, status=400)
+                data_path, manifest_path, manifest = drop_cached_ids(
+                    owner_id, float(manifest.get("fps", FPS)), clip_ids, [clip_id], preserve_preview=True
+                )
+                segments = [dict(x) for x in manifest.get("segments", [])]
+                validated_clip_ids = [
+                    str(x.get("clip_id")) for x in segments
+                    if str(x.get("clip_id") or "") and bool(x.get("validated", False))
+                ]
+                computed_clip_ids = [
+                    str(x.get("clip_id")) for x in segments
+                    if str(x.get("clip_id") or "") and bool(x.get("computed", False)) and not bool(x.get("validated", False))
+                ]
+                return web.json_response({
+                    "ok": True,
+                    "generation_mode": "ref2va",
+                    "motion_context": False,
+                    "cached_count": len(segments),
+                    "validated_count": len(validated_clip_ids),
+                    "cached_clip_ids": [str(x.get("clip_id")) for x in segments if str(x.get("clip_id") or "")],
+                    "validated_clip_ids": validated_clip_ids,
+                    "computed_clip_ids": computed_clip_ids,
+                    "computed_indices": [],
+                    "discarded_clip_ids": [clip_id],
+                    "checkpoint_active": bool(manifest.get("batch_in_progress", False) or manifest.get("batch_interrupted", False)),
+                    "checkpoint_interrupted": bool(manifest.get("batch_interrupted", False)),
+                    "checkpoint_snapshot_count": int(manifest.get("batch_snapshot_count", 0) or 0),
+                })
+
+            if runtime_mode == "fl2va":
                 clip_id = str(body.get("clip_id") or "").strip()
                 clip_ids = [str(x) for x in (body.get("clip_ids") or []) if str(x)]
                 if not clip_id or not clip_ids:
@@ -4078,16 +4486,17 @@ if web is not None and PromptServer is not None and getattr(PromptServer, "insta
         try:
             idx = int(clip_index)
             generation_mode = str(request.query.get("mode") or "ref2va").lower()
-            if generation_mode == "fl2va":
-                from .fl2va_engine import cache_owner_id
-                cache_owner = cache_owner_id(owner_id)
-            else:
-                cache_owner = f"extender_{_safe_name(owner_id)}"
+            motion_context = _request_bool(request.query.get("motion_context"), True)
+            runtime_mode = _extender_runtime_mode(generation_mode, motion_context)
+            clip_id = str(request.query.get("clip_id") or "").strip()
+            cache_owner = _extender_cache_owner_id(owner_id, generation_mode, motion_context)
             data_path, manifest_path = _chain_paths(cache_owner)
             manifest = _load_manifest_from_paths(data_path, manifest_path)
             if manifest is None:
                 return web.json_response({"ok": False, "error": "No cached H3 sequence found."}, status=404)
             segments = [dict(x) for x in manifest.get("segments", [])]
+            if runtime_mode in {"fl2va", "ref2va_independent"} and clip_id:
+                idx = next((i for i, x in enumerate(segments) if str(x.get("clip_id") or "") == clip_id), -1)
             if idx < 0 or idx >= len(segments):
                 return web.json_response({"ok": False, "error": "This clip has not been rendered yet."}, status=400)
             preview_path = _latest_preview_temp_path(final_id)
@@ -4117,16 +4526,17 @@ if web is not None and PromptServer is not None and getattr(PromptServer, "insta
             if not owner_id:
                 return web.json_response({"ok": False, "error": "Missing owner id."}, status=400)
             generation_mode = str(body.get("generation_mode") or "ref2va").lower()
-            if generation_mode == "fl2va":
-                from .fl2va_engine import cache_owner_id
-                cache_owner = cache_owner_id(owner_id)
-            else:
-                cache_owner = f"extender_{_safe_name(owner_id)}"
+            motion_context = _request_bool(body.get("motion_context"), True)
+            runtime_mode = _extender_runtime_mode(generation_mode, motion_context)
+            clip_id = str(body.get("clip_id") or "").strip()
+            cache_owner = _extender_cache_owner_id(owner_id, generation_mode, motion_context)
             data_path, manifest_path = _chain_paths(cache_owner)
             manifest = _load_manifest_from_paths(data_path, manifest_path)
             if manifest is None:
                 return web.json_response({"ok": False, "error": "No cached H3 sequence found."}, status=404)
             segments = [dict(x) for x in manifest.get("segments", [])]
+            if runtime_mode in {"fl2va", "ref2va_independent"} and clip_id:
+                idx = next((i for i, x in enumerate(segments) if str(x.get("clip_id") or "") == clip_id), -1)
             if idx < 0 or idx >= len(segments):
                 return web.json_response({"ok": False, "error": "This clip has not been rendered yet."}, status=400)
             adjustment = _normalize_color_adjustment(body.get("adjustment"))
@@ -4188,11 +4598,8 @@ if web is not None and PromptServer is not None and getattr(PromptServer, "insta
             if owner_id:
                 try:
                     generation_mode = str(body.get("generation_mode") or "ref2va").lower()
-                    if generation_mode == "fl2va":
-                        from .fl2va_engine import cache_owner_id
-                        cache_owner = cache_owner_id(owner_id)
-                    else:
-                        cache_owner = f"extender_{_safe_name(owner_id)}"
+                    motion_context = _request_bool(body.get("motion_context"), True)
+                    cache_owner = _extender_cache_owner_id(owner_id, generation_mode, motion_context)
                     data_path, manifest_path = _chain_paths(cache_owner)
                     manifest = _load_manifest_from_paths(data_path, manifest_path)
                     if manifest is not None:
@@ -4226,11 +4633,9 @@ if web is not None and PromptServer is not None and getattr(PromptServer, "insta
 
         try:
             generation_mode = str(request.query.get("mode") or "ref2va").lower()
-            if generation_mode == "fl2va":
-                from .fl2va_engine import cache_owner_id
-                cache_owner = cache_owner_id(owner_id)
-            else:
-                cache_owner = f"extender_{_safe_name(owner_id)}"
+            motion_context = _request_bool(request.query.get("motion_context"), True)
+            runtime_mode = _extender_runtime_mode(generation_mode, motion_context)
+            cache_owner = _extender_cache_owner_id(owner_id, generation_mode, motion_context)
             data_path, manifest_path = _chain_paths(cache_owner)
             if not data_path.exists() or not manifest_path.exists():
                 return web.json_response({"found": False})
@@ -4240,10 +4645,13 @@ if web is not None and PromptServer is not None and getattr(PromptServer, "insta
                 return web.json_response({"found": False})
 
             segments = [dict(x) for x in manifest.get("segments", [])]
-            is_fl2va = str(manifest.get("sequence_mode") or generation_mode).lower() == "fl2va"
+            sequence_mode = str(manifest.get("sequence_mode") or runtime_mode).lower()
+            is_fl2va = sequence_mode == "fl2va"
+            is_independent = sequence_mode == "ref2va_independent"
+            is_random_access = is_fl2va or is_independent
             validated_count = (
                 sum(bool(x.get("validated", False)) for x in segments)
-                if is_fl2va else _validated_prefix_count(segments)
+                if is_random_access else _validated_prefix_count(segments)
             )
             geometry = manifest.get("geometry") if isinstance(manifest.get("geometry"), dict) else {}
             resolved_width = int(geometry.get("video_w", 0) or 0) * 16
@@ -4263,10 +4671,19 @@ if web is not None and PromptServer is not None and getattr(PromptServer, "insta
             return web.json_response({
                 "found": True,
                 "generation_mode": "fl2va" if is_fl2va else "ref2va",
+                "motion_context": False if is_independent else True,
                 "cached_count": int(len(segments)),
                 "validated_count": int(validated_count),
-                "cached_clip_ids": [str(x.get("clip_id")) for x in segments if str(x.get("clip_id") or "")],
-                "validated_clip_ids": [str(x.get("clip_id")) for x in segments if str(x.get("clip_id") or "") and bool(x.get("validated", False))],
+                "cached_clip_ids": (
+                    [str(x.get("clip_id")) for x in segments if str(x.get("clip_id") or "")]
+                    if is_random_access
+                    else [str(x) for x in list(manifest.get("extender_clip_ids") or [])[:len(segments)] if str(x)]
+                ),
+                "validated_clip_ids": (
+                    [str(x.get("clip_id")) for x in segments if str(x.get("clip_id") or "") and bool(x.get("validated", False))]
+                    if is_random_access
+                    else [str(x) for x in list(manifest.get("extender_clip_ids") or [])[:int(validated_count)] if str(x)]
+                ),
                 "continuity_signatures": continuity_signatures,
                 "computed_indices": computed_indices,
                 "computed_clip_ids": computed_clip_ids,
@@ -4300,7 +4717,8 @@ if web is not None and PromptServer is not None and getattr(PromptServer, "insta
 
         try:
             generation_mode = str(request.query.get("mode") or "ref2va").lower()
-            restored = _restore_cached_preview_without_decode(owner_id, final_id, generation_mode)
+            motion_context = _request_bool(request.query.get("motion_context"), True)
+            restored = _restore_cached_preview_without_decode(owner_id, final_id, generation_mode, motion_context)
             if restored is None:
                 return web.json_response({"found": False})
 
@@ -4309,11 +4727,7 @@ if web is not None and PromptServer is not None and getattr(PromptServer, "insta
                 restored["fps"],
                 "temp",
             )
-            if generation_mode == "fl2va":
-                from .fl2va_engine import cache_owner_id
-                cache_owner = cache_owner_id(owner_id)
-            else:
-                cache_owner = f"extender_{_safe_name(owner_id)}"
+            cache_owner = _extender_cache_owner_id(owner_id, generation_mode, motion_context)
             data_path, manifest_path = _chain_paths(cache_owner)
             manifest = _load_manifest_from_paths(data_path, manifest_path)
             restored_segments = list(manifest.get("segments", []) if manifest else [])[:int(restored["clip_count"])]
@@ -4410,7 +4824,16 @@ class MiniMaxH3MotionContextDiskFinalDecode:
         if interrupted:
             snapshot_count = max(1, min(len(segments), snapshot_count))
             segments = segments[:snapshot_count]
-        if str(manifest.get("sequence_mode") or "ref2va").lower() == "fl2va":
+        sequence_mode = str(manifest.get("sequence_mode") or "ref2va").lower()
+        if sequence_mode == "ref2va_independent":
+            from .ref2va_independent import export_final as export_ref2va_independent_final
+            return export_ref2va_independent_final(
+                cache=cache, vae=vae, audio_vae=audio_vae, fps=fps,
+                filename_prefix=filename_prefix, output_directory=output_directory,
+                codec=codec, crf=crf, preset=preset, audio_bitrate=audio_bitrate,
+                unique_id=unique_id, workflow=workflow, prompt=prompt,
+            )
+        if sequence_mode == "fl2va":
             from .fl2va_engine import export_fl2va_final
             return export_fl2va_final(
                 cache=cache, vae=vae, audio_vae=audio_vae, fps=fps,

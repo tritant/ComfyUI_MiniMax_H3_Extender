@@ -637,6 +637,7 @@ def _ensure_plan_video_cache(
     final_export_profile=None,
     final_color_adjustment=None,
     final_handoff_enabled=False,
+    require_continuity=True,
 ):
     """Ensure one FL2VA plan's preview and optional exact-final cache.
 
@@ -653,6 +654,11 @@ def _ensure_plan_video_cache(
         and last_target.stat().st_size > 0
         and _load_plan_continuity_meta(data_path, clip_id) is not None
     )
+    # FL2VA may need the selected handoff frame for Previous-linked plans.
+    # Independent Ref2VA (Motion Context OFF) never chains clips together, so a
+    # missing continuity sidecar must not force a VideoVAE decode of an otherwise
+    # complete COMPUTED checkpoint after Save/Load.
+    continuity_ok = bool(continuity_ready) or not bool(require_continuity)
 
     profile = (
         d.normalize_full_batch_export_profile(final_export_profile)
@@ -667,7 +673,7 @@ def _ensure_plan_video_cache(
     final_path = None
     final_ready = profile is None
     visible_frames = None
-    if profile is not None and continuity_ready:
+    if profile is not None and continuity_ok:
         visible_frames = _visible_frames_for_plan(
             data_path, desc, handoff_enabled=bool(final_handoff_enabled)
         )
@@ -676,19 +682,21 @@ def _ensure_plan_video_cache(
             desc, profile, adjustment, final_path, visible_frames=visible_frames
         )
 
-    if video_ready and continuity_ready and final_ready:
+    if video_ready and continuity_ok and final_ready:
         return target, False
 
     temp = target.with_name(target.stem + f".tmp_{os.urandom(4).hex()}.mp4")
     v = None
     decoded = None
+    plan_decoded = None
     try:
         d._LOG.info(
-            "FL2VA incremental cache repair: decoding plan %d only "
-            "(preview=%s continuity=%s final=%s)",
+            "H3 random-access incremental cache repair: decoding plan %d only "
+            "(preview=%s continuity=%s continuity_required=%s final=%s)",
             int(desc.get("index", 0)) + 1,
             bool(video_ready),
             bool(continuity_ready),
+            bool(require_continuity),
             bool(final_ready),
         )
         v = d._load_segment_video(data_path, desc)
@@ -697,18 +705,32 @@ def _ensure_plan_video_cache(
             progress.advance()
         if decoded.ndim == 5:
             decoded = decoded.reshape(-1, decoded.shape[-3], decoded.shape[-2], decoded.shape[-1])
-        _save_plan_last_frame_cache(data_path, clip_id, decoded)
-        continuity_ready = True
-        wanted = int(desc.get("frames", 0))
-        if int(decoded.shape[0]) != wanted:
+
+        source_frames = int(desc.get("source_frames", desc.get("frames", 0)) or 0)
+        plan_frames = int(desc.get("frames", source_frames) or source_frames)
+        visible_offset = int(desc.get("visible_offset", 0) or 0)
+        if source_frames <= 0 or plan_frames <= 0 or visible_offset < 0:
+            raise RuntimeError("H3 random-access cache repair: invalid source/visible frame geometry.")
+        if int(decoded.shape[0]) != source_frames:
             raise RuntimeError(
                 f"FL2VA preview cache: clip {int(desc.get('index', 0)) + 1} returned "
-                f"{decoded.shape[0]} frames, expected {wanted}."
+                f"{decoded.shape[0]} frames, expected source {source_frames}."
             )
+        visible_end = int(visible_offset + plan_frames)
+        if visible_end > int(decoded.shape[0]):
+            raise RuntimeError(
+                f"H3 random-access cache repair: clip {int(desc.get('index', 0)) + 1} "
+                f"visible window {visible_offset}:{visible_end} exceeds decoded "
+                f"source length {decoded.shape[0]}."
+            )
+        plan_decoded = decoded[visible_offset:visible_end]
+
+        _save_plan_last_frame_cache(data_path, clip_id, plan_decoded)
+        continuity_ready = True
         if not video_ready:
             d._encode_corrected_segment_video_mp4(
                 ffmpeg,
-                decoded,
+                plan_decoded,
                 fps,
                 temp,
                 f"fl2va_{clip_id}_{os.urandom(3).hex()}",
@@ -734,7 +756,7 @@ def _ensure_plan_video_cache(
                 try:
                     d._encode_final_segment_video(
                         ffmpeg,
-                        decoded[:int(visible_frames)],
+                        plan_decoded[:int(visible_frames)],
                         float(fps),
                         final_temp,
                         f"fl2va_final_{clip_id}_{os.urandom(3).hex()}",
@@ -753,6 +775,8 @@ def _ensure_plan_video_cache(
             temp.unlink(missing_ok=True)
         except OSError:
             pass
+        if plan_decoded is not None:
+            del plan_decoded
         if decoded is not None:
             del decoded
         if v is not None:
@@ -1532,6 +1556,7 @@ def export_fl2va_final(
     unique_id=None,
     workflow=None,
     prompt=None,
+    require_continuity=True,
 ):
     """Decode FL2VA plans as independent hard cuts.
 
@@ -1599,6 +1624,7 @@ def export_fl2va_final(
                 final_export_profile=clip_by_clip_export_profile,
                 final_color_adjustment=adjustment,
                 final_handoff_enabled=handoff_enabled,
+                require_continuity=bool(require_continuity),
             )
 
             # Persist the identity of the exact-final sidecar created from the
@@ -1747,6 +1773,7 @@ def export_fl2va_final(
             final_export_profile=export_profile,
             final_color_adjustment=adjustment,
             final_handoff_enabled=handoff_enabled,
+            require_continuity=bool(require_continuity),
         )
 
         # The helper may have decoded/rebuilt this plan only. Once the exact
