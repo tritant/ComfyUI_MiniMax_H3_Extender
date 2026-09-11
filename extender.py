@@ -100,7 +100,7 @@ from .ref2va_independent import (
     run as _run_ref2va_independent,
 )
 
-BUILD = "minimax-h3-extender-v2.7.1"
+BUILD = "minimax-h3-extender-v2.7.2"
 _LOG = logging.getLogger(__name__)
 FPS = 24
 AUDIO_LATENT_FPS = 40
@@ -1179,9 +1179,9 @@ def _audio_duration_seconds(audio):
 def _slice_ref_audio(audio, start_seconds: float, duration_seconds: float, label: str, require_full: bool):
     """Return an AUDIO payload cropped before Audio-VAE encoding.
 
-    Long standalone references use require_full=True so every clip gets exactly
-    its own sequential timeline window. Video soundtracks use require_full=False
-    because container audio can be a few samples shorter than the video stream.
+    require_full=True is available for callers that need exact source coverage.
+    Standalone timeline refs and video soundtracks use require_full=False so a
+    source may end naturally inside the requested window.
     """
     if not isinstance(audio, dict) or "waveform" not in audio:
         raise ValueError(f"MiniMax H3 Extender: {label} is not a valid AUDIO payload.")
@@ -1276,14 +1276,19 @@ def _prepare_standalone_audio_refs(
         timeline_mode = source_duration > REF_AUDIO_TIMELINE_SPLIT_SECONDS + 1e-6
 
         if timeline_mode:
-            if clip_duration_seconds > MAX_REF_AUDIO_SECONDS + 1e-6:
-                raise ValueError(
-                    f"MiniMax H3 Extender: {label} cannot cover this clip as one H3 audio reference: "
-                    f"effective clip duration is {clip_duration_seconds:.3f}s, above the {MAX_REF_AUDIO_SECONDS:.0f}s reference-audio limit."
-                )
             start = float(clip_start_offsets.get(slot, 0.0)) if clip_start_offsets is not None else default_clip_start
-            duration = clip_duration_seconds
-            sliced = _slice_ref_audio(audio, start, duration, label, require_full=True)
+            remaining = max(0.0, source_duration - start)
+
+            # A timeline ref is allowed to end inside the current clip. Use the
+            # available tail instead of requiring the source to cover the whole
+            # generated clip. Once less than H3's minimum usable reference-audio
+            # duration remains, this logical Audio slot is simply absent for the
+            # current/subsequent clips; the timeline is never looped or restarted.
+            if remaining + 1e-6 < MIN_REF_AUDIO_SECONDS:
+                continue
+
+            duration = min(clip_duration_seconds, remaining, MAX_REF_AUDIO_SECONDS)
+            sliced = _slice_ref_audio(audio, start, duration, label, require_full=False)
         else:
             # Preserve classic short-reference behavior across every clip, but
             # never feed more audio than the current generated clip requires.
