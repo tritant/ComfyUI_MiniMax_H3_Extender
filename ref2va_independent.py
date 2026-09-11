@@ -904,7 +904,7 @@ def run(
                 raise ValueError(
                     "MiniMax H3 Extender: standalone reference audio requires at least one image or video reference."
                 )
-            audio_items, audio_blocks = e._prepare_standalone_audio_refs(
+            audio_items, audio_blocks, selected_audio_slots = e._prepare_standalone_audio_refs(
                 audio_vae,
                 selected_ref_audios,
                 selected_audio_offsets,

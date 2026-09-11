@@ -1242,11 +1242,10 @@ def _prepare_standalone_audio_refs(
 ):
     """Build per-clip standalone audio refs without reusing illegal long audio.
 
-    Short refs (<=5s) remain reusable references: they start at 0 for every
-    clip and are cropped to the current clip duration when useful. A source
-    longer than 5s is treated as a timeline and automatically advanced by the
-    cumulative H3-aligned duration of preceding cards that selected the same
-    logical Audio slot.
+    Reusable refs start at 0 for every clip. A source is treated as a timeline
+    only when it is longer than both the 5s split threshold and the current
+    H3-aligned clip duration; timeline refs advance by the cumulative duration
+    of preceding cards that selected the same logical Audio slot.
     """
     active = [
         (slot, audio)
@@ -1254,7 +1253,7 @@ def _prepare_standalone_audio_refs(
         if audio is not None
     ]
     if not active:
-        return [], []
+        return [], [], []
     if audio_vae is None:
         raise ValueError(
             "MiniMax H3 Extender: standalone audio reference inputs are connected but audio_vae is not. "
@@ -1273,9 +1272,20 @@ def _prepare_standalone_audio_refs(
     for slot, audio in active:
         label = f"ref_audio_{slot}"
         source_duration = _audio_duration_seconds(audio)
-        timeline_mode = source_duration > REF_AUDIO_TIMELINE_SPLIT_SECONDS + 1e-6
+        timeline_mode = source_duration > max(
+            REF_AUDIO_TIMELINE_SPLIT_SECONDS,
+            clip_duration_seconds,
+        ) + 1e-6
 
         if timeline_mode:
+            # A true timeline must fit inside H3's per-reference 15s limit for
+            # each card. Silently consuming only the first 15s while advancing
+            # by a longer card duration would skip source audio between clips.
+            if clip_duration_seconds > MAX_REF_AUDIO_SECONDS + 1e-6:
+                raise ValueError(
+                    f"MiniMax H3 Extender: {label} cannot cover this clip as one H3 audio reference: "
+                    f"effective clip duration is {clip_duration_seconds:.3f}s, above the {MAX_REF_AUDIO_SECONDS:.0f}s reference-audio limit."
+                )
             start = float(clip_start_offsets.get(slot, 0.0)) if clip_start_offsets is not None else default_clip_start
             remaining = max(0.0, source_duration - start)
 
@@ -1284,7 +1294,8 @@ def _prepare_standalone_audio_refs(
             # generated clip. Once less than H3's minimum usable reference-audio
             # duration remains, this logical Audio slot is simply absent for the
             # current/subsequent clips; the timeline is never looped or restarted.
-            if remaining + 1e-6 < MIN_REF_AUDIO_SECONDS:
+            # Keep a small margin for sample-index rounding in _slice_ref_audio.
+            if remaining < MIN_REF_AUDIO_SECONDS + 1e-3:
                 continue
 
             duration = min(clip_duration_seconds, remaining, MAX_REF_AUDIO_SECONDS)
@@ -1342,7 +1353,7 @@ def _prepare_standalone_audio_refs(
                 "audio_latent": audio_latent,
             }
         )
-    return ref_items, ref_blocks
+    return ref_items, ref_blocks, [int(slot) for slot, *_ in prepared]
 
 
 _AUDIO_TAG_RE = re.compile(r"<Audio\s+(\d+)>", re.IGNORECASE)
@@ -4995,7 +5006,7 @@ class MiniMaxH3Extender:
                     raise ValueError(
                         "MiniMax H3 Extender: standalone reference audio requires at least one image or video reference."
                     )
-                audio_items, audio_blocks = _prepare_standalone_audio_refs(
+                audio_items, audio_blocks, selected_audio_slots = _prepare_standalone_audio_refs(
                     audio_vae,
                     selected_ref_audios,
                     selected_audio_offsets,
