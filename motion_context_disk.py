@@ -61,7 +61,7 @@ from .motion_context_ram import (
     _streams_from_latent,
 )
 
-BUILD = "motion-context-disk-v2.7.2"
+BUILD = "motion-context-disk-v2.7.3"
 PREVIEW_AUDIO_MODE = "pcm_single_aac_gain_chain_v3_entry_ramp"
 CACHE_VERSION = 12
 PREVIEW_ROTATION_SLOTS = 3
@@ -4204,8 +4204,9 @@ if web is not None and PromptServer is not None and getattr(PromptServer, "insta
 
         Local refs still use this route to invalidate clips. Both Ref2VA modes
         also use it for explicit manual Validated on/off changes because their
-        disk manifests are authoritative after a browser refresh. FL2VA keeps
-        the historical invalidation-only behavior.
+        disk manifests are authoritative after a browser refresh. FL2VA persists
+        the same manual state and propagates invalidation only through explicit
+        Previous-linked followers.
         """
         try:
             body = await request.json()
@@ -4237,16 +4238,34 @@ if web is not None and PromptServer is not None and getattr(PromptServer, "insta
                 if target is not None:
                     target["validated"] = bool(requested_validated)
             elif runtime_mode == "fl2va":
-                # Preserve the historical FL2VA route behavior.
+                # FL2VA validation is random-access except for explicit Previous
+                # dependencies. Persist the exact manual checkbox state. When an
+                # upstream plan is invalidated, only the consecutive Previous
+                # followers reported by the current UI state are invalidated too;
+                # the first manual follower remains independent. Consuming
+                # COMPUTED here prevents an interrupted checkpoint from silently
+                # resurrecting after an explicit manual validation change.
+                target = None
                 if clip_id:
-                    started = False
-                    for desc in segments:
-                        if str(desc.get("clip_id") or "") == clip_id:
-                            started = True
-                        if started:
-                            desc["validated"] = False
+                    target = next(
+                        (x for x in segments if str(x.get("clip_id") or "") == clip_id),
+                        None,
+                    )
                 elif 0 <= clip_index < len(segments):
-                    segments[clip_index]["validated"] = False
+                    target = segments[clip_index]
+                if target is not None:
+                    if requested_validated:
+                        target["validated"] = True
+                        target.pop("computed", None)
+                    else:
+                        invalidate_ids = {str(target.get("clip_id") or "")}
+                        invalidate_ids.update(
+                            str(x) for x in (body.get("dependent_clip_ids") or []) if str(x)
+                        )
+                        for desc in segments:
+                            if str(desc.get("clip_id") or "") in invalidate_ids:
+                                desc["validated"] = False
+                                desc.pop("computed", None)
             else:
                 # Ref2VA Motion ON is causal: validation is a contiguous prefix.
                 # Manual unvalidation clears the selected clip and everything
