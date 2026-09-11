@@ -4614,6 +4614,22 @@ function render(node, runtime) {
         const prompt = document.createElement("textarea");
         prompt.value = clip.prompt;
         prompt.spellcheck = false;
+        // Nodes 2.0 uses the wheel over the canvas for graph zoom. Mark only
+        // the prompt textarea as a wheel-capturing DOM control so scrolling
+        // inside a long prompt stays inside the prompt instead of zooming the graph.
+        prompt.dataset.captureWheel = "true";
+        prompt.addEventListener("mouseenter", () => {
+            const LG = globalThis.LiteGraph;
+            const nodes2 = typeof LG?.vueNodesMode === "boolean"
+                ? LG.vueNodesMode
+                : Boolean(prompt.closest?.(".lg-node-widget"));
+            if (!nodes2 || document.activeElement === prompt) return;
+            try {
+                prompt.focus({ preventScroll: true });
+            } catch (_) {
+                prompt.focus();
+            }
+        });
         prompt.style.width = "100%";
         // The prompt is the flexible section of the card. Keep a real minimum
         // but allow it to absorb extra height without pushing controls on top
