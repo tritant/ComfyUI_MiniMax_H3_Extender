@@ -408,6 +408,11 @@ async function persistLocalRefInvalidation(node, runtime, clipIndex, validatedSt
     const index = Number(clipIndex);
     if (!Number.isInteger(index) || index < 0) return false;
     const generationMode = String(runtime?.state?.generation_mode || "ref2va") === "fl2va" ? "fl2va" : "ref2va";
+    const fl2vaDependentClipIds = (generationMode === "fl2va" && !Boolean(validatedState))
+        ? fl2vaPreviousDependentIndices(runtime?.state, index)
+            .map((depIndex) => String(runtime?.state?.clips?.[depIndex]?.id || ""))
+            .filter(Boolean)
+        : [];
     try {
         const response = await fetch(api.apiURL("/h3_extender/local_ref_invalidate"), {
             method: "POST",
@@ -419,6 +424,7 @@ async function persistLocalRefInvalidation(node, runtime, clipIndex, validatedSt
                 clip_index: index,
                 clip_id: String(runtime?.state?.clips?.[index]?.id || ""),
                 validated: Boolean(validatedState),
+                dependent_clip_ids: fl2vaDependentClipIds,
             }),
         });
         const payload = await response.json().catch(() => ({}));
@@ -3862,6 +3868,17 @@ async function refreshFl2vaContinuitySignature(node, runtime, clipId) {
     }
 }
 
+function fl2vaPreviousDependentIndices(state, startIndex) {
+    const clips = state?.clips || [];
+    const start = Math.max(0, Number(startIndex) || 0);
+    const out = [];
+    for (let i = start + 1; i < clips.length; i++) {
+        if (String(clips[i]?.first_source || "manual") !== "previous_clip") break;
+        out.push(i);
+    }
+    return out;
+}
+
 function invalidateFl2vaPlanAndFollowers(runtime, startIndex, includeStart = true) {
     const clips = runtime?.state?.clips || [];
     let i = Math.max(0, Number(startIndex) || 0);
@@ -4826,7 +4843,13 @@ function render(node, runtime) {
         validated.checked = clip.validated;
         validated.addEventListener("change", async () => {
             const wasValidated = Boolean(clip.validated);
-            let persistRef2vaValidation = false;
+            let persistValidation = false;
+            const fl2vaValidationSnapshot = fl2vaMode ? {
+                validated: (state.clips || []).map((item) => Boolean(item?.validated)),
+                validatedClipIds: new Set(runtime.validatedClipIds || []),
+                computedClipIds: new Set(runtime.computedClipIds || []),
+                computedIndices: new Set(runtime.computedIndices || []),
+            } : null;
 
             if (randomAccess) {
                 // Random-access plans/clips validate independently, but a clip
@@ -4843,8 +4866,27 @@ function render(node, runtime) {
                 } else {
                     clip.validated = false;
                 }
-                if (independentRef2va && Boolean(clip.validated) !== wasValidated) {
-                    persistRef2vaValidation = true;
+                if (Boolean(clip.validated) !== wasValidated) {
+                    if (independentRef2va) {
+                        persistValidation = true;
+                    } else if (fl2vaMode) {
+                        persistValidation = true;
+                        if (!Boolean(clip.validated)) {
+                            const affected = [index, ...fl2vaPreviousDependentIndices(state, index)];
+                            for (const affectedIndex of affected) {
+                                const affectedClip = state.clips?.[affectedIndex];
+                                if (!affectedClip) continue;
+                                affectedClip.validated = false;
+                                const affectedId = String(affectedClip.id || "");
+                                if (affectedId) {
+                                    runtime.validatedClipIds?.delete(affectedId);
+                                    runtime.computedClipIds?.delete(affectedId);
+                                }
+                                runtime.computedIndices?.delete(affectedIndex);
+                            }
+                            runtime.validatedCount = runtime.validatedClipIds?.size || 0;
+                        }
+                    }
                 }
             } else {
                 if (validated.checked) {
@@ -4859,12 +4901,12 @@ function render(node, runtime) {
                 }
                 // Ref2VA Motion ON is causal, but its disk manifest is still
                 // authoritative after a browser refresh. Persist the exact
-                // manual prefix change just like independent Ref2VA persists
-                // its per-clip state. FL2VA keeps its existing behavior.
+                // manual prefix change just like the random-access modes persist
+                // their explicit per-clip validation state.
                 if (String(state?.generation_mode || "ref2va") === "ref2va"
                     && state?.motion_context !== false
                     && Boolean(clip.validated) !== wasValidated) {
-                    persistRef2vaValidation = true;
+                    persistValidation = true;
                 }
             }
             updateHidden(node, runtime);
@@ -4875,11 +4917,13 @@ function render(node, runtime) {
             // validation snapshot and send a validated clip back to the sampler.
             captureNativeWorkflowState(node, runtime);
 
-            // Ref2VA restores validation from its disk manifest after F5 in
-            // both Motion OFF and Motion ON. Persist both manual validation
-            // directions so the authoritative manifest and the card checkbox
-            // always agree. FL2VA deliberately stays on its historical path.
-            if (persistRef2vaValidation) {
+            // Validation is restored from the disk manifest after F5 in all
+            // three generation modes. Persist both manual directions so the
+            // authoritative manifest and the card checkbox always agree. In
+            // FL2VA, explicit Previous followers are invalidated together with
+            // their changed predecessor, while the first manual follower stops
+            // propagation.
+            if (persistValidation) {
                 const requestedValidated = Boolean(clip.validated);
                 validated.disabled = true;
                 const persisted = await persistLocalRefInvalidation(
@@ -4887,20 +4931,33 @@ function render(node, runtime) {
                 );
                 validated.disabled = false;
                 if (!persisted) {
-                    clip.validated = wasValidated;
-                    validated.checked = wasValidated;
-                    if (independentRef2va) {
-                        if (wasValidated) runtime.validatedClipIds?.add(String(clip.id));
-                        else runtime.validatedClipIds?.delete(String(clip.id));
-                        runtime.validatedCount = runtime.validatedClipIds?.size || 0;
+                    if (fl2vaMode && fl2vaValidationSnapshot) {
+                        for (let i = 0; i < (state.clips || []).length; i++) {
+                            if (i < fl2vaValidationSnapshot.validated.length) {
+                                state.clips[i].validated = Boolean(fl2vaValidationSnapshot.validated[i]);
+                            }
+                        }
+                        runtime.validatedClipIds = new Set(fl2vaValidationSnapshot.validatedClipIds);
+                        runtime.computedClipIds = new Set(fl2vaValidationSnapshot.computedClipIds);
+                        runtime.computedIndices = new Set(fl2vaValidationSnapshot.computedIndices);
+                        runtime.validatedCount = runtime.validatedClipIds.size;
+                        validated.checked = Boolean(state.clips?.[index]?.validated);
                     } else {
-                        runtime.validatedCount = validatedPrefixFromState(state);
-                        runtime.validatedClipIds = new Set(
-                            (state.clips || [])
-                                .slice(0, runtime.validatedCount)
-                                .map((item) => String(item?.id || ""))
-                                .filter(Boolean)
-                        );
+                        clip.validated = wasValidated;
+                        validated.checked = wasValidated;
+                        if (independentRef2va) {
+                            if (wasValidated) runtime.validatedClipIds?.add(String(clip.id));
+                            else runtime.validatedClipIds?.delete(String(clip.id));
+                            runtime.validatedCount = runtime.validatedClipIds?.size || 0;
+                        } else {
+                            runtime.validatedCount = validatedPrefixFromState(state);
+                            runtime.validatedClipIds = new Set(
+                                (state.clips || [])
+                                    .slice(0, runtime.validatedCount)
+                                    .map((item) => String(item?.id || ""))
+                                    .filter(Boolean)
+                            );
+                        }
                     }
                     updateHidden(node, runtime);
                     captureNativeWorkflowState(node, runtime);
@@ -4910,6 +4967,24 @@ function render(node, runtime) {
                 if (independentRef2va) {
                     if (requestedValidated) runtime.validatedClipIds?.add(String(clip.id));
                     else runtime.validatedClipIds?.delete(String(clip.id));
+                    runtime.validatedCount = runtime.validatedClipIds?.size || 0;
+                } else if (fl2vaMode) {
+                    if (requestedValidated) {
+                        runtime.validatedClipIds?.add(String(clip.id));
+                        runtime.computedClipIds?.delete(String(clip.id));
+                        runtime.computedIndices?.delete(index);
+                    } else {
+                        const affected = [index, ...fl2vaPreviousDependentIndices(state, index)];
+                        for (const affectedIndex of affected) {
+                            const affectedClip = state.clips?.[affectedIndex];
+                            const affectedId = String(affectedClip?.id || "");
+                            if (affectedId) {
+                                runtime.validatedClipIds?.delete(affectedId);
+                                runtime.computedClipIds?.delete(affectedId);
+                            }
+                            runtime.computedIndices?.delete(affectedIndex);
+                        }
+                    }
                     runtime.validatedCount = runtime.validatedClipIds?.size || 0;
                 } else {
                     runtime.validatedCount = validatedPrefixFromState(state);
