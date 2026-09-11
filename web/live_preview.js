@@ -217,6 +217,37 @@ function previewDomRenderMode(element) {
     return insideVueRow ? "nodes2" : "legacy";
 }
 
+function setLegacyPreviewWidgetFullWidth(state, enabled) {
+    const widget = state?.widget;
+    if (!widget) return;
+
+    if (enabled) {
+        if (state.legacyWidthPinInstalled) return;
+        try {
+            state.legacyWidthOwnDescriptor = Object.getOwnPropertyDescriptor(widget, "width") || null;
+            Object.defineProperty(widget, "width", {
+                configurable: true,
+                enumerable: state.legacyWidthOwnDescriptor?.enumerable ?? true,
+                get: () => undefined,
+                set: () => {},
+            });
+            state.legacyWidthPinInstalled = true;
+        } catch (_) {
+            // Best-effort workaround for the upstream Legacy DOM-widget width bug.
+        }
+        return;
+    }
+
+    if (!state.legacyWidthPinInstalled) return;
+    try {
+        const previous = state.legacyWidthOwnDescriptor;
+        if (previous) Object.defineProperty(widget, "width", previous);
+        else delete widget.width;
+    } catch (_) {}
+    state.legacyWidthPinInstalled = false;
+    state.legacyWidthOwnDescriptor = null;
+}
+
 function previewHeightIsPoisoned(height, minimumHeight) {
     const h = Number(height);
     if (!Number.isFinite(h) || h <= 0) return false;
@@ -285,6 +316,15 @@ function findUpstreamExtenderId(node) {
     return findUpstreamExtenderNode(node)?.id ?? null;
 }
 
+function boolValue(value, defaultValue = true) {
+    if (value === undefined || value === null || value === "") return Boolean(defaultValue);
+    if (value === false || value === 0) return false;
+    const text = String(value).trim().toLowerCase();
+    if (["false", "0", "off", "no"].includes(text)) return false;
+    if (["true", "1", "on", "yes"].includes(text)) return true;
+    return Boolean(value);
+}
+
 function upstreamGenerationMode(node) {
     const origin = findUpstreamExtenderNode(node);
 
@@ -306,6 +346,22 @@ function upstreamGenerationMode(node) {
 
     const runtimeMode = String(origin?.__h3Extender?.state?.generation_mode || "").toLowerCase();
     return runtimeMode === "fl2va" ? "fl2va" : "ref2va";
+}
+
+function upstreamMotionContext(node) {
+    const origin = findUpstreamExtenderNode(node);
+    const clipsWidget = (origin?.widgets || []).find((w) => w?.name === "clips_json");
+    if (typeof clipsWidget?.value === "string") {
+        try {
+            const parsed = JSON.parse(clipsWidget.value);
+            if (parsed && !Array.isArray(parsed) && Object.prototype.hasOwnProperty.call(parsed, "motion_context")) {
+                return boolValue(parsed.motion_context, true);
+            }
+        } catch (_) {}
+    }
+    const widget = (origin?.widgets || []).find((w) => w?.name === "motion_context");
+    if (widget) return boolValue(widget.value, true);
+    return origin?.__h3Extender?.state?.motion_context !== false;
 }
 
 function loadPreviewSource(node, state, url) {
@@ -401,6 +457,10 @@ async function restorePreviewOnLoad(node, state, attempt = 0) {
             ? "fl2va"
             : "ref2va";
         params.set("mode", restoreMode);
+        const restoreMotion = state.restoreMotionOverride == null
+            ? upstreamMotionContext(node)
+            : Boolean(state.restoreMotionOverride);
+        params.set("motion_context", restoreMotion ? "true" : "false");
 
         const response = await fetch(
             api.apiURL("/h3_extender/restored_preview?" + params.toString())
@@ -443,6 +503,7 @@ async function restorePreviewOnLoad(node, state, attempt = 0) {
         loadPreviewSource(node, state, mediaUrl(payload.video) + "&t=" + Date.now());
         state.restoreLoaded = true;
         state.restoreModeOverride = null;
+        state.restoreMotionOverride = null;
 
         requestAnimationFrame(() => {
             requestAnimationFrame(() => {
@@ -470,6 +531,9 @@ function syncPlayerToNode(node, state, growNodeIfNeeded = false, retry = 0) {
     }
 
     if (mode === "nodes2") {
+        // Never carry the Legacy-only width workaround into Nodes 2.0.
+        setLegacyPreviewWidgetFullWidth(state, false);
+
         const currentH = Number(node.size?.[1] || 0);
         const widgetY = Number(state.widget.last_y);
         const fallbackH = Number.isFinite(widgetY) && widgetY > 0
@@ -517,6 +581,12 @@ function syncPlayerToNode(node, state, growNodeIfNeeded = false, retry = 0) {
         state.video.style.flex = "1 1 auto";
         return;
     }
+
+    // ComfyUI frontend currently writes the right-panel host width into
+    // widget.width in Legacy mode. LiteGraph then stops falling back to the
+    // live node width and the DOM preview is clipped to roughly half the node.
+    // Keep width undefined only in Legacy so layout always follows node.size[0].
+    setLegacyPreviewWidgetFullWidth(state, true);
 
     const widgetY = Number(state.widget.last_y);
 
@@ -624,6 +694,7 @@ async function saveCurrentPreview(node, state) {
             body: JSON.stringify({
                 owner_id: findUpstreamExtenderId(node),
                 generation_mode: upstreamGenerationMode(node),
+                motion_context: upstreamMotionContext(node),
                 filename: info.filename,
                 subfolder: info.subfolder || "",
                 type: info.type || "temp",
@@ -740,6 +811,8 @@ function makePlayer(node) {
         syncingPlayer: false,
         lastRenderMode: null,
         legacyNodeHeight: null,
+        legacyWidthPinInstalled: false,
+        legacyWidthOwnDescriptor: null,
         liveLoaded: false,
         restoreLoaded: false,
         restoreRequestRunning: false,
@@ -790,6 +863,7 @@ function makePlayer(node) {
 
     const oldRemove = node.onRemoved;
     node.onRemoved = function () {
+        setLegacyPreviewWidgetFullWidth(state, false);
         try {
             video.pause();
             video.removeAttribute("src");
@@ -809,7 +883,7 @@ function makePlayer(node) {
     return state;
 }
 
-function refreshImportedProjectPreview(ownerId, generationMode = null) {
+function refreshImportedProjectPreview(ownerId, generationMode = null, motionContext = null) {
     const graph = app.graph;
     if (!graph) return;
     const wanted = String(ownerId);
@@ -824,6 +898,7 @@ function refreshImportedProjectPreview(ownerId, generationMode = null) {
         state.restoreModeOverride = String(generationMode || "") === "fl2va"
             ? "fl2va"
             : (String(generationMode || "") === "ref2va" ? "ref2va" : null);
+        state.restoreMotionOverride = motionContext == null ? null : boolValue(motionContext, true);
         state.currentVideoInfo = null;
         state.currentPreviewMeta = null;
         state.colorTimeline = [];
@@ -871,7 +946,11 @@ app.registerExtension({
         window.addEventListener("h3-extender-project-loaded", (event) => {
             const ownerId = event?.detail?.owner_id;
             if (ownerId == null) return;
-            refreshImportedProjectPreview(ownerId, event?.detail?.generation_mode);
+            refreshImportedProjectPreview(
+                ownerId,
+                event?.detail?.generation_mode,
+                event?.detail?.motion_context,
+            );
         });
         window.addEventListener("h3-extender-color-updated", (event) => {
             const ownerId = event?.detail?.owner_id;

@@ -93,6 +93,7 @@ const PROJECT_WIDGETS = [
     "megapixels",
     "refs_json",
     "generation_mode",
+    "motion_context",
 ];
 
 const FINAL_PROJECT_WIDGETS = [
@@ -103,6 +104,31 @@ const FINAL_PROJECT_WIDGETS = [
     "preset",
     "audio_bitrate",
 ];
+
+function boolValue(value, defaultValue = true) {
+    if (value === undefined || value === null || value === "") return Boolean(defaultValue);
+    if (value === false || value === 0) return false;
+    const text = String(value).trim().toLowerCase();
+    if (["false", "0", "off", "no"].includes(text)) return false;
+    if (["true", "1", "on", "yes"].includes(text)) return true;
+    return Boolean(value);
+}
+
+function ref2vaIndependentMode(state) {
+    return String(state?.generation_mode || "ref2va") === "ref2va" && state?.motion_context === false;
+}
+
+function randomAccessMode(state) {
+    return String(state?.generation_mode || "ref2va") === "fl2va" || ref2vaIndependentMode(state);
+}
+
+function validationStateKey(modeOrState = "ref2va", motionContext = null) {
+    const stateLike = modeOrState && typeof modeOrState === "object" ? modeOrState : null;
+    const mode = String(stateLike?.generation_mode ?? modeOrState ?? "ref2va") === "fl2va" ? "fl2va" : "ref2va";
+    if (mode === "fl2va") return "fl2va";
+    const motion = stateLike ? stateLike.motion_context !== false : boolValue(motionContext, true);
+    return motion ? "ref2va_motion" : "ref2va_independent";
+}
 
 // Validation and reference semantics are user-controlled. The Extender never
 // associates Ref N with Clip N and never decides which clip a reference edit
@@ -378,7 +404,7 @@ function localRefsConflictSummary(node, runtime, clip) {
     return conflicts;
 }
 
-async function persistLocalRefInvalidation(node, runtime, clipIndex) {
+async function persistLocalRefInvalidation(node, runtime, clipIndex, validatedState = false) {
     const index = Number(clipIndex);
     if (!Number.isInteger(index) || index < 0) return false;
     const generationMode = String(runtime?.state?.generation_mode || "ref2va") === "fl2va" ? "fl2va" : "ref2va";
@@ -389,8 +415,10 @@ async function persistLocalRefInvalidation(node, runtime, clipIndex) {
             body: JSON.stringify({
                 owner_id: String(node?.id ?? ""),
                 generation_mode: generationMode,
+                motion_context: runtime?.state?.motion_context !== false,
                 clip_index: index,
                 clip_id: String(runtime?.state?.clips?.[index]?.id || ""),
+                validated: Boolean(validatedState),
             }),
         });
         const payload = await response.json().catch(() => ({}));
@@ -408,11 +436,22 @@ async function persistLocalRefInvalidation(node, runtime, clipIndex) {
 async function prepareLocalRefMutation(node, runtime, clipIndex) {
     const index = Number(clipIndex);
     if (!Number.isInteger(index) || index < 0) return false;
-    if (runtime?.computedIndices?.has(index)) {
+    const clip = runtime?.state?.clips?.[index];
+    const isComputed = randomAccessMode(runtime?.state)
+        ? runtime?.computedClipIds?.has(String(clip?.id || ""))
+        : runtime?.computedIndices?.has(index);
+    if (isComputed) {
         const ok = await discardComputedClip(node, runtime, index);
         if (!ok) return false;
     }
-    invalidateFrom(runtime.state, index);
+    if (randomAccessMode(runtime?.state)) {
+        const wasValidated = Boolean(clip?.validated);
+        if (clip) clip.validated = false;
+        runtime?.validatedClipIds?.delete(String(clip?.id || ""));
+        if (wasValidated) runtime.validatedCount = Math.max(0, Number(runtime?.validatedCount || 0) - 1);
+    } else {
+        invalidateFrom(runtime.state, index);
+    }
     if (!(await persistLocalRefInvalidation(node, runtime, index))) return false;
     return true;
 }
@@ -872,6 +911,7 @@ function parseState(raw) {
         const legacyArray = Array.isArray(p);
         const payload = legacyArray ? { clips: p } : (p && typeof p === "object" ? p : {});
         const generationMode = String(payload?.generation_mode || "ref2va") === "fl2va" ? "fl2va" : "ref2va";
+        const motionContext = boolValue(payload?.motion_context, true);
         const rawActive = Array.isArray(payload?.clips) && payload.clips.length ? payload.clips : null;
         const savedModes = payload?.mode_clips && typeof payload.mode_clips === "object"
             ? payload.mode_clips
@@ -891,10 +931,15 @@ function parseState(raw) {
                 ? normalizeClipList(savedModes.fl2va)
                 : blankModeClips());
         const activeClips = generationMode === "fl2va" ? fl2vaClips : ref2vaClips;
+        const causalLineage = Array.isArray(payload?.causal_lineage)
+            ? payload.causal_lineage.map((value) => String(value)).filter(Boolean)
+            : ref2vaClips.map((clip) => String(clip.id));
 
         return {
             version: 2,
             generation_mode: generationMode,
+            motion_context: motionContext,
+            causal_lineage: causalLineage,
             load_token: String(payload?.project_load_token || ""),
             prompt_pack_signature: String(payload?.prompt_pack_signature || ""),
             // Execution-only cache-buster persisted in the native clips_json widget.
@@ -913,6 +958,8 @@ function parseState(raw) {
     return {
         version: 2,
         generation_mode: "ref2va",
+        motion_context: true,
+        causal_lineage: ref2vaClips.map((clip) => String(clip.id)),
         load_token: "",
         prompt_pack_signature: "",
         resume_nonce: "",
@@ -928,6 +975,8 @@ function serializeState(state) {
     const payload = {
         version: 2,
         generation_mode: mode,
+        motion_context: state?.motion_context !== false,
+        causal_lineage: Array.isArray(state?.causal_lineage) ? state.causal_lineage.map(String) : [],
         clips: state.clips,
         mode_clips: {
             ref2va: state.mode_clips.ref2va,
@@ -947,7 +996,13 @@ function serializeProjectState(state) {
     // marker are still interpreted as Ref2VA by the backend.
     ensureModeClipState(state);
     const mode = state?.generation_mode === "fl2va" ? "fl2va" : "ref2va";
-    const payload = { version: 2, generation_mode: mode, clips: state.clips };
+    const payload = {
+        version: 2,
+        generation_mode: mode,
+        motion_context: state?.motion_context !== false,
+        causal_lineage: Array.isArray(state?.causal_lineage) ? state.causal_lineage.map(String) : [],
+        clips: state.clips,
+    };
     if (state?.load_token) payload.project_load_token = String(state.load_token);
     if (state?.prompt_pack_signature) payload.prompt_pack_signature = String(state.prompt_pack_signature);
     if (state?.resume_nonce) payload.resume_nonce = String(state.resume_nonce);
@@ -956,6 +1011,7 @@ function serializeProjectState(state) {
 
 function mergeActiveStateJson(runtime, raw, explicitMode = null) {
     const incoming = parseState(raw);
+    const incomingMotion = explicitMotionContextFromStateJson(raw);
     if (!runtime?.state) return incoming;
     ensureModeClipState(runtime.state);
     const mode = String(explicitMode || incoming.generation_mode || runtime.state.generation_mode || "ref2va") === "fl2va"
@@ -968,6 +1024,7 @@ function mergeActiveStateJson(runtime, raw, explicitMode = null) {
         ? incomingClips
         : blankModeClips();
     runtime.state.generation_mode = mode;
+    if (incomingMotion !== null) runtime.state.motion_context = incomingMotion;
     runtime.state.clips = runtime.state.mode_clips[mode];
     runtime.state.load_token = incoming.load_token || runtime.state.load_token || "";
     runtime.state.prompt_pack_signature = incoming.prompt_pack_signature || "";
@@ -999,7 +1056,7 @@ async function refreshLoraNames(node, runtime) {
 }
 
 function validatedPrefixFromState(state) {
-    if (state?.generation_mode === "fl2va") {
+    if (randomAccessMode(state)) {
         return (state?.clips || []).filter((clip) => Boolean(clip?.validated)).length;
     }
     let count = 0;
@@ -1018,6 +1075,7 @@ async function restoreCacheState(node, runtime) {
         const params = new URLSearchParams();
         params.set("owner_id", String(node.id));
         params.set("mode", String(runtime.state?.generation_mode || getWidget(node, "generation_mode")?.value || "ref2va"));
+        params.set("motion_context", runtime.state?.motion_context === false ? "false" : "true");
         const response = await fetch(
             api.apiURL("/h3_extender/cache_state?" + params.toString())
         );
@@ -1051,16 +1109,34 @@ async function restoreCacheState(node, runtime) {
             Object.entries(payload?.continuity_signatures || {}).map(([key, value]) => [String(key), String(value || "")]).filter(([, value]) => Boolean(value))
         );
         const activeMode = String(runtime.state?.generation_mode || "ref2va") === "fl2va" ? "fl2va" : "ref2va";
-        if (activeMode === "fl2va") {
+        if (randomAccessMode(runtime.state)) {
             for (const clip of runtime.state?.clips || []) {
                 clip.validated = runtime.validatedClipIds.has(String(clip.id));
             }
         } else {
+            const payloadOrder = Array.isArray(payload.cached_clip_ids) ? payload.cached_clip_ids.map(String) : [];
+            const cachedOrder = payloadOrder.length
+                ? payloadOrder
+                : (Array.isArray(runtime.state?.causal_lineage) ? runtime.state.causal_lineage.map(String) : []);
+            if (payloadOrder.length) runtime.state.causal_lineage = payloadOrder.slice();
+            const currentOrder = (runtime.state?.clips || []).map((clip) => String(clip.id));
+            let safePrefix = Number(runtime.validatedCount || 0);
+            if (cachedOrder.length) {
+                let commonPrefix = 0;
+                while (
+                    commonPrefix < cachedOrder.length
+                    && commonPrefix < currentOrder.length
+                    && cachedOrder[commonPrefix] === currentOrder[commonPrefix]
+                ) commonPrefix += 1;
+                safePrefix = Math.min(safePrefix, commonPrefix);
+                runtime.cachedCount = Math.min(Number(runtime.cachedCount || 0), commonPrefix);
+            }
+            runtime.validatedCount = safePrefix;
             for (let i = 0; i < (runtime.state?.clips || []).length; i++) {
-                runtime.state.clips[i].validated = i < runtime.validatedCount;
+                runtime.state.clips[i].validated = i < safePrefix;
             }
         }
-        snapshotModeValidation(runtime, activeMode);
+        snapshotModeValidation(runtime);
         runtime.jsonWidget.value = serializeState(runtime.state);
         const restoredW = Number(payload.resolved_width || 0);
         const restoredH = Number(payload.resolved_height || 0);
@@ -1101,6 +1177,7 @@ async function discardComputedClip(node, runtime, clipIndex) {
         const body = {
             owner_id: String(node.id),
             generation_mode: generationMode,
+            motion_context: runtime.state?.motion_context !== false,
             clip_index: index,
             clip_id: String(clip.id || ""),
             clip_ids: (runtime.state?.clips || []).map((item) => String(item?.id || "")),
@@ -1131,14 +1208,14 @@ async function discardComputedClip(node, runtime, clipIndex) {
         runtime.checkpointInterrupted = Boolean(payload.checkpoint_interrupted);
         runtime.checkpointSnapshotCount = Number(payload.checkpoint_snapshot_count || 0);
 
-        if (generationMode === "ref2va") {
+        if (generationMode === "ref2va" && runtime.state?.motion_context !== false) {
             // Ref2VA Motion Context is causal: rerolling this checkpoint makes
             // every following cached result unusable.
             invalidateFrom(runtime.state, index);
         } else {
-            // FL2VA is random-access except for explicit Previous chains. The
-            // backend returns the exact cascade it discarded so the badges and
-            // serialized card state become truthful immediately.
+            // Random-access modes use the exact clip IDs returned by the backend.
+            // FL2VA may include Previous-linked dependants; independent Ref2VA
+            // always returns only the requested clip.
             const discardedIds = new Set(
                 Array.isArray(payload.discarded_clip_ids)
                     ? payload.discarded_clip_ids.map(String)
@@ -1161,7 +1238,9 @@ async function discardComputedClip(node, runtime, clipIndex) {
             ? payload.discarded_clip_ids.length
             : 1;
         runtime.statusText = generationMode === "ref2va"
-            ? `Clip ${index + 1} checkpoint discarded — Ref2VA will rerender from this clip`
+            ? (runtime.state?.motion_context !== false
+                ? `Clip ${index + 1} checkpoint discarded — Ref2VA will rerender from this clip`
+                : `Clip ${index + 1} checkpoint discarded — only this independent Ref2VA clip will rerender`)
             : (discardedCount > 1
                 ? `FL2VA clip ${index + 1} checkpoint discarded — ${discardedCount - 1} Previous-linked dependent clip(s) also decomputed`
                 : `FL2VA clip ${index + 1} checkpoint discarded — this plan will rerender`);
@@ -1469,7 +1548,25 @@ function wrapResolutionWidgetCallbacks(node, runtime) {
     style.id = "h3-extender-hide-state-json";
     style.textContent = `
         .lg-node-widget:has(> [node-type="${TARGET}"] > textarea),
-        .lg-node-widget:has(button[data-testid="widget-select-default-trigger"][aria-label="generation_mode"]) {
+        .lg-node-widget:has(button[data-testid="widget-select-default-trigger"][aria-label="generation_mode"]),
+        .lg-node-widget:has([aria-label="motion_context"]),
+        .lg-node-widget:has([name="motion_context"]) {
+            display: none !important;
+        }
+
+        /* Nodes 2.0 keeps native widget visibility in its Vue-side store, so
+           changing only LiteGraph's live widget.hidden flag is not reactive.
+           The Extender DOM root publishes the current mode as a per-node marker;
+           these scoped rules hide only this node's context rows when Motion
+           Context is inactive (Ref2VA Motion OFF) or irrelevant (FL2VA). */
+        [data-node-id]:has([data-h3-hide-context-widgets="1"])
+            .lg-node-widget:has([aria-label="context_length"]),
+        [data-node-id]:has([data-h3-hide-context-widgets="1"])
+            .lg-node-widget:has([name="context_length"]),
+        [data-node-id]:has([data-h3-hide-context-widgets="1"])
+            .lg-node-widget:has([aria-label="audio_context_length"]),
+        [data-node-id]:has([data-h3-hide-context-widgets="1"])
+            .lg-node-widget:has([name="audio_context_length"]) {
             display: none !important;
         }
     `;
@@ -1479,12 +1576,17 @@ function wrapResolutionWidgetCallbacks(node, runtime) {
 function hideNativeWidget(node, widget) {
     if (!widget) return;
 
-    // Modern Nodes 2.0 renders native widgets from its own widget store. Merely
-    // giving a widget a zero layout size is not enough: the control can remain
-    // visible while the following DOM widget is laid out in the same row, which
-    // causes the overlap seen with the hidden generation_mode combo. Mark the
-    // widget hidden as well, while keeping it alive for normal serialization.
+    // Modern Nodes 2.0 renders native widgets from its own Vue-side store. The
+    // injected CSS above removes these rows from the DOM, and widget.hidden keeps
+    // the serialized widget logically hidden. Do NOT replace computeSize or
+    // computeLayoutSize here: Vue recalculates its WidgetGrid after a manual node
+    // resize and those fake zero sizes make LiteGraph's following label positions
+    // diverge from the actual Vue rows (notably resolution_mode).
     widget.hidden = true;
+    if (globalThis.LiteGraph?.vueNodesMode === true) {
+        node?.graph?.setDirtyCanvas(true, true);
+        return;
+    }
 
     // LiteGraph / Nodes 1.0: also remove the logical footprint but keep the
     // widget itself intact so workflow serialization continues to work.
@@ -1523,7 +1625,26 @@ function setNativeWidgetVisibility(node, widget, visible) {
         widget.__h3OriginalComputeLayoutSize = widget.computeLayoutSize;
     }
 
+    const nodes2 = globalThis.LiteGraph?.vueNodesMode === true;
     widget.hidden = !visible;
+
+    if (nodes2) {
+        // Nodes 2.0 owns the visible native rows in Vue. The scoped CSS rule
+        // handles the actual DOM-row removal when context widgets are inactive,
+        // while widget.hidden keeps LiteGraph's canvas/widget layout in agreement.
+        // Never replace computeSize/computeLayoutSize here: doing so makes the
+        // LiteGraph label positions diverge from the Vue controls after a mode
+        // change (resolution_mode text one row too low + a phantom gap).
+        if (widget.__h3OriginalComputeSize !== undefined) widget.computeSize = widget.__h3OriginalComputeSize;
+        else delete widget.computeSize;
+        if (widget.__h3OriginalComputeLayoutSize !== undefined) widget.computeLayoutSize = widget.__h3OriginalComputeLayoutSize;
+        else delete widget.computeLayoutSize;
+        node?.graph?.setDirtyCanvas(true, true);
+        return;
+    }
+
+    // Legacy LiteGraph still needs the historical zero-footprint sizing plus
+    // direct DOM hiding because there is no Vue row for the CSS rule to remove.
     if (visible) {
         if (widget.__h3OriginalComputeSize !== undefined) widget.computeSize = widget.__h3OriginalComputeSize;
         else delete widget.computeSize;
@@ -1551,11 +1672,23 @@ function setNativeWidgetVisibility(node, widget, visible) {
     node?.graph?.setDirtyCanvas(true, true);
 }
 
-function syncModeSpecificNativeWidgets(node, runtime, fl2vaMode) {
-    // Motion Context controls have no meaning in FL2VA. Hide them only in that
-    // mode while keeping their values intact for the independent Ref2VA state.
-    setNativeWidgetVisibility(node, runtime?.contextLengthWidget, !fl2vaMode);
-    setNativeWidgetVisibility(node, runtime?.audioContextLengthWidget, !fl2vaMode);
+function syncModeSpecificNativeWidgets(node, runtime) {
+    // Context lengths only affect causal Ref2VA Motion Context. They stay hidden
+    // in FL2VA and in independent Ref2VA, while their saved values are preserved.
+    const causalRef2va = String(runtime?.state?.generation_mode || "ref2va") === "ref2va"
+        && runtime?.state?.motion_context !== false;
+
+    // Nodes 2.0 does not react to a late mutation of the LiteGraph widget's
+    // hidden flag because its native rows are rendered from a separate Vue-side
+    // widget store. Publish the same state on our per-node DOM root; the scoped
+    // CSS above then removes exactly the two native context rows for this node.
+    // Legacy keeps using setNativeWidgetVisibility() below unchanged.
+    if (runtime?.root) {
+        runtime.root.dataset.h3HideContextWidgets = causalRef2va ? "0" : "1";
+    }
+
+    setNativeWidgetVisibility(node, runtime?.contextLengthWidget, causalRef2va);
+    setNativeWidgetVisibility(node, runtime?.audioContextLengthWidget, causalRef2va);
 }
 
 function domWidgetRenderMode(element) {
@@ -1575,6 +1708,38 @@ function domWidgetRenderMode(element) {
 
     // Older frontends may not expose vueNodesMode; fall back to the wrapper.
     return insideVueRow ? "nodes2" : "legacy";
+}
+
+
+function setLegacyExtenderWidgetFullWidth(runtime, enabled) {
+    const widget = runtime?.domWidget;
+    if (!widget) return;
+
+    if (enabled) {
+        if (runtime.legacyWidthPinInstalled) return;
+        try {
+            runtime.legacyWidthOwnDescriptor = Object.getOwnPropertyDescriptor(widget, "width") || null;
+            Object.defineProperty(widget, "width", {
+                configurable: true,
+                enumerable: runtime.legacyWidthOwnDescriptor?.enumerable ?? true,
+                get: () => undefined,
+                set: () => {},
+            });
+            runtime.legacyWidthPinInstalled = true;
+        } catch (_) {
+            // Best-effort workaround for the upstream Legacy DOM-widget width bug.
+        }
+        return;
+    }
+
+    if (!runtime.legacyWidthPinInstalled) return;
+    try {
+        const previous = runtime.legacyWidthOwnDescriptor;
+        if (previous) Object.defineProperty(widget, "width", previous);
+        else delete widget.width;
+    } catch (_) {}
+    runtime.legacyWidthPinInstalled = false;
+    runtime.legacyWidthOwnDescriptor = null;
 }
 
 function obviouslyPoisonedHeight(height, minimumHeight) {
@@ -1656,46 +1821,131 @@ function advanceSeedAfterGenerate(clip) {
     // fixed deliberately does nothing.
 }
 
-function cardStatus(runtime, clip, index) {
-    if (
-        Number(runtime.activeClipIndex) === index &&
-        ["preparing", "sampling", "complete"].includes(String(runtime.activePhase || ""))
-    ) {
+function cardStatus(node, runtime, clip, index) {
+    const activeIndex = Number(runtime.activeClipIndex);
+    const activePhase = String(runtime.activePhase || "");
+    const runActive = ["preparing", "sampling", "complete"].includes(activePhase);
+
+    if (activeIndex === index && runActive) {
         return "rendering";
     }
 
-    const fl2va = runtime.state?.generation_mode === "fl2va";
-    const cached = fl2va
+    const randomAccess = randomAccessMode(runtime.state);
+    const cached = randomAccess
         ? runtime.cachedClipIds?.has(String(clip.id))
         : index < Number(runtime.cachedCount || 0);
     if (clip.validated && cached) return "validated";
-    const computed = fl2va
+    const computed = randomAccess
         ? runtime.computedClipIds?.has(String(clip.id))
         : runtime.computedIndices?.has(index);
     if (computed && cached) return "computed";
+
+    // Ref2VA Motion OFF Full Batch follows the same live progression semantics
+    // expected from the random-access batch UI: only the clip immediately before
+    // the active one is the transient NEXT card. Do not derive NEXT from the
+    // first unvalidated clip while the batch is running, otherwise it remains
+    // stuck on Clip 1 for the entire run because Full Batch does not validate
+    // cards as it progresses. Persisted COMPUTED/VALIDATED states above always
+    // win, so a resumed interrupted checkpoint remains truthful.
+    const ref2vaIndependentFullBatch =
+        ref2vaIndependentMode(runtime.state)
+        && String(getWidget(node, "run_mode")?.value || "clip_by_clip") === "full_batch";
+    if (ref2vaIndependentFullBatch && runActive && activeIndex >= 0) {
+        if (index === activeIndex - 1) return "current";
+        if (cached) return "cached";
+        return "future";
+    }
+
     const firstOpen = runtime.state.clips.findIndex((c) => !c.validated);
     if (index === firstOpen) return cached ? "candidate" : "current";
     if (cached) return "cached";
     return "future";
 }
 
-function snapshotModeValidation(runtime, mode = null) {
+function snapshotModeValidation(runtime, mode = null, motionContext = null) {
     if (!runtime?.state) return;
     if (!runtime.modeValidationState) runtime.modeValidationState = {};
-    const key = String(mode || runtime.state.generation_mode || "ref2va") === "fl2va" ? "fl2va" : "ref2va";
+    const key = mode == null
+        ? validationStateKey(runtime.state)
+        : validationStateKey(mode, motionContext ?? runtime.state?.motion_context);
     runtime.modeValidationState[key] = new Map(
         (runtime.state.clips || []).map((clip) => [String(clip.id), Boolean(clip.validated)])
     );
+    if (!runtime.modeValidationOrder) runtime.modeValidationOrder = {};
+    runtime.modeValidationOrder[key] = (runtime.state.clips || []).map((clip) => String(clip.id));
 }
 
-function restoreModeValidation(runtime, mode) {
-    const key = String(mode || "ref2va") === "fl2va" ? "fl2va" : "ref2va";
+function restoreModeValidation(runtime, mode = null, motionContext = null) {
+    const key = mode == null
+        ? validationStateKey(runtime.state)
+        : validationStateKey(mode, motionContext ?? runtime.state?.motion_context);
     const saved = runtime?.modeValidationState?.[key];
     if (!(saved instanceof Map)) return false;
-    for (const clip of runtime.state?.clips || []) {
-        clip.validated = Boolean(saved.get(String(clip.id)));
+    const causalRef2va = key === "ref2va_motion";
+    if (causalRef2va) {
+        const savedOrder = Array.isArray(runtime?.state?.causal_lineage) && runtime.state.causal_lineage.length
+            ? runtime.state.causal_lineage.map(String)
+            : (Array.isArray(runtime?.modeValidationOrder?.[key]) ? runtime.modeValidationOrder[key] : []);
+        const currentOrder = (runtime.state?.clips || []).map((clip) => String(clip.id));
+        let commonPrefix = 0;
+        while (
+            commonPrefix < savedOrder.length
+            && commonPrefix < currentOrder.length
+            && String(savedOrder[commonPrefix]) === String(currentOrder[commonPrefix])
+        ) commonPrefix += 1;
+        for (let i = 0; i < (runtime.state?.clips || []).length; i++) {
+            const clip = runtime.state.clips[i];
+            clip.validated = i < commonPrefix && Boolean(saved.get(String(clip.id)));
+        }
+    } else {
+        for (const clip of runtime.state?.clips || []) {
+            clip.validated = Boolean(saved.get(String(clip.id)));
+        }
     }
     return true;
+}
+
+function seedModeValidationFromCurrent(runtime, mode, motionContext, clips = null) {
+    if (!runtime?.state) return;
+    if (!runtime.modeValidationState) runtime.modeValidationState = {};
+    const key = validationStateKey(mode, motionContext);
+    const sourceClips = Array.isArray(clips) ? clips : (runtime.state?.clips || []);
+    runtime.modeValidationState[key] = new Map(
+        sourceClips.map((clip) => [String(clip?.id || ""), Boolean(clip?.validated)])
+    );
+    if (!runtime.modeValidationOrder) runtime.modeValidationOrder = {};
+    runtime.modeValidationOrder[key] = sourceClips.map((clip) => String(clip?.id || ""));
+}
+
+async function bootstrapRef2vaMotionToggleCache(node, runtime, nextMotionContext) {
+    if (!node || !runtime?.state) return { ok: false, bootstrapped: false, found: false };
+    if (String(runtime.state?.generation_mode || "ref2va") !== "ref2va") {
+        return { ok: false, bootstrapped: false, found: false };
+    }
+    const body = {
+        owner_id: String(node.id),
+        generation_mode: "ref2va",
+        source_motion_context: runtime.state?.motion_context !== false,
+        target_motion_context: nextMotionContext !== false,
+        clips: (runtime.state?.clips || []).map((clip) => ({
+            id: String(clip?.id || ""),
+            validated: Boolean(clip?.validated),
+        })),
+    };
+    try {
+        const response = await fetch(api.apiURL("/h3_extender/bootstrap_ref2va_motion_cache"), {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(body),
+        });
+        const payload = await response.json().catch(() => ({}));
+        if (!response.ok || !payload?.ok) {
+            return { ok: false, bootstrapped: false, found: false, error: payload?.error || `Bootstrap failed (${response.status})` };
+        }
+        return payload;
+    } catch (error) {
+        return { ok: false, bootstrapped: false, found: false, error: String(error?.message || error) };
+    }
 }
 
 function explicitGenerationModeFromStateJson(raw) {
@@ -1709,6 +1959,24 @@ function explicitGenerationModeFromStateJson(raw) {
     } catch (_) {
         return "";
     }
+}
+
+function explicitMotionContextFromStateJson(raw) {
+    if (typeof raw !== "string" || !raw.trim()) return null;
+    try {
+        const parsed = JSON.parse(raw);
+        if (!parsed || Array.isArray(parsed) || typeof parsed !== "object") return null;
+        if (!Object.prototype.hasOwnProperty.call(parsed, "motion_context")) return null;
+        return boolValue(parsed.motion_context, true);
+    } catch (_) {
+        return null;
+    }
+}
+
+function persistentMotionContext(node, raw = "") {
+    const explicit = explicitMotionContextFromStateJson(raw);
+    if (explicit !== null) return explicit;
+    return boolValue(getWidget(node, "motion_context")?.value, true);
 }
 
 function persistentGenerationMode(node, raw = "") {
@@ -1766,6 +2034,9 @@ function updateHidden(node, runtime) {
     runtime.jsonWidget.value = raw;
     if (runtime.generationModeWidget) {
         runtime.generationModeWidget.value = runtime.state?.generation_mode === "fl2va" ? "fl2va" : "ref2va";
+    }
+    if (runtime.motionContextWidget) {
+        runtime.motionContextWidget.value = runtime.state?.motion_context !== false;
     }
     notifyWorkflowChanged(node, runtime);
 }
@@ -2777,7 +3048,9 @@ async function openClipColorEditor(node, runtime, clipIndex) {
     params.set("owner_id", String(node.id));
     params.set("final_id", String(finalNode.id));
     params.set("clip_index", String(clipIndex));
+    params.set("clip_id", String(runtime.state?.clips?.[clipIndex]?.id || ""));
     params.set("mode", String(runtime.state?.generation_mode || "ref2va"));
+    params.set("motion_context", runtime.state?.motion_context === false ? "false" : "true");
 
     let payload;
     try {
@@ -2970,7 +3243,9 @@ async function openClipColorEditor(node, runtime, clipIndex) {
                 body: JSON.stringify({
                     owner_id: String(node.id),
                     clip_index: Number(clipIndex),
+                    clip_id: String(clip?.id || ""),
                     generation_mode: String(runtime.state?.generation_mode || "ref2va"),
+                    motion_context: runtime.state?.motion_context !== false,
                     adjustment: normalizeColorAdjustment(adjustment),
                 }),
             });
@@ -3078,6 +3353,7 @@ function collectProjectPayload(node, runtime) {
         extender: {
             class_name: TARGET,
             generation_mode: String(runtime.state?.generation_mode || getWidget(node, "generation_mode")?.value || "ref2va"),
+            motion_context: runtime.state?.motion_context !== false,
             node_title: String(node?.title || "MiniMax H3 Extender"),
             settings,
             resolution: {
@@ -3135,7 +3411,14 @@ function applyProjectPayload(node, runtime, projectPayload) {
     }
 
     const projectMode = String(extender?.generation_mode || settings?.generation_mode || "ref2va") === "fl2va" ? "fl2va" : "ref2va";
+    const projectMotion = boolValue(
+        Object.prototype.hasOwnProperty.call(extender, "motion_context")
+            ? extender.motion_context
+            : settings?.motion_context,
+        true,
+    );
     setWidgetValue(node, "generation_mode", projectMode);
+    setWidgetValue(node, "motion_context", projectMotion);
 
     const savedResolution = extender?.resolution;
     const hasSavedMode =
@@ -3184,6 +3467,7 @@ function applyProjectPayload(node, runtime, projectPayload) {
         || JSON.stringify({ version: 1, clips: extender?.clips || [] })
     );
     runtime.state = parseState(rawClips);
+    runtime.state.motion_context = explicitMotionContextFromStateJson(rawClips) ?? projectMotion;
     activateModeState(runtime.state, projectMode);
     // Loading a project mutates the disk cache outside ComfyUI's executor. A
     // one-shot token forces the Extender input hash to change even if every
@@ -3362,6 +3646,7 @@ async function loadProjectFile(node, runtime, file) {
             detail: {
                 owner_id: String(node.id),
                 generation_mode: runtime.state?.generation_mode === "fl2va" ? "fl2va" : "ref2va",
+                motion_context: runtime.state?.motion_context !== false,
             },
         }));
     } catch (error) {
@@ -3859,12 +4144,22 @@ function render(node, runtime) {
     cards.replaceChildren();
 
     const fl2vaMode = state.generation_mode === "fl2va";
-    syncModeSpecificNativeWidgets(node, runtime, fl2vaMode);
+    const independentRef2va = ref2vaIndependentMode(state);
+    const randomAccess = fl2vaMode || independentRef2va;
+    syncModeSpecificNativeWidgets(node, runtime);
     renderMediaStrip(node, runtime, fl2vaMode);
     if (runtime.modeButton) {
         runtime.modeButton.textContent = fl2vaMode ? "MODE: FL2VA" : "MODE: REF2VA";
     }
+    if (runtime.motionButton) {
+        runtime.motionButton.style.display = fl2vaMode ? "none" : "inline-block";
+        runtime.motionButton.textContent = state.motion_context === false ? "MOTION: OFF" : "MOTION: ON";
+        runtime.motionButton.title = state.motion_context === false
+            ? "Independent Ref2VA clips: no Motion Context; reruns and edits stay targeted"
+            : "Causal Ref2VA chain: each clip receives Motion Context from the previous clip";
+    }
     if (runtime.generationModeWidget) runtime.generationModeWidget.value = fl2vaMode ? "fl2va" : "ref2va";
+    if (runtime.motionContextWidget) runtime.motionContextWidget.value = state.motion_context !== false;
     if (runtime.refsSection) runtime.refsSection.style.display = "block";
     if (runtime.interruptButton) {
         const active = ["preparing", "sampling", "complete"].includes(String(runtime.activePhase || ""));
@@ -3875,7 +4170,7 @@ function render(node, runtime) {
     }
     counter.textContent = fl2vaMode
         ? `${state.clips.length} plan${state.clips.length > 1 ? "s" : ""} • FL2VA`
-        : `${state.clips.length} clip${state.clips.length > 1 ? "s" : ""} • ${refCount(runtime)} ref${refCount(runtime) === 1 ? "" : "s"}`;
+        : `${state.clips.length} clip${state.clips.length > 1 ? "s" : ""} • ${refCount(runtime)} ref${refCount(runtime) === 1 ? "" : "s"}${independentRef2va ? " • independent" : ""}`;
     status.textContent = runtime.statusText || "Ready";
 
     state.clips.forEach((clip, index) => {
@@ -3893,7 +4188,7 @@ function render(node, runtime) {
         card.style.flexDirection = "column";
         card.style.minHeight = `${cardMinHeightForState(state)}px`;
 
-        const st = cardStatus(runtime, clip, index);
+        const st = cardStatus(node, runtime, clip, index);
         if (st === "rendering") {
             card.style.border = "3px solid rgba(70,210,255,1)";
             card.style.boxShadow = "0 0 0 1px rgba(70,210,255,.25), 0 0 16px rgba(70,210,255,.38)";
@@ -3949,7 +4244,7 @@ function render(node, runtime) {
         colorButton.type = "button";
         colorButton.textContent = "🎨";
         const colorBusy = ["preparing", "sampling", "complete"].includes(String(runtime.activePhase || ""));
-        const colorCached = fl2vaMode
+        const colorCached = randomAccess
             ? runtime.cachedClipIds?.has(String(clip.id))
             : index < Number(runtime.cachedCount || 0);
         colorButton.title = colorBusy
@@ -4026,21 +4321,22 @@ function render(node, runtime) {
             });
             head.appendChild(refsButton);
         }
-        if (fl2vaMode) {
+        if (randomAccess) {
             const insertButton = document.createElement("button");
             insertButton.type = "button";
             insertButton.textContent = "+";
-            insertButton.title = "Insert a new independent FL2VA plan after this one";
+            insertButton.title = fl2vaMode
+                ? "Insert a new independent FL2VA plan after this one"
+                : "Insert a new independent Ref2VA clip after this one";
             insertButton.style.width = "24px";
             insertButton.style.height = "22px";
             insertButton.style.padding = "0";
             insertButton.addEventListener("click", (e) => {
                 e.preventDefault();
                 state.clips.splice(index + 1, 0, newClip(index + 1));
-                // A former follower moved one position to the right. If it was
-                // linked to "Previous", its predecessor changed and its chain
-                // must be regenerated.
-                if (String(state.clips[index + 2]?.first_source || "manual") === "previous_clip") {
+                // Only FL2VA has an explicit Previous dependency. Independent
+                // Ref2VA clips are stable-ID random-access and stay untouched.
+                if (fl2vaMode && String(state.clips[index + 2]?.first_source || "manual") === "previous_clip") {
                     invalidateFl2vaPlanAndFollowers(runtime, index + 2, true);
                 }
                 updateHidden(node, runtime);
@@ -4049,7 +4345,7 @@ function render(node, runtime) {
             const deleteButton = document.createElement("button");
             deleteButton.type = "button";
             deleteButton.textContent = "×";
-            deleteButton.title = "Remove this FL2VA plan";
+            deleteButton.title = fl2vaMode ? "Remove this FL2VA plan" : "Remove this independent Ref2VA clip";
             deleteButton.style.width = "24px";
             deleteButton.style.height = "22px";
             deleteButton.style.padding = "0";
@@ -4058,9 +4354,11 @@ function render(node, runtime) {
                 e.preventDefault();
                 if (state.clips.length <= 1) return;
                 state.clips.splice(index, 1);
-                healFirstPlanPreviousSource(runtime);
-                if (String(state.clips[index]?.first_source || "manual") === "previous_clip") {
-                    invalidateFl2vaPlanAndFollowers(runtime, index, true);
+                if (fl2vaMode) {
+                    healFirstPlanPreviousSource(runtime);
+                    if (String(state.clips[index]?.first_source || "manual") === "previous_clip") {
+                        invalidateFl2vaPlanAndFollowers(runtime, index, true);
+                    }
                 }
                 updateHidden(node, runtime);
                 render(node, runtime);
@@ -4405,6 +4703,7 @@ function render(node, runtime) {
                     });
                 }
                 updateHidden(node, runtime);
+                captureNativeWorkflowState(node, runtime);
                 render(node, runtime);
             });
             loraBox.appendChild(loraSelect);
@@ -4419,6 +4718,7 @@ function render(node, runtime) {
                 if (isAddRow || !clip.loras[loraIndex]) return;
                 clip.loras[loraIndex].strength = Math.max(-100, Math.min(100, Number(loraStrength.value || 0)));
                 updateHidden(node, runtime);
+                captureNativeWorkflowState(node, runtime);
             });
             loraStrengthBox.appendChild(loraStrength);
 
@@ -4524,11 +4824,28 @@ function render(node, runtime) {
         const validated = document.createElement("input");
         validated.type = "checkbox";
         validated.checked = clip.validated;
-        validated.addEventListener("change", () => {
-            if (fl2vaMode) {
-                // FL2VA plans are independent: validation is per card and never
-                // forces later plans open.
-                clip.validated = Boolean(validated.checked);
+        validated.addEventListener("change", async () => {
+            const wasValidated = Boolean(clip.validated);
+            let persistRef2vaValidation = false;
+
+            if (randomAccess) {
+                // Random-access plans/clips validate independently, but a clip
+                // can only be marked Validated when its physical cache exists.
+                if (validated.checked) {
+                    const cached = runtime.cachedClipIds?.has(String(clip.id));
+                    if (!cached) {
+                        clip.validated = false;
+                        validated.checked = false;
+                        runtime.statusText = `Clip ${index + 1} cannot be marked Validated because its cache does not exist yet.`;
+                    } else {
+                        clip.validated = true;
+                    }
+                } else {
+                    clip.validated = false;
+                }
+                if (independentRef2va && Boolean(clip.validated) !== wasValidated) {
+                    persistRef2vaValidation = true;
+                }
             } else {
                 if (validated.checked) {
                     clip.validated = true;
@@ -4540,6 +4857,15 @@ function render(node, runtime) {
                     if (open) c.validated = false;
                     else if (!c.validated) open = true;
                 }
+                // Ref2VA Motion ON is causal, but its disk manifest is still
+                // authoritative after a browser refresh. Persist the exact
+                // manual prefix change just like independent Ref2VA persists
+                // its per-clip state. FL2VA keeps its existing behavior.
+                if (String(state?.generation_mode || "ref2va") === "ref2va"
+                    && state?.motion_context !== false
+                    && Boolean(clip.validated) !== wasValidated) {
+                    persistRef2vaValidation = true;
+                }
             }
             updateHidden(node, runtime);
             // Nodes 2.0 captures native control edits around pointer events.
@@ -4548,6 +4874,67 @@ function render(node, runtime) {
             // Otherwise immediately changing run_mode can resurrect the previous
             // validation snapshot and send a validated clip back to the sampler.
             captureNativeWorkflowState(node, runtime);
+
+            // Ref2VA restores validation from its disk manifest after F5 in
+            // both Motion OFF and Motion ON. Persist both manual validation
+            // directions so the authoritative manifest and the card checkbox
+            // always agree. FL2VA deliberately stays on its historical path.
+            if (persistRef2vaValidation) {
+                const requestedValidated = Boolean(clip.validated);
+                validated.disabled = true;
+                const persisted = await persistLocalRefInvalidation(
+                    node, runtime, index, requestedValidated
+                );
+                validated.disabled = false;
+                if (!persisted) {
+                    clip.validated = wasValidated;
+                    validated.checked = wasValidated;
+                    if (independentRef2va) {
+                        if (wasValidated) runtime.validatedClipIds?.add(String(clip.id));
+                        else runtime.validatedClipIds?.delete(String(clip.id));
+                        runtime.validatedCount = runtime.validatedClipIds?.size || 0;
+                    } else {
+                        runtime.validatedCount = validatedPrefixFromState(state);
+                        runtime.validatedClipIds = new Set(
+                            (state.clips || [])
+                                .slice(0, runtime.validatedCount)
+                                .map((item) => String(item?.id || ""))
+                                .filter(Boolean)
+                        );
+                    }
+                    updateHidden(node, runtime);
+                    captureNativeWorkflowState(node, runtime);
+                    render(node, runtime);
+                    return;
+                }
+                if (independentRef2va) {
+                    if (requestedValidated) runtime.validatedClipIds?.add(String(clip.id));
+                    else runtime.validatedClipIds?.delete(String(clip.id));
+                    runtime.validatedCount = runtime.validatedClipIds?.size || 0;
+                } else {
+                    runtime.validatedCount = validatedPrefixFromState(state);
+                    runtime.validatedClipIds = new Set(
+                        (state.clips || [])
+                            .slice(0, runtime.validatedCount)
+                            .map((item) => String(item?.id || ""))
+                            .filter(Boolean)
+                    );
+                    // Keep the interrupted Full-Batch checkpoint labels causal:
+                    // validating a candidate consumes its own COMPUTED marker;
+                    // invalidating clip N revokes COMPUTED for N and every later
+                    // clip because they depend on that Motion Context chain.
+                    if (requestedValidated) {
+                        runtime.computedIndices?.delete(index);
+                    } else {
+                        runtime.computedIndices = new Set(
+                            [...(runtime.computedIndices || [])]
+                                .filter((value) => Number(value) < index)
+                        );
+                    }
+                }
+                snapshotModeValidation(runtime);
+            }
+
             render(node, runtime);
         });
         validateLabel.append(validated, document.createTextNode("Validated"));
@@ -4563,7 +4950,9 @@ function render(node, runtime) {
             reroll.textContent = "↻";
             reroll.title = fl2vaMode
                 ? "Discard this computed checkpoint so this FL2VA plan is rendered again"
-                : "Discard this computed checkpoint; Ref2VA will rerender this clip and the following chain";
+                : (independentRef2va
+                    ? "Discard this computed checkpoint so only this independent Ref2VA clip is rendered again"
+                    : "Discard this computed checkpoint; Ref2VA will rerender this clip and the following chain");
             reroll.style.width = "27px";
             reroll.style.height = "22px";
             reroll.style.padding = "0";
@@ -4587,6 +4976,113 @@ function render(node, runtime) {
         card.appendChild(foot);
         cards.appendChild(card);
     });
+
+    // Nodes 2.0 can recompute the DOM-widget grid after the Extender rebuilds
+    // its cards (for example when toggling a Validated checkbox). During that
+    // Vue layout pass the timeline may temporarily fall back to intrinsic card
+    // height, leaving unused space below until a manual node resize occurs.
+    // Reapply the same Nodes 2.0 grid/elastic-height normalization after Vue
+    // has committed the rebuilt DOM. Legacy never enters this branch.
+    if (globalThis.LiteGraph?.vueNodesMode === true) {
+        requestAnimationFrame(() => {
+            requestAnimationFrame(() => syncDomHeight(node, runtime, false));
+        });
+    }
+}
+
+function nodes2NormalizeWidgetGrid(runtime) {
+    const root = runtime?.root;
+    if (!root?.isConnected) return null;
+    const timelineRow = root.closest?.(".lg-node-widget");
+    const grid = timelineRow?.parentElement?.closest?.(".lg-node-widgets")
+        || timelineRow?.parentElement;
+    if (!timelineRow || !grid?.classList?.contains("lg-node-widgets")) return null;
+
+    // Vue Nodes 2.0 generates an explicit grid-template-rows list from its
+    // processed widget model. Our serialized multiline clips_json widget is
+    // intentionally hidden with CSS, but Vue can still keep its original
+    // expanding `auto` track in that list. On a manual vertical resize that
+    // invisible track absorbs free height and pushes resolution_mode away from
+    // its control while starving the Extender DOM row. Rebuild the track list
+    // from the rows that are ACTUALLY visible in the DOM: native controls stay
+    // min-content and only the Extender timeline owns the remaining 1fr.
+    const visibleRows = Array.from(grid.children).filter((row) => {
+        if (!(row instanceof HTMLElement)) return false;
+        if (!row.classList.contains("col-span-full")) return false;
+        return getComputedStyle(row).display !== "none";
+    });
+    if (!visibleRows.includes(timelineRow)) return null;
+
+    const minH = nodes2MinHeightForState(runtime.state);
+    const tracks = visibleRows.map((row) =>
+        row === timelineRow ? `minmax(${minH}px, 1fr)` : "min-content"
+    );
+    const template = tracks.join(" ");
+    if (grid.style.gridTemplateRows !== template) {
+        grid.style.gridTemplateRows = template;
+    }
+    grid.style.flex = "1 1 auto";
+    runtime.nodes2WidgetGrid = grid;
+    ensureNodes2WidgetGridObserver(runtime, grid);
+    return timelineRow;
+}
+
+function ensureNodes2WidgetGridObserver(runtime, grid) {
+    if (!runtime || !grid || globalThis.LiteGraph?.vueNodesMode !== true) return;
+    if (runtime.nodes2WidgetGridObserver && runtime.nodes2ObservedWidgetGrid === grid) return;
+
+    runtime.nodes2WidgetGridObserver?.disconnect?.();
+    runtime.nodes2ObservedWidgetGrid = grid;
+    runtime.nodes2WidgetGridObserver = new MutationObserver(() => {
+        if (globalThis.LiteGraph?.vueNodesMode !== true) return;
+        if (!runtime?.root?.isConnected || !grid?.isConnected) return;
+        // Vue rewrites WidgetGrid inline sizing during node resize, execution
+        // state changes and widget refreshes. Re-normalize in this mutation
+        // microtask, before the browser paints an intermediate collapsed row.
+        const row = nodes2NormalizeWidgetGrid(runtime);
+        applyNodes2TimelineHeight(runtime, row);
+    });
+    runtime.nodes2WidgetGridObserver.observe(grid, {
+        attributes: true,
+        attributeFilter: ["style"],
+        childList: true,
+    });
+}
+
+function applyNodes2TimelineHeight(runtime, timelineRow = null) {
+    const root = runtime?.root;
+    const cards = runtime?.cards;
+    if (!root || !cards) return;
+    const minH = nodes2MinHeightForState(runtime.state);
+
+    // Nodes 2.0 owns the grid-track height. Never copy the current pixel height
+    // back onto the DOM root: after an upward resize that pixel value becomes
+    // intrinsic content and the Vue grid can no longer shrink the node again.
+    // Instead the row keeps a stable minimum and the Extender simply fills 100%
+    // of whatever height Vue currently allocates, in either direction.
+    if (timelineRow) {
+        timelineRow.style.minHeight = `${minH}px`;
+        timelineRow.style.height = "auto";
+        timelineRow.style.overflow = "hidden";
+    }
+    root.style.height = "100%";
+    root.style.minHeight = `${minH}px`;
+    root.style.maxHeight = "none";
+    root.style.flex = "1 1 0";
+    root.style.overflow = "hidden";
+    cards.style.height = "auto";
+    cards.style.flex = "1 1 0";
+    cards.style.minHeight = `${cardMinHeightForState(runtime.state) + CARD_SCROLLBAR_SPACE}px`;
+}
+
+function ensureNodes2TimelineObserver(node, runtime, timelineRow) {
+    // No observer is needed anymore. The Nodes 2.0 grid track is the source of
+    // truth and root/cards fill it with percentage/flex sizing. Keeping a
+    // ResizeObserver that writes measured pixels back into the content would
+    // recreate the one-way growth latch we are explicitly avoiding.
+    runtime.nodes2TimelineObserver?.disconnect?.();
+    runtime.nodes2TimelineObserver = null;
+    runtime.nodes2ObservedTimelineRow = timelineRow || null;
 }
 
 function syncDomHeight(node, runtime, forceMin = false, retry = 0) {
@@ -4604,6 +5100,7 @@ function syncDomHeight(node, runtime, forceMin = false, retry = 0) {
     // value from node.size here: node.size -> DOM getHeight -> node.size is the
     // feedback loop that created the infinite-height nodes.
     if (mode === "nodes2") {
+        setLegacyExtenderWidgetFullWidth(runtime, false);
         const currentH = Number(node.size?.[1] || 0);
         const y = Number(runtime.domWidget.last_y);
         const nodes2MinH = nodes2MinHeightForState(runtime.state);
@@ -4639,31 +5136,21 @@ function syncDomHeight(node, runtime, forceMin = false, retry = 0) {
 
         runtime.lastRenderMode = "nodes2";
 
-        // Nodes 2.0 mounts this element inside WidgetDOM.vue's flex wrapper
-        // (`flex flex-col *:flex-1`) and NodeWidgets.vue owns the grid row.
-        // Do NOT use percentage heights here. A `height: 100%` has no stable
-        // intrinsic size while CSS Grid is resolving an `auto` row; after a
-        // manual resize that row can collapse to 0 and WidgetDOM will not
-        // remount the element until a page refresh. Keep a real intrinsic
-        // minimum instead and let Vue stretch the row/child naturally.
-        runtime.root.style.height = "auto";
-        runtime.root.style.minHeight = `${nodes2MinH}px`;
+        // Vue owns the node height, but the Extender owns which of its widget
+        // rows is allowed to expand. Normalize the Nodes 2.0 grid so hidden
+        // serialized multiline widgets cannot keep an invisible `auto` track.
+        const timelineRow = nodes2NormalizeWidgetGrid(runtime);
+        ensureNodes2TimelineObserver(node, runtime, timelineRow);
+        applyNodes2TimelineHeight(runtime, timelineRow);
         runtime.root.style.setProperty("--comfy-widget-min-height", `${nodes2MinH}px`);
-        runtime.root.style.maxHeight = "none";
-        runtime.root.style.flex = "1 1 auto";
         runtime.root.style.paddingTop = `${5 + NODES2_TOP_GAP}px`;
-        // Avoid a second vertical clipping boundary at fractional canvas zooms.
-        // Horizontal clipping/scrolling is still owned by `cards`.
-        runtime.root.style.overflow = "visible";
-
-        runtime.cards.style.height = "auto";
-        runtime.cards.style.flex = "1 1 auto";
-        // The horizontal scrollbar has reserved space below the cards. Give the
-        // row enough intrinsic height for both the card and that gutter so the
-        // top/bottom cannot be shaved off by grid rounding at certain zooms.
-        runtime.cards.style.minHeight = `${cardMinHeightForState(runtime.state) + CARD_SCROLLBAR_SPACE}px`;
         return;
     }
+
+    // Legacy only: prevent ComfyUI from pinning the DOM widget to the stale
+    // sidebar-adjusted host width. Keep widget.width undefined so LiteGraph
+    // always falls back to the live node width, exactly like Final Decode.
+    setLegacyExtenderWidgetFullWidth(runtime, true);
 
     const y = Number(runtime.domWidget.last_y);
     if (!Number.isFinite(y) || y <= 0) {
@@ -4674,6 +5161,13 @@ function syncDomHeight(node, runtime, forceMin = false, retry = 0) {
     }
 
     // Remove Nodes 2.0-only intrinsic sizing when returning to Legacy.
+    runtime.nodes2TimelineObserver?.disconnect?.();
+    runtime.nodes2TimelineObserver = null;
+    runtime.nodes2ObservedTimelineRow = null;
+    runtime.nodes2WidgetGridObserver?.disconnect?.();
+    runtime.nodes2WidgetGridObserver = null;
+    runtime.nodes2ObservedWidgetGrid = null;
+    runtime.nodes2WidgetGrid = null;
     runtime.root.style.paddingTop = "5px";
     runtime.root.style.minHeight = "0";
     runtime.root.style.setProperty("--comfy-widget-min-height", `${UI_MIN_HEIGHT}px`);
@@ -4746,12 +5240,15 @@ function hydrateRuntimeFromNativeWidgets(node, runtime, restoreCache = false) {
     const rawState = String(runtime.jsonWidget?.value || "");
     const state = parseState(rawState);
     const mode = persistentGenerationMode(node, rawState);
+    const motionContext = persistentMotionContext(node, rawState);
+    state.motion_context = motionContext;
     activateModeState(state, mode);
     runtime.state = state;
     if (runtime.generationModeWidget) runtime.generationModeWidget.value = mode;
+    if (runtime.motionContextWidget) runtime.motionContextWidget.value = motionContext;
 
     runtime.refsState = parseRefsState(runtime.refsWidget?.value);
-    snapshotModeValidation(runtime, mode);
+    snapshotModeValidation(runtime, mode, motionContext);
     const restoredValidatedPrefix = validatedPrefixFromState(runtime.state);
     runtime.cachedCount = restoredValidatedPrefix;
     runtime.validatedCount = restoredValidatedPrefix;
@@ -4790,12 +5287,14 @@ function buildUi(node) {
     const jsonWidget = getWidget(node, "clips_json");
     const refsWidget = getWidget(node, "refs_json");
     const generationModeWidget = getWidget(node, "generation_mode");
+    const motionContextWidget = getWidget(node, "motion_context");
     const contextLengthWidget = getWidget(node, "context_length");
     const audioContextLengthWidget = getWidget(node, "audio_context_length");
-    if (!jsonWidget || !refsWidget || !generationModeWidget) return null;
+    if (!jsonWidget || !refsWidget || !generationModeWidget || !motionContextWidget) return null;
     hideNativeWidget(node, jsonWidget);
     hideNativeWidget(node, refsWidget);
     hideNativeWidget(node, generationModeWidget);
+    hideNativeWidget(node, motionContextWidget);
 
     const state = parseState(jsonWidget.value);
     // Initial node construction can happen before a saved workflow has been
@@ -4803,10 +5302,14 @@ function buildUi(node) {
     // from the native serialized widgets.
     const persistedMode = persistentGenerationMode(node, jsonWidget.value);
     generationModeWidget.value = persistedMode;
+    const persistedMotion = persistentMotionContext(node, jsonWidget.value);
+    motionContextWidget.value = persistedMotion;
+    state.motion_context = persistedMotion;
     activateModeState(state, persistedMode);
     const refsState = parseRefsState(refsWidget.value);
 
     const root = document.createElement("div");
+    root.dataset.h3ExtenderRoot = "1";
     root.style.width = "100%";
     root.style.minWidth = "0";
     const initialUiMinHeight = uiMinHeightForState(state);
@@ -4839,7 +5342,11 @@ function buildUi(node) {
         // REF2VA and FL2VA own completely independent card timelines. Store the
         // active array before switching and restore the other mode's array;
         // edits, insertions and deletions in one mode never mutate the other.
+        snapshotModeValidation(runtime);
         activateModeState(runtime.state, next);
+        if (!restoreModeValidation(runtime)) {
+            for (const clip of runtime.state.clips) clip.validated = false;
+        }
         generationModeWidget.value = next;
         runtime.cachedClipIds = new Set();
         runtime.validatedClipIds = new Set();
@@ -4851,6 +5358,51 @@ function buildUi(node) {
         runtime.cachedCount = 0;
         runtime.validatedCount = 0;
         runtime.cacheStateRestored = false;
+        updateHidden(node, runtime);
+        captureNativeWorkflowState(node, runtime);
+        render(node, runtime);
+        restoreCacheState(node, runtime);
+        requestAnimationFrame(() => syncDomHeight(node, runtime, true));
+    });
+
+    const motionButton = document.createElement("button");
+    motionButton.title = "Toggle Ref2VA Motion Context";
+    motionButton.addEventListener("click", async (e) => {
+        e.preventDefault();
+        if (projectBusy(runtime) || runtime.state?.generation_mode === "fl2va") return;
+
+        const nextMotionContext = runtime.state?.motion_context === false;
+        snapshotModeValidation(runtime);
+        const targetKey = validationStateKey("ref2va", nextMotionContext);
+        const hasTargetSnapshot = runtime?.modeValidationState?.[targetKey] instanceof Map;
+        const bootstrap = await bootstrapRef2vaMotionToggleCache(node, runtime, nextMotionContext);
+        if (bootstrap?.bootstrapped && !hasTargetSnapshot) {
+            seedModeValidationFromCurrent(runtime, "ref2va", nextMotionContext);
+        }
+
+        runtime.state.motion_context = nextMotionContext;
+        motionContextWidget.value = runtime.state.motion_context !== false;
+
+        // Motion ON and OFF keep separate physical caches, but the first switch
+        // should inherit already-rendered Ref2VA clips into the target cache.
+        // If the target snapshot still does not exist, fall back to an empty
+        // validation state rather than fabricating validated clips.
+        if (!restoreModeValidation(runtime)) {
+            for (const clip of runtime.state.clips) clip.validated = false;
+        }
+        runtime.cachedClipIds = new Set();
+        runtime.validatedClipIds = new Set();
+        runtime.computedIndices = new Set();
+        runtime.computedClipIds = new Set();
+        runtime.checkpointActive = false;
+        runtime.checkpointInterrupted = false;
+        runtime.checkpointSnapshotCount = 0;
+        runtime.cachedCount = 0;
+        runtime.validatedCount = validatedPrefixFromState(runtime.state);
+        runtime.cacheStateRestored = false;
+        if (bootstrap?.error) {
+            runtime.statusText = `Motion toggle cache bootstrap failed: ${bootstrap.error}`;
+        }
         updateHidden(node, runtime);
         captureNativeWorkflowState(node, runtime);
         render(node, runtime);
@@ -4933,7 +5485,7 @@ function buildUi(node) {
     status.style.textOverflow = "ellipsis";
     status.style.maxWidth = "55%";
 
-    toolbar.append(modeButton, add, remove, saveProjectButton, loadProjectButton, interruptButton, counter, status, projectFileInput);
+    toolbar.append(modeButton, motionButton, add, remove, saveProjectButton, loadProjectButton, interruptButton, counter, status, projectFileInput);
 
     const refFileInput = document.createElement("input");
     refFileInput.type = "file";
@@ -5013,9 +5565,11 @@ function buildUi(node) {
         refFileInput,
         frameFileInput,
         generationModeWidget,
+        motionContextWidget,
         contextLengthWidget,
         audioContextLengthWidget,
         modeButton,
+        motionButton,
         pendingRefSlot: -1,
         pendingFrameClip: -1,
         pendingFrameKind: "",
@@ -5028,6 +5582,13 @@ function buildUi(node) {
         syncingDomHeight: false,
         lastRenderMode: null,
         legacyNodeHeight: null,
+        legacyWidthPinInstalled: false,
+        legacyWidthOwnDescriptor: null,
+        nodes2TimelineObserver: null,
+        nodes2ObservedTimelineRow: null,
+        nodes2WidgetGridObserver: null,
+        nodes2ObservedWidgetGrid: null,
+        nodes2WidgetGrid: null,
         // clips_json already preserves the validated flags. Seed the visual state
         // immediately, then replace it with the authoritative disk manifest below.
         cachedCount: restoredValidatedPrefix,
@@ -5077,9 +5638,12 @@ function buildUi(node) {
         continuitySignatures: new Map(),
         continuitySignatureRequests: new Set(),
         modeValidationState: {
-            [state.generation_mode === "fl2va" ? "fl2va" : "ref2va"]: new Map(
+            [validationStateKey(state)]: new Map(
                 (state.clips || []).map((clip) => [String(clip.id), Boolean(clip.validated)])
             ),
+        },
+        modeValidationOrder: {
+            [validationStateKey(state)]: (state.clips || []).map((clip) => String(clip.id)),
         },
         // True while ComfyUI is reconstructing a serialized graph. The official
         // lifecycle hooks clear this only after native widget restoration has
@@ -5126,20 +5690,15 @@ function buildUi(node) {
         afterResize: (resizedNode) => {
             const mode = domWidgetRenderMode(root);
             if (mode === "nodes2") {
-                // Re-assert only intrinsic CSS. Never derive anything from
-                // node.size while Vue is resolving its grid.
-                const nodes2MinH = nodes2MinHeightForState(runtime.state);
-                root.style.height = "auto";
-                root.style.minHeight = `${nodes2MinH}px`;
-                root.style.setProperty("--comfy-widget-min-height", `${nodes2MinH}px`);
-                root.style.maxHeight = "none";
-                root.style.flex = "1 1 auto";
-                root.style.paddingTop = `${5 + NODES2_TOP_GAP}px`;
-                root.style.overflow = "visible";
-                cards.style.height = "auto";
-                cards.style.flex = "1 1 auto";
-                cards.style.minHeight = `${cardMinHeightForState(runtime.state) + CARD_SCROLLBAR_SPACE}px`;
+                // Nodes 2.0 updates its WidgetGrid row after the resize callback.
+                // Wait for Vue's next layout pass, then read the row/wrapper
+                // height in syncDomHeight(). No node.size -> getHeight feedback
+                // is introduced, so the historical infinite-height bug stays
+                // impossible. Legacy does not enter this branch.
                 runtime.lastRenderMode = "nodes2";
+                requestAnimationFrame(() => {
+                    requestAnimationFrame(() => syncDomHeight(resizedNode, runtime, false));
+                });
             } else if (mode === "legacy") {
                 requestAnimationFrame(() => syncDomHeight(resizedNode, runtime, false));
             } else {
@@ -5149,6 +5708,13 @@ function buildUi(node) {
     });
     runtime.domWidget = domWidget;
     node.__h3Extender = runtime;
+
+    // Install the Legacy width workaround as soon as the widget exists.
+    // If the widget is still being re-parented, syncDomHeight() will install it
+    // on the first confirmed Legacy layout pass. Nodes 2.0 never enables it.
+    if (domWidgetRenderMode(root) === "legacy") {
+        setLegacyExtenderWidgetFullWidth(runtime, true);
+    }
 
     // FL2VA uses one horizontal scrollbar only: the card row. First/Last follows
     // it passively, which avoids the feedback/repaint flicker of two synchronized
@@ -5467,6 +6033,10 @@ app.registerExtension({
                 );
                 if (runtime.generationModeWidget) runtime.generationModeWidget.value = runtime.state.generation_mode;
             }
+            if (Object.prototype.hasOwnProperty.call(info, "motion_context")) {
+                runtime.state.motion_context = boolValue(info.motion_context, true);
+                if (runtime.motionContextWidget) runtime.motionContextWidget.value = runtime.state.motion_context;
+            }
             if (info.refs_json) {
                 runtime.refsWidget.value = info.refs_json;
                 runtime.refsState = parseRefsState(info.refs_json);
@@ -5492,6 +6062,12 @@ app.registerExtension({
             runtime.validatedCount = Number(info.validated_count || 0);
             runtime.cachedClipIds = new Set(Array.isArray(info.cached_clip_ids) ? info.cached_clip_ids.map(String) : []);
             runtime.validatedClipIds = new Set(Array.isArray(info.validated_clip_ids) ? info.validated_clip_ids.map(String) : []);
+            if (String(runtime.state?.generation_mode || "ref2va") === "ref2va" && runtime.state?.motion_context !== false) {
+                const returnedOrder = Array.isArray(info.cached_clip_ids) ? info.cached_clip_ids.map(String) : [];
+                runtime.state.causal_lineage = returnedOrder.length
+                    ? returnedOrder
+                    : (runtime.state.clips || []).slice(0, Number(info.cached_count || 0)).map((clip) => String(clip.id));
+            }
             runtime.computedIndices = new Set(
                 Array.isArray(info.computed_indices)
                     ? info.computed_indices.map((value) => Number(value)).filter((value) => Number.isInteger(value) && value >= 0)
@@ -5521,7 +6097,7 @@ app.registerExtension({
             runtime.continuitySignatures = new Map(
                 Object.entries(info?.continuity_signatures || {}).map(([key, value]) => [String(key), String(value || "")]).filter(([, value]) => Boolean(value))
             );
-            snapshotModeValidation(runtime, runtime.state?.generation_mode);
+            snapshotModeValidation(runtime);
             runtime.resolvedWidth = Number(info.resolved_width || 0);
             runtime.resolvedHeight = Number(info.resolved_height || 0);
             runtime.resolutionGuide = String(info.resolution_guide || "");
