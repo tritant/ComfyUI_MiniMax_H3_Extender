@@ -6,6 +6,18 @@ The node combines **Ref2VA conditioning, Motion Context, disk caching, multi-cli
 
 ---
 
+### 🆕 Motion Context OFF
+
+Ref2VA now includes a **Motion Context ON/OFF** option.
+
+With **Motion Context OFF**, clips are fully independent from each other. This means you can **insert, rerender, or invalidate any clip without invalidating the clips before or after it**, making random-access editing much more flexible.
+
+The trade-off is that there is **no continuity between clips**: each clip is generated as a separate shot, so characters, framing, camera position, motion, and scene composition are not automatically carried over from one clip to the next.
+
+Use **Motion Context ON** when you want continuous multi-clip motion and seamless progression, and **Motion Context OFF** when you prefer independent shots and easier editing.
+
+---
+
 ### 🆕 Per-Clip Local References
 
 Ref2VA clips can now use their own **local Picture, Video and Audio references** in addition to the existing global references.
