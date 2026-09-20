@@ -9,6 +9,7 @@ validated disk cache and the separate Final Decode / Preview node.
 The node intentionally accepts an already-patched H3 MODEL. Sigma-shift,
 upstream LoRA, Spectrum or other model patches therefore compose normally
 before the Extender; optional card-local LoRAs can be stacked on top per clip.
+Optional Alibaba PDD Acc uses ComfyUI-MiniMax-H3-PDD-Acc when selected.
 """
 
 from __future__ import annotations
@@ -51,11 +52,18 @@ from server import PromptServer
 from .motion_context_ram import MiniMaxH3MotionContextRAM
 from .prompt_bridge import MAX_PROMPTS, PROMPT_PACK_TYPE, _prompt_pack_signature
 from .reference_bridge import MAX_REFERENCE_SLOTS, REF_PACK_TYPE
+from .pdd_bridge import (
+    apply_pdd_acc,
+    is_pdd_enabled,
+    pdd_acc_choices,
+)
 from .motion_context_disk import (
     CACHE_VERSION,
     CACHE_TYPE,
     _DATA_START,
     _chain_paths,
+    _clear_refine_sidecar,
+    _invalidate_refine_from_index,
     _decoded_audio_cache_path,
     _decoded_audio_cache_end,
     _decoded_preview_cache_path,
@@ -135,7 +143,7 @@ REF_AUDIO_TIMELINE_SPLIT_SECONDS = 5.0
 MAX_CLIPS = 512
 MAX_FL2VA_GUIDES = 3
 DEFAULT_DURATION = 10.0
-DEFAULT_MEGAPIXELS = 0.40
+DEFAULT_MEGAPIXELS = 0.70
 MAX_RESOLUTION = 4096
 DEFAULT_SEED_MAX = (1 << 53) - 1  # exact integer range in browser JS
 
@@ -805,6 +813,8 @@ def _normalize_external_ref_pack(value):
         "version": int(value.get("version", 1) or 1),
         "source": str(value.get("source") or "External reference pack"),
         "count": sum(1 for image in slots if image is not None),
+        # Director / replace packs set this so empty slots wipe ghost internal refs.
+        "clear_empty": bool(value.get("clear_empty", False)),
         "slots": slots,
     }
 
@@ -827,8 +837,12 @@ def _local_picture_slot_reservations(clips):
 def _sync_refs_from_ref_pack(refs, pack, reserved_slots=None):
     """Inject connected external slots into the existing internal Ref N slots.
 
-    Empty external slots are deliberately no-ops: they never clear or compact an
-    internal reference. Connected slots keep their exact logical number.
+    Connected slots keep their exact logical number.
+
+    Empty external slots:
+    - default (Reference Bridge): no-op — leave internal Ref N untouched
+    - ``clear_empty=True`` (Director replace packs): clear internal Ref N so
+      deleted Director cards cannot leave ghost images in the Extender store
 
     A slot already reserved by any clip-local Picture is skipped, not remapped and
     never treated as a fatal error. Local refs deliberately win so an external
@@ -836,15 +850,25 @@ def _sync_refs_from_ref_pack(refs, pack, reserved_slots=None):
     """
     refs = _normalize_ref_descriptors(refs)
     if pack is None:
-        return refs, [], []
+        return refs, [], [], []
 
     reserved_slots = {int(x) for x in (reserved_slots or set()) if 1 <= int(x) <= MAX_IMAGE_REFS}
+    clear_empty = bool(pack.get("clear_empty", False))
     imported_slots = []
     skipped_slots = []
+    cleared_slots = []
     for index, image in enumerate(pack.get("slots") or [], start=1):
         if index > MAX_IMAGE_REFS:
             break
         if image is None:
+            if not clear_empty:
+                continue
+            if index in reserved_slots:
+                skipped_slots.append(index)
+                continue
+            if refs[index - 1] is not None:
+                refs[index - 1] = None
+                cleared_slots.append(index)
             continue
         if index in reserved_slots:
             skipped_slots.append(index)
@@ -868,7 +892,7 @@ def _sync_refs_from_ref_pack(refs, pack, reserved_slots=None):
         if changed:
             imported_slots.append(index)
 
-    return refs, imported_slots, skipped_slots
+    return refs, imported_slots, skipped_slots, cleared_slots
 
 
 def _edit_internal_reference(source_id, original_name, brightness, contrast, saturation, external_signature=""):
@@ -1171,14 +1195,21 @@ def _take_ref_video_h3_frames(video_frames, source_fps: float, start: int, end: 
     end = max(start, int(end))
     if end <= start:
         return video_frames[:0]
-    if abs(float(source_fps) - float(FPS)) < 1e-6 or int(video_frames.shape[0]) <= 1:
-        return video_frames[start:end]
+    source_count = int(video_frames.shape[0])
+    if source_count <= 0:
+        return video_frames[:0]
+    # Same-fps and single-frame sources: clamp indices so a short batch can be
+    # extended by repeating the last frame (H3 2s minimum pad path).
+    if abs(float(source_fps) - float(FPS)) < 1e-6 or source_count <= 1:
+        idx = torch.arange(start, end, device=video_frames.device)
+        idx = torch.clamp(idx, 0, source_count - 1)
+        return video_frames.index_select(0, idx)
 
     positions = torch.arange(
         start, end, device=video_frames.device, dtype=torch.float32
     )
     idx = torch.round(positions * (float(source_fps) / float(FPS))).to(torch.long)
-    idx = torch.clamp(idx, 0, int(video_frames.shape[0]) - 1)
+    idx = torch.clamp(idx, 0, source_count - 1)
     return video_frames.index_select(0, idx)
 
 
@@ -1214,7 +1245,11 @@ def _resize_ref_video_qwen_frames(
         return video_frames[:0, :int(height), :int(width), :3], target_positions
 
     if abs(float(source_fps) - float(FPS)) < 1e-6 or int(video_frames.shape[0]) <= 1:
-        selected = video_frames[target_positions]
+        idx = torch.tensor(
+            target_positions, device=video_frames.device, dtype=torch.long
+        )
+        idx = torch.clamp(idx, 0, max(0, int(video_frames.shape[0]) - 1))
+        selected = video_frames.index_select(0, idx)
     else:
         positions = torch.tensor(
             target_positions, device=video_frames.device, dtype=torch.float32
@@ -1604,10 +1639,24 @@ def _prepare_shared_refs(
         source_fps, full_h3_frames = _ref_video_h3_frame_count(
             video_frames, source_fps, f"ref_video_{slot}"
         )
-        if int(full_h3_frames) < int(2 * FPS):
+        min_ref_frames = int(2 * FPS)
+        if int(full_h3_frames) < 1:
             raise ValueError(
-                f"MiniMax H3 Extender: ref_video_{slot} is shorter than MiniMax H3's 2-second minimum at 24 fps."
+                f"MiniMax H3 Extender: ref_video_{slot} has no frames after 24 fps resample."
             )
+        if int(full_h3_frames) < min_ref_frames:
+            # Prefer completing the run over rejecting short refs (e.g. last-20
+            # Get Image from Batch). Later resize clamps indices so the pad is
+            # the last source frame repeated to a 2s @ 24 fps timeline.
+            pad = min_ref_frames - int(full_h3_frames)
+            _LOG.warning(
+                "MiniMax H3 Extender: ref_video_%s is %.2fs at 24 fps (< 2.00s); "
+                "padded %d frame(s) by repeating the last frame.",
+                slot,
+                float(full_h3_frames) / float(FPS),
+                int(pad),
+            )
+            full_h3_frames = min_ref_frames
 
         vh, vw = int(video_frames.shape[1]), int(video_frames.shape[2])
         cw, ch = _adapt_ref_video_canvas(vw, vh)
@@ -1825,14 +1874,31 @@ def _sigmas(model, scheduler: str, steps: int, denoise: float):
     return sigmas[-(steps + 1):]
 
 
-def _sample_h3(model, conditioning, latent, seed: int, sampler_name: str, scheduler: str, steps: int, denoise: float):
-    if int(steps) < 1:
-        raise ValueError("MiniMax H3 Extender: steps must be >= 1.")
-
+def _sample_h3(
+    model,
+    conditioning,
+    latent,
+    seed: int,
+    sampler_name: str,
+    scheduler: str,
+    steps: int,
+    denoise: float,
+    sigmas=None,
+):
     guider = _BasicGuider(model)
     guider.set_conds(conditioning)
     sampler = comfy.samplers.sampler_object(str(sampler_name))
-    sigmas = _sigmas(model, scheduler, steps, denoise)
+    if sigmas is not None:
+        if str(sampler_name).lower() != "euler":
+            logging.warning(
+                "MiniMax H3 Extender: PDD Acc is trained for sampler 'euler' "
+                "(current sampler_name=%s). Sampling continues with your choice.",
+                sampler_name,
+            )
+    else:
+        if int(steps) < 1:
+            raise ValueError("MiniMax H3 Extender: steps must be >= 1.")
+        sigmas = _sigmas(model, scheduler, steps, denoise)
 
     latent_out = latent.copy()
     latent_image = latent["samples"]
@@ -1870,6 +1936,39 @@ def _sample_h3(model, conditioning, latent, seed: int, sampler_name: str, schedu
     out.pop("downscale_ratio_temporal", None)
     out["samples"] = samples
     return out
+
+
+def _prepare_pdd_model(
+    model,
+    *,
+    generation_mode: str,
+    pdd_acc_lora="None",
+    pdd_nfe="8",
+    pdd_lora_strength=1.0,
+    pdd_head_strength=1.0,
+    denoise=1.0,
+    sampler_name="euler",
+):
+    """Return ``(model, sigmas_or_None)``. Sigmas are set only when PDD is on."""
+    if not is_pdd_enabled(pdd_acc_lora):
+        return model, None
+    if str(sampler_name).lower() != "euler":
+        logging.warning(
+            "MiniMax H3 Extender: PDD Acc recipe uses sampler 'euler' "
+            "(sampler_name=%s). Controls are left unchanged; expect quality loss "
+            "if you keep a non-euler sampler.",
+            sampler_name,
+        )
+    patched, sigmas, _info = apply_pdd_acc(
+        model,
+        str(pdd_acc_lora),
+        generation_mode=generation_mode,
+        nfe=pdd_nfe,
+        lora_strength=pdd_lora_strength,
+        head_strength=pdd_head_strength,
+        denoise=denoise,
+    )
+    return patched, sigmas
 
 
 def _normalize_color_adjustment(value=None):
@@ -2001,6 +2100,20 @@ def _apply_per_clip_loras(owner, model, clip, lora_cfgs, clip_index):
     return patched_model, clip
 
 
+def _coerce_bool(value, default=False):
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if text in ("1", "true", "yes", "on"):
+            return True
+        if text in ("0", "false", "no", "off", ""):
+            return False
+    return bool(default)
+
+
 def _default_clip(index: int = 0):
     return {
         "id": f"clip_{index + 1}",
@@ -2010,6 +2123,7 @@ def _default_clip(index: int = 0):
         "seed_mode": "randomize",
         "duration": DEFAULT_DURATION,
         "validated": False,
+        "refine_validated": False,
         "color_adjustment": _normalize_color_adjustment(),
         "loras": [],
         "local_refs": _normalize_local_refs(None),
@@ -2094,6 +2208,7 @@ def _parse_clips_json(value: str, generation_mode="ref2va", motion_context=True)
                 "seed_mode": seed_mode,
                 "duration": duration,
                 "validated": bool(raw.get("validated", False)),
+                "refine_validated": bool(raw.get("refine_validated", False)),
                 "color_adjustment": _normalize_color_adjustment(raw.get("color_adjustment")),
                 "loras": _normalize_clip_loras(raw.get("loras"), legacy=raw.get("lora")),
                 "local_refs": _normalize_local_refs(raw.get("local_refs")),
@@ -2121,6 +2236,12 @@ def _parse_clips_json(value: str, generation_mode="ref2va", motion_context=True)
             if found_open:
                 clip["validated"] = False
             elif not clip["validated"]:
+                found_open = True
+        found_open = False
+        for clip in out:
+            if found_open:
+                clip["refine_validated"] = False
+            elif not clip["refine_validated"]:
                 found_open = True
 
     return out
@@ -2411,7 +2532,15 @@ def _send_extender_prompt_pack_import(node_id, clips_json, prompt_count, source=
         pass
 
 
-def _send_extender_ref_pack_import(node_id, refs_json, imported_slots, ref_count, source="", skipped_slots=None):
+def _send_extender_ref_pack_import(
+    node_id,
+    refs_json,
+    imported_slots,
+    ref_count,
+    source="",
+    skipped_slots=None,
+    cleared_slots=None,
+):
     try:
         server = PromptServer.instance
         if server is None:
@@ -2423,6 +2552,7 @@ def _send_extender_ref_pack_import(node_id, refs_json, imported_slots, ref_count
                 "refs_json": str(refs_json),
                 "imported_slots": [int(i) for i in imported_slots or []],
                 "skipped_slots": [int(i) for i in skipped_slots or []],
+                "cleared_slots": [int(i) for i in cleared_slots or []],
                 "ref_count": int(ref_count),
                 "source": str(source or "External reference pack"),
             },
@@ -3940,6 +4070,14 @@ class MiniMaxH3Extender:
         default_sampler = "euler" if "euler" in sampler_names else sampler_names[0]
         default_scheduler = "simple" if "simple" in scheduler_names else scheduler_names[0]
 
+        try:
+            from .latent_upscaler import default_upscale_model, scan_upscale_models
+            _upscale_models = scan_upscale_models()
+            _default_upscale = default_upscale_model(_upscale_models)
+        except Exception:
+            _upscale_models = ["None"]
+            _default_upscale = "None"
+
         required = {
             "model": (
                 "MODEL",
@@ -3950,7 +4088,13 @@ class MiniMaxH3Extender:
             ),
             "clip": ("CLIP",),
             "vae": ("VAE",),
-            "run_mode": (["clip_by_clip", "full_batch"], {"default": "clip_by_clip"}),
+            "run_mode": (
+                ["clip_by_clip", "full_batch"],
+                {
+                    "default": "clip_by_clip",
+                    "tooltip": "Applies to draft generation and to run_refine. clip_by_clip processes the next open card then stops; full_batch walks the whole plan.",
+                },
+            ),
             "width": (
                 "INT",
                 {
@@ -3986,14 +4130,14 @@ class MiniMaxH3Extender:
                 ["auto_from_ref", "manual"],
                 {
                     "default": "auto_from_ref",
-                    "tooltip": "Auto uses internal Ref 1 as the aspect-ratio guide; with no internal image references it falls back to width/height.",
+                    "tooltip": "Canvas size mode. Auto keeps aspect from the reference and scales to megapixels; Manual uses width/height. With no usable reference Auto falls back to width/height.",
                 },
             ),
             "megapixels": (
                 "FLOAT",
                 {
                     "default": DEFAULT_MEGAPIXELS, "min": 0.01, "max": 16.0, "step": 0.01,
-                    "tooltip": "Target total pixels for Auto resolution. Auto and Manual canvases use the MiniMax H3 32-pixel grid; Auto snaps downward without exceeding the requested pixel budget.",
+                    "tooltip": "Target total pixels for Auto canvas size. Auto and Manual canvases use the MiniMax H3 32-pixel grid; Auto snaps downward without exceeding the requested pixel budget.",
                 },
             ),
             # Internal image-reference manager state. Appended after the v14.25
@@ -4017,6 +4161,94 @@ class MiniMaxH3Extender:
             "motion_context": (
                 "BOOLEAN",
                 {"default": True, "tooltip": "Ref2VA only: chain clips with Motion Context. Disable for independent random-access clips."},
+            ),
+            # PDD Acc (optional acceleration). Appended after motion_context so
+            # older positional widget arrays keep their original mapping.
+            "pdd_acc_lora": (
+                pdd_acc_choices(),
+                {
+                    "default": "None",
+                    "tooltip": "Optional Alibaba MiniMax-H3 PDD Acc LoRA from models/pdd_acc/. Requires ComfyUI-MiniMax-H3-PDD-Acc. None = normal steps/scheduler. When set, the trained PDD sigma grid is used and steps/scheduler are ignored.",
+                },
+            ),
+            "pdd_nfe": (
+                ["8", "4"],
+                {
+                    "default": "8",
+                    "tooltip": "PDD model evaluations (sampler steps). 8 is the trained default; 4 is the official faster regrouping. Ignored when pdd_acc_lora is None.",
+                },
+            ),
+            "pdd_lora_strength": (
+                "FLOAT",
+                {
+                    "default": 1.0,
+                    "min": -2.0,
+                    "max": 2.0,
+                    "step": 0.01,
+                    "tooltip": "PDD trunk LoRA strength (trained at 1.0). Ignored when pdd_acc_lora is None.",
+                },
+            ),
+            "pdd_head_strength": (
+                "FLOAT",
+                {
+                    "default": 1.0,
+                    "min": 0.0,
+                    "max": 2.0,
+                    "step": 0.01,
+                    "tooltip": "PDD head-bank blend strength (trained at 1.0). Ignored when pdd_acc_lora is None.",
+                },
+            ),
+            # Latent refine (appended for workflow widget compatibility).
+            "run_refine": (
+                "BOOLEAN",
+                {
+                    "default": False,
+                    "tooltip": "When True, keep the draft cache and run a second pass: neural latent upscale + resample with refine_denoise. Canvas size is ignored (draft geometry + refine_megapixels). Honors run_mode and refine Validated prefix. Refines the drafted prefix (clip_by_clip can refine clip 1 before the rest exist). Requires latent_upscale_model.",
+                },
+            ),
+            "latent_upscale_model": (
+                _upscale_models,
+                {
+                    "default": _default_upscale,
+                    "tooltip": "H3 latent upscaler weights from models/latent_upscale_models/. Used by run_refine.",
+                },
+            ),
+            "refine_megapixels": (
+                "FLOAT",
+                {
+                    "default": 1.2,
+                    "min": 0.1,
+                    "max": 8.0,
+                    "step": 0.1,
+                    "tooltip": "Target megapixels for the refine pass after latent upscale.",
+                },
+            ),
+            "refine_denoise": (
+                "FLOAT",
+                {
+                    "default": 0.3,
+                    "min": 0.01,
+                    "max": 1.0,
+                    "step": 0.01,
+                    "tooltip": "Sampler denoise for the refine pass (img2img on upscaled draft latents).",
+                },
+            ),
+            "refine_steps": (
+                "INT",
+                {
+                    "default": 4,
+                    "min": 1,
+                    "max": 10000,
+                    "step": 1,
+                    "tooltip": "Sampler steps for the refine pass.",
+                },
+            ),
+            "latent_upscale_precision": (
+                ["fp16", "bf16", "fp32"],
+                {
+                    "default": "bf16",
+                    "tooltip": "Compute precision for the latent upscaler during refine.",
+                },
             ),
         }
 
@@ -4130,7 +4362,7 @@ class MiniMaxH3Extender:
             "ref_pack": (
                 REF_PACK_TYPE,
                 {
-                    "tooltip": "Optional external image-reference pack. Connected Ref N slots are imported into the matching internal Ref N slots on Queue; empty slots leave internal references untouched."
+                    "tooltip": "Optional external image-reference pack. Connected Ref N slots are imported into the matching internal Ref N slots on Queue. Empty slots leave internals untouched unless the pack sets clear_empty (Director does)."
                 },
             ),
             "prompt_pack": (
@@ -4209,11 +4441,26 @@ class MiniMaxH3Extender:
         resolution_mode,
         megapixels,
         export_profile,
+        pdd_acc_lora="None",
+        pdd_nfe="8",
+        pdd_lora_strength=1.0,
+        pdd_head_strength=1.0,
     ):
         if fl2va_model is None:
             raise ValueError(
                 "MiniMax H3 Extender: FL2VA mode requires the fl2va_model input."
             )
+
+        fl2va_model, pdd_sigmas = _prepare_pdd_model(
+            fl2va_model,
+            generation_mode="fl2va",
+            pdd_acc_lora=pdd_acc_lora,
+            pdd_nfe=pdd_nfe,
+            pdd_lora_strength=pdd_lora_strength,
+            pdd_head_strength=pdd_head_strength,
+            denoise=denoise,
+            sampler_name=sampler_name,
+        )
 
         clip_ids = [str(cfg.get("id") or f"clip_{i + 1}") for i, cfg in enumerate(clips)]
         data_path, manifest_path, manifest = sync_fl2va_manifest(owner, FPS, clip_ids)
@@ -4500,6 +4747,7 @@ class MiniMaxH3Extender:
             sampled = _sample_h3(
                 clip_model, positive, latent, cfg["seed"],
                 str(sampler_name), str(scheduler), int(steps), float(denoise),
+                sigmas=pdd_sigmas,
             )
             (
                 previous_handle,
@@ -4735,6 +4983,16 @@ class MiniMaxH3Extender:
         refs_json=None,
         generation_mode="ref2va",
         motion_context=True,
+        pdd_acc_lora="None",
+        pdd_nfe="8",
+        pdd_lora_strength=1.0,
+        pdd_head_strength=1.0,
+        run_refine=False,
+        latent_upscale_model="None",
+        refine_megapixels=1.2,
+        refine_denoise=0.3,
+        refine_steps=4,
+        latent_upscale_precision="bf16",
         prompt_pack=None,
         ref_pack=None,
         unique_id=None,
@@ -4743,6 +5001,7 @@ class MiniMaxH3Extender:
     ):
         generation_mode = _normalize_generation_mode(generation_mode)
         motion_context = bool(motion_context)
+        run_refine = _coerce_bool(run_refine, False)
         stored_prompt_pack_signature = _prompt_pack_signature_from_state(clips_json)
         clips = _parse_clips_json(clips_json, generation_mode, motion_context)
         external_prompt_pack = _normalize_external_prompt_pack(prompt_pack)
@@ -4756,6 +5015,15 @@ class MiniMaxH3Extender:
         owner = str(unique_id if unique_id is not None else "h3_extender")
         if external_prompt_pack is None:
             active_prompt_pack_signature = ""
+
+        if bool(run_refine) and generation_mode == "fl2va":
+            raise ValueError(
+                "MiniMax H3 Extender: run_refine is currently supported for REF2VA only."
+            )
+        if bool(run_refine) and not motion_context:
+            raise ValueError(
+                "MiniMax H3 Extender: run_refine requires Ref2VA Motion Context (causal draft cache)."
+            )
 
         requested_export_profile = _final_decode_profile_from_prompt(prompt, owner)
 
@@ -4781,6 +5049,10 @@ class MiniMaxH3Extender:
                 resolution_mode=resolution_mode,
                 megapixels=megapixels,
                 export_profile=requested_export_profile,
+                pdd_acc_lora=pdd_acc_lora,
+                pdd_nfe=pdd_nfe,
+                pdd_lora_strength=pdd_lora_strength,
+                pdd_head_strength=pdd_head_strength,
             )
 
         if not motion_context:
@@ -4796,6 +5068,10 @@ class MiniMaxH3Extender:
                 resolution_mode=resolution_mode, megapixels=megapixels,
                 refs_json=refs_json, ref_pack=ref_pack,
                 export_profile=requested_export_profile, kwargs=kwargs,
+                pdd_acc_lora=pdd_acc_lora,
+                pdd_nfe=pdd_nfe,
+                pdd_lora_strength=pdd_lora_strength,
+                pdd_head_strength=pdd_head_strength,
             )
 
         data_path, manifest_path, manifest = _manifest_for_extender(owner, FPS)
@@ -4816,12 +5092,16 @@ class MiniMaxH3Extender:
         refs = _parse_refs_json(refs_json)
         external_ref_pack = _normalize_external_ref_pack(ref_pack)
         local_picture_slots = _local_picture_slot_reservations(clips)
-        refs, ref_pack_imported_slots, ref_pack_skipped_slots = _sync_refs_from_ref_pack(
-            refs,
-            external_ref_pack,
-            local_picture_slots,
+        refs, ref_pack_imported_slots, ref_pack_skipped_slots, ref_pack_cleared_slots = (
+            _sync_refs_from_ref_pack(
+                refs,
+                external_ref_pack,
+                local_picture_slots,
+            )
         )
-        if (ref_pack_imported_slots or ref_pack_skipped_slots) and external_ref_pack is not None:
+        if (
+            ref_pack_imported_slots or ref_pack_skipped_slots or ref_pack_cleared_slots
+        ) and external_ref_pack is not None:
             _send_extender_ref_pack_import(
                 owner,
                 _refs_json(refs),
@@ -4829,6 +5109,7 @@ class MiniMaxH3Extender:
                 int(external_ref_pack.get("count", 0) or 0),
                 external_ref_pack.get("source") or "External reference pack",
                 skipped_slots=ref_pack_skipped_slots,
+                cleared_slots=ref_pack_cleared_slots,
             )
         refs_signature = _refs_signature(refs)
         requested_resolution = _resolve_generation_resolution(
@@ -4870,21 +5151,42 @@ class MiniMaxH3Extender:
         previous_cache_resolution = dict(cache_resolution) if requested_mismatch else None
 
         if requested_mismatch:
-            # Resolution is the one unavoidable global invalidation: latent
-            # geometry cannot be mixed inside one sequential disk chain.
-            manifest = _truncate_chain(data_path, manifest_path, manifest, 0)
-            segments = []
-            cache_resolution = None
-            cache_has_segments = False
-            resolution["cache_reset"] = True
-            for cfg in clips:
-                cfg["validated"] = False
-            try:
-                preview_path = _decoded_preview_cache_path(data_path)
-                if preview_path.exists():
-                    preview_path.unlink()
-            except Exception:
-                pass
+            if bool(run_refine):
+                # Refine input is draft geometry; output size comes from
+                # refine_megapixels. Canvas/Auto size only applies to draft
+                # generation, so ignore a mismatch instead of blocking or
+                # wiping the draft the user is trying to refine.
+                resolution["width"] = int(cache_resolution["width"])
+                resolution["height"] = int(cache_resolution["height"])
+                resolved_width = int(resolution["width"])
+                resolved_height = int(resolution["height"])
+                previous_cache_resolution = None
+                logging.info(
+                    "run_refine: ignoring Canvas %sx%s; using draft cache %sx%s "
+                    "(target size from refine_megapixels)",
+                    int(requested_resolution["width"]),
+                    int(requested_resolution["height"]),
+                    resolved_width,
+                    resolved_height,
+                )
+            else:
+                # Resolution is the one unavoidable global invalidation: latent
+                # geometry cannot be mixed inside one sequential disk chain.
+                manifest = _truncate_chain(data_path, manifest_path, manifest, 0)
+                segments = []
+                cache_resolution = None
+                cache_has_segments = False
+                resolution["cache_reset"] = True
+                for cfg in clips:
+                    cfg["validated"] = False
+                    cfg["refine_validated"] = False
+                _clear_refine_sidecar(data_path)
+                try:
+                    preview_path = _decoded_preview_cache_path(data_path)
+                    if preview_path.exists():
+                        preview_path.unlink()
+                except Exception:
+                    pass
 
         if prompt_pack_imported and external_prompt_pack is not None:
             imported_json = _state_json(clips, active_prompt_pack_signature, "ref2va")
@@ -4950,6 +5252,17 @@ class MiniMaxH3Extender:
         prepared_image_blocks = None
         prepared_video_blocks_by_frame_count = {}
 
+        model, pdd_sigmas = _prepare_pdd_model(
+            model,
+            generation_mode=generation_mode,
+            pdd_acc_lora=pdd_acc_lora,
+            pdd_nfe=pdd_nfe,
+            pdd_lora_strength=pdd_lora_strength,
+            pdd_head_strength=pdd_head_strength,
+            denoise=denoise,
+            sampler_name=sampler_name,
+        )
+
         disk_join = MiniMaxH3MotionContextDiskJoin()
         motion = MiniMaxH3MotionContextRAM()
 
@@ -4966,6 +5279,112 @@ class MiniMaxH3Extender:
                 [bool(c.get("validated", False)) for c in clips],
                 len((_load_manifest_from_paths(data_path, manifest_path) or {}).get("segments", [])),
             )
+
+        if bool(run_refine):
+            from .latent_refine import run_refine_pass
+
+            current_manifest = _load_manifest_from_paths(data_path, manifest_path)
+            if current_manifest is None:
+                raise ValueError(
+                    "MiniMax H3 Extender: run_refine needs an existing draft cache."
+                )
+            draft_n = len((current_manifest or {}).get("segments") or [])
+            if draft_n < 1:
+                raise ValueError(
+                    "MiniMax H3 Extender: Run refine pass is ON, but draft cache "
+                    "is empty. Expand Latent refine, uncheck Run refine pass, "
+                    "Queue to generate draft, then enable refine again."
+                )
+            refine_result = run_refine_pass(
+                owner=owner,
+                data_path=data_path,
+                draft_manifest=current_manifest,
+                clips=clips,
+                model=model,
+                clip=clip,
+                vae=vae,
+                audio_vae=audio_vae,
+                refs=refs,
+                ref_videos=ref_videos,
+                ref_video_fps=ref_video_fps,
+                ref_video_audios=ref_video_audios,
+                standalone_audio_clip_plan=standalone_audio_clip_plan,
+                active_ref_video_count=active_ref_video_count,
+                prepared_image_blocks=prepared_image_blocks,
+                prepared_video_blocks_by_frame_count=prepared_video_blocks_by_frame_count,
+                ref_image_size=ref_image_size,
+                context_length=context_length,
+                audio_context_length=audio_context_length,
+                sampler_name=sampler_name,
+                scheduler=scheduler,
+                upscale_model=latent_upscale_model,
+                refine_megapixels=refine_megapixels,
+                refine_denoise=refine_denoise,
+                refine_steps=refine_steps,
+                upscale_precision=latent_upscale_precision,
+                make_ref2va_conditioning=_make_ref2va_conditioning,
+                prepare_shared_refs=_prepare_shared_refs,
+                prepare_standalone_audio_refs=_prepare_standalone_audio_refs,
+                apply_per_clip_loras=_apply_per_clip_loras,
+                sample_h3=_sample_h3,
+                motion=motion,
+                duration_to_frames=_duration_to_frames,
+                reference_count=_reference_count,
+                max_mixed_ref_items=MAX_MIXED_REF_ITEMS,
+                fps=FPS,
+                send_progress=_send_extender_progress,
+                extender_self=self,
+                run_mode=str(run_mode),
+            )
+            refine_cached = int(refine_result.get("cached_count", 0))
+            refine_validated = int(refine_result.get("validated_count", 0))
+            refine_generated = list(refine_result.get("generated") or [])
+            # Draft cache handle; Final Decode latent_layer=auto picks a complete
+            # refine sidecar. Partial refine is available via latent_layer=refine.
+            status = (
+                f"refine {str(run_mode)} | cached {refine_cached}/{len(clips)} | "
+                f"validated {refine_validated} | draft preserved"
+            )
+            if refine_generated:
+                status += " | generated " + ",".join(str(i + 1) for i in refine_generated)
+            else:
+                status += " | disk only"
+            previous_handle = {
+                "version": CACHE_VERSION,
+                "data_path": str(Path(data_path).resolve()),
+                "manifest_path": str(Path(manifest_path).resolve()),
+                "run_mode": str(run_mode),
+                "stop": True,
+                "next_index": int(len(current_manifest.get("segments", []))),
+                "status": status,
+            }
+            size = _cache_size_mb(data_path, manifest_path)
+            _send_extender_progress(owner, -1, len(clips), "idle", status)
+            ui_state = {
+                "generation_mode": "ref2va",
+                "clips_json": _state_json(clips, active_prompt_pack_signature, generation_mode),
+                "clip_count": len(clips),
+                "cached_count": refine_cached,
+                "validated_count": refine_validated,
+                "refine_cached_count": refine_cached,
+                "refine_validated_count": refine_validated,
+                "generated": [i + 1 for i in refine_generated],
+                "status": status,
+                "build": BUILD,
+                "refined": True,
+                "run_refine": True,
+            }
+            return {
+                "ui": {"h3_extender_state": [ui_state]},
+                "result": (
+                    previous_handle,
+                    int(len(clips)),
+                    int(refine_validated),
+                    status,
+                    float(size),
+                    BUILD,
+                ),
+            }
 
         # Walk the card list in order. Cached TRUE clips are metadata-only;
         # active clips sample and are written immediately to disk.
@@ -5269,6 +5688,12 @@ class MiniMaxH3Extender:
                 f"Rendering clip {i + 1}/{len(clips)}",
             )
 
+            # Draft rewrite of clip i invalidates refine from i onward, but keeps
+            # an already refined prefix intact for interleaved clip_by_clip work.
+            _invalidate_refine_from_index(data_path, i)
+            for j in range(i, len(clips)):
+                clips[j]["refine_validated"] = False
+
             sampled = _sample_h3(
                 clip_model,
                 positive,
@@ -5278,6 +5703,7 @@ class MiniMaxH3Extender:
                 str(scheduler),
                 int(steps),
                 float(denoise),
+                sigmas=pdd_sigmas,
             )
 
             result = disk_join.join(
@@ -5430,6 +5856,9 @@ class MiniMaxH3Extender:
             if ref_pack_imported_slots:
                 imported_text = ",".join(str(i) for i in ref_pack_imported_slots)
                 details.append(f"imported Ref {imported_text}")
+            if ref_pack_cleared_slots:
+                cleared_text = ",".join(str(i) for i in ref_pack_cleared_slots)
+                details.append(f"cleared Ref {cleared_text}")
             if ref_pack_skipped_slots:
                 skipped_text = ",".join(str(i) for i in ref_pack_skipped_slots)
                 details.append(f"ignored local-reserved Ref {skipped_text}")
@@ -5506,6 +5935,7 @@ class MiniMaxH3Extender:
             "ref_pack_count": int(external_ref_pack.get("count", 0) or 0) if external_ref_pack is not None else 0,
             "ref_pack_imported_slots": [int(i) for i in ref_pack_imported_slots],
             "ref_pack_skipped_slots": [int(i) for i in ref_pack_skipped_slots],
+            "ref_pack_cleared_slots": [int(i) for i in ref_pack_cleared_slots],
             "per_clip_lora_count": int(sum(len(cfg.get("loras") or []) for cfg in clips)),
             "build": BUILD,
         }

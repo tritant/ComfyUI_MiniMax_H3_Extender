@@ -34,7 +34,7 @@ const MAX_IMAGE_REFS = 9;
 const MAX_MIXED_REFS = 12;
 const MAX_FL2VA_GUIDES = 3;
 const MAX_RESOLUTION = 4096;
-const DEFAULT_MEGAPIXELS = 0.40;
+const DEFAULT_MEGAPIXELS = 0.70;
 
 // Nodes 2.0 lifecycle guard. Workflow loading is bracketed by the official
 // beforeConfigureGraph/afterConfigureGraph extension hooks; while this flag is
@@ -65,16 +65,28 @@ function cardMinHeightForState(state) {
     return base + maxSelectedLoraRows(state) * 46;
 }
 
-function uiMinHeightForState(state) {
+// Always-visible Canvas size panel + collapsed PDD / Latent refine headers.
+const SECTIONS_COLLAPSED_RESERVE = 210;
+
+function sectionsStackHeight(runtime) {
+    const measured = Number(runtime?.sectionsWrap?.offsetHeight || 0);
+    if (Number.isFinite(measured) && measured > 0) return measured;
+    return SECTIONS_COLLAPSED_RESERVE;
+}
+
+function uiMinHeightForState(state, runtime = null) {
     // Both modes own the same media strip above the cards: Ref2VA shows the
     // nine internal references, FL2VA shows each plan's First/Last frames.
     // Keeping one fixed strip height also prevents mode switches from pulling
     // the DOM widget upward into the native widgets in Nodes 2.0.
-    return Math.max(UI_MIN_HEIGHT, 55 + REF_SECTION_HEIGHT + cardMinHeightForState(state) + CARD_SCROLLBAR_SPACE);
+    return Math.max(
+        UI_MIN_HEIGHT,
+        55 + REF_SECTION_HEIGHT + cardMinHeightForState(state) + CARD_SCROLLBAR_SPACE + sectionsStackHeight(runtime),
+    );
 }
 
-function nodes2MinHeightForState(state) {
-    return Math.max(NODES2_MIN_HEIGHT, uiMinHeightForState(state) + NODES2_TOP_GAP);
+function nodes2MinHeightForState(state, runtime = null) {
+    return Math.max(NODES2_MIN_HEIGHT, uiMinHeightForState(state, runtime) + NODES2_TOP_GAP);
 }
 
 const PROJECT_WIDGETS = [
@@ -94,6 +106,16 @@ const PROJECT_WIDGETS = [
     "refs_json",
     "generation_mode",
     "motion_context",
+    "pdd_acc_lora",
+    "pdd_nfe",
+    "pdd_lora_strength",
+    "pdd_head_strength",
+    "run_refine",
+    "latent_upscale_model",
+    "refine_megapixels",
+    "refine_denoise",
+    "refine_steps",
+    "latent_upscale_precision",
 ];
 
 const FINAL_PROJECT_WIDGETS = [
@@ -987,6 +1009,7 @@ function newClip(index) {
         seed_mode: "randomize",
         duration: 10.0,
         validated: false,
+        refine_validated: false,
         color_adjustment: normalizeColorAdjustment(),
         loras: [],
         local_refs: emptyLocalRefs(),
@@ -1009,6 +1032,7 @@ function normalizeClipList(rawClips) {
             : "randomize",
         duration: Math.max(0.25, Math.min(150, Number(c?.duration || 10))),
         validated: Boolean(c?.validated),
+        refine_validated: Boolean(c?.refine_validated),
         color_adjustment: normalizeColorAdjustment(c?.color_adjustment),
         loras: normalizeClipLoras(c?.loras, c?.lora),
         local_refs: normalizeLocalRefs(c?.local_refs),
@@ -1222,16 +1246,28 @@ async function refreshLoraNames(node, runtime) {
     }
 }
 
-function validatedPrefixFromState(state) {
-    if (randomAccessMode(state)) {
+function validatedPrefixFromState(state, refineMode = false) {
+    if (!refineMode && randomAccessMode(state)) {
         return (state?.clips || []).filter((clip) => Boolean(clip?.validated)).length;
     }
     let count = 0;
     for (const clip of state?.clips || []) {
-        if (!clip?.validated) break;
+        const ok = refineMode ? Boolean(clip?.refine_validated) : Boolean(clip?.validated);
+        if (!ok) break;
         count += 1;
     }
     return count;
+}
+
+function isRefineUiActive(runtime) {
+    return coerceWidgetBool(runtime?.runRefineWidget?.value);
+}
+
+function invalidateFrom(state, index, refineMode = false) {
+    for (let i = Math.max(0, index); i < state.clips.length; i++) {
+        if (refineMode) state.clips[i].refine_validated = false;
+        else state.clips[i].validated = false;
+    }
 }
 
 async function restoreCacheState(node, runtime) {
@@ -1264,6 +1300,8 @@ async function restoreCacheState(node, runtime) {
 
         runtime.cachedCount = Number(payload.cached_count || 0);
         runtime.validatedCount = Number(payload.validated_count || 0);
+        runtime.refineCachedCount = Number(payload.refine_cached_count || 0);
+        runtime.refineValidatedCount = Number(payload.refine_validated_count || 0);
         runtime.cachedClipIds = new Set(Array.isArray(payload.cached_clip_ids) ? payload.cached_clip_ids.map(String) : []);
         runtime.validatedClipIds = new Set(Array.isArray(payload.validated_clip_ids) ? payload.validated_clip_ids.map(String) : []);
         runtime.computedIndices = new Set(
@@ -1281,6 +1319,7 @@ async function restoreCacheState(node, runtime) {
             Object.entries(payload?.continuity_signatures || {}).map(([key, value]) => [String(key), String(value || "")]).filter(([, value]) => Boolean(value))
         );
         const activeMode = String(runtime.state?.generation_mode || "ref2va") === "fl2va" ? "fl2va" : "ref2va";
+        const refineMode = isRefineUiActive(runtime);
         if (randomAccessMode(runtime.state)) {
             for (const clip of runtime.state?.clips || []) {
                 clip.validated = runtime.validatedClipIds.has(String(clip.id));
@@ -1306,6 +1345,7 @@ async function restoreCacheState(node, runtime) {
             runtime.validatedCount = safePrefix;
             for (let i = 0; i < (runtime.state?.clips || []).length; i++) {
                 runtime.state.clips[i].validated = i < safePrefix;
+                runtime.state.clips[i].refine_validated = i < runtime.refineValidatedCount;
             }
         }
         snapshotModeValidation(runtime);
@@ -1322,10 +1362,12 @@ async function restoreCacheState(node, runtime) {
         const resolutionText = restoredW > 0 && restoredH > 0
             ? ` | project ${restoredW}x${restoredH}`
             : "";
-        runtime.statusText =
-            `Restored cache${resolutionText} | cached ${runtime.cachedCount}/${runtime.state.clips.length} | ` +
-            `validated ${runtime.validatedCount}` +
-            (runtime.checkpointActive ? ` | resumable checkpoint ${runtime.checkpointSnapshotCount || ""}` : "");
+        const checkpointSuffix = runtime.checkpointActive
+            ? ` | resumable checkpoint ${runtime.checkpointSnapshotCount || ""}`
+            : "";
+        runtime.statusText = refineMode
+            ? `Restored refine${resolutionText} | cached ${runtime.refineCachedCount}/${runtime.state.clips.length} | validated ${runtime.refineValidatedCount}${checkpointSuffix}`
+            : `Restored cache${resolutionText} | cached ${runtime.cachedCount}/${runtime.state.clips.length} | validated ${runtime.validatedCount}${checkpointSuffix}`;
         syncResolutionAndInvalidate(node, runtime);
         render(node, runtime);
         node.graph?.setDirtyCanvas(true, true);
@@ -1864,6 +1906,68 @@ function setNativeWidgetVisibility(node, widget, visible) {
     node?.graph?.setDirtyCanvas(true, true);
 }
 
+function isPddAccActive(node, runtime) {
+    const widget = runtime?.pddAccLoraWidget || getWidget(node, "pdd_acc_lora");
+    const value = String(widget?.value ?? "None").trim();
+    return Boolean(value) && value !== "None";
+}
+
+/** Mirror pdd_bridge.validate_pdd_file_for_mode filename heuristic. */
+function pddAccTrunkFromName(name) {
+    const low = String(name || "").toLowerCase().replace(/-/g, "_");
+    const hasFl = low.includes("fl2va");
+    const hasRef = low.includes("ref2va");
+    if (hasFl && !hasRef) return "fl2va";
+    if (hasRef && !hasFl) return "ref2va";
+    return null;
+}
+
+function pddAccModeMismatchMessage(pddFile, generationMode) {
+    const value = String(pddFile || "").trim();
+    if (!value || value === "None") return null;
+    const expected = String(generationMode || "ref2va").toLowerCase() === "fl2va" ? "fl2va" : "ref2va";
+    const trunk = pddAccTrunkFromName(value);
+    if (!trunk || trunk === expected) return null;
+    return (
+        `PDD Acc '${value}' looks like a ${trunk.toUpperCase()} distill, but generation mode is ${expected}. `
+        + `Use the matching ${expected.toUpperCase()} Acc LoRA (models/pdd_acc/).`
+    );
+}
+
+/**
+ * If the selected PDD Acc filename targets the other trunk, clear it to None
+ * and surface the reason in the Extender status (optionally via alert).
+ * Backend validate_pdd_file_for_mode remains the hard Queue-time guard.
+ */
+function enforcePddAccModeMatch(node, runtime, { alertUser = false } = {}) {
+    const widget = runtime?.pddAccLoraWidget || getWidget(node, "pdd_acc_lora");
+    if (!widget) return true;
+    const value = String(widget.value ?? "None").trim() || "None";
+    const mode = String(
+        runtime?.state?.generation_mode
+        || getWidget(node, "generation_mode")?.value
+        || "ref2va",
+    );
+    const message = pddAccModeMismatchMessage(value, mode);
+    if (!message) return true;
+
+    widget.value = "None";
+    for (const row of runtime?.pddAllRows || []) {
+        if (row?.__h3Widget === widget && row.__h3Select) {
+            row.__h3Select.value = "None";
+        }
+    }
+    if (runtime) runtime.statusText = message;
+    if (alertUser) {
+        try { alert(message); } catch (_) { /* headless / blocked */ }
+    }
+    syncModeSpecificNativeWidgets(node, runtime);
+    syncExtenderSections(node, runtime);
+    if (runtime?.status) runtime.status.textContent = runtime.statusText;
+    node?.graph?.setDirtyCanvas(true, true);
+    return false;
+}
+
 function syncModeSpecificNativeWidgets(node, runtime) {
     // Context lengths only affect causal Ref2VA Motion Context. They stay hidden
     // in FL2VA and in independent Ref2VA, while their saved values are preserved.
@@ -1881,6 +1985,468 @@ function syncModeSpecificNativeWidgets(node, runtime) {
 
     setNativeWidgetVisibility(node, runtime?.contextLengthWidget, causalRef2va);
     setNativeWidgetVisibility(node, runtime?.audioContextLengthWidget, causalRef2va);
+
+    // When PDD Acc is selected the backend uses the trained sigma grid from
+    // pdd_nfe. Hide the ordinary steps/scheduler so they cannot confuse the run.
+    const pddActive = isPddAccActive(node, runtime);
+    setNativeWidgetVisibility(node, runtime?.stepsWidget, !pddActive);
+    setNativeWidgetVisibility(node, runtime?.schedulerWidget, !pddActive);
+}
+
+
+function installPddWidgetHooks(node, runtime) {
+    const pddWidget = runtime?.pddAccLoraWidget || getWidget(node, "pdd_acc_lora");
+    if (!pddWidget || pddWidget.__h3PddHooked) return;
+    pddWidget.__h3PddHooked = true;
+    const prev = pddWidget.callback;
+    pddWidget.callback = function () {
+        if (typeof prev === "function") prev.apply(this, arguments);
+        enforcePddAccModeMatch(node, runtime, { alertUser: true });
+        syncModeSpecificNativeWidgets(node, runtime);
+        syncExtenderSections(node, runtime);
+        node?.graph?.setDirtyCanvas(true, true);
+    };
+}
+
+function ensureExtenderSectionStyles() {
+    if (document.getElementById("h3-extender-section-style")) return;
+    const style = document.createElement("style");
+    style.id = "h3-extender-section-style";
+    style.textContent = `
+        .h3-ext-sections {
+            display: flex;
+            flex-direction: column;
+            gap: 6px;
+            margin: 0 0 8px;
+            flex: 0 0 auto;
+            min-width: 0;
+        }
+        .h3-ext-section {
+            border: 1px solid rgba(255, 255, 255, 0.14);
+            border-radius: 6px;
+            background: rgba(0, 0, 0, 0.18);
+            overflow: hidden;
+        }
+        .h3-ext-section-head {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            width: 100%;
+            padding: 6px 8px;
+            border: 0;
+            background: rgba(255, 255, 255, 0.04);
+            color: inherit;
+            cursor: pointer;
+            font-size: 11px;
+            font-weight: 700;
+            letter-spacing: 0.2px;
+            text-align: left;
+        }
+        .h3-ext-section-head:hover { background: rgba(255, 255, 255, 0.08); }
+        .h3-ext-section-chevron { opacity: 0.7; width: 12px; flex: 0 0 auto; }
+        .h3-ext-section-body {
+            display: none;
+            padding: 6px 8px 8px;
+            gap: 5px;
+            flex-direction: column;
+            border-top: 1px solid rgba(255, 255, 255, 0.08);
+        }
+        .h3-ext-section.open .h3-ext-section-body { display: flex; }
+        .h3-ext-row {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            min-width: 0;
+        }
+        .h3-ext-row label {
+            flex: 0 0 124px;
+            font-size: 10px;
+            opacity: 0.78;
+        }
+        .h3-ext-row select,
+        .h3-ext-row input[type="number"] {
+            flex: 1 1 auto;
+            min-width: 0;
+            font-size: 11px;
+        }
+        .h3-ext-row input[type="checkbox"] {
+            width: 14px;
+            height: 14px;
+        }
+        .h3-ext-hint {
+            font-size: 10px;
+            opacity: 0.62;
+            line-height: 1.35;
+            margin: 0 0 2px;
+        }
+        .h3-ext-spotlight {
+            border: 2px solid rgba(140, 210, 155, 0.55);
+            border-radius: 8px;
+            background: rgba(70, 150, 95, 0.10);
+            padding: 7px 8px 8px;
+            display: flex;
+            flex-direction: column;
+            gap: 5px;
+            min-width: 0;
+        }
+        .h3-ext-spotlight-title {
+            font-size: 11px;
+            font-weight: 700;
+            letter-spacing: 0.2px;
+            opacity: 0.92;
+            margin: 0 0 1px;
+        }
+        .h3-ext-spotlight .h3-ext-row label {
+            flex-basis: 132px;
+        }
+        .h3-ext-spotlight-field {
+            border: 2px solid rgba(140, 210, 155, 0.55);
+            border-radius: 7px;
+            background: rgba(70, 150, 95, 0.10);
+            padding: 4px 6px 6px;
+            box-sizing: border-box;
+            min-width: 0;
+        }
+        .h3-ext-spotlight-field input[type="number"] {
+            border-color: rgba(140, 210, 155, 0.45) !important;
+        }
+    `;
+    document.head.appendChild(style);
+}
+
+const CANVAS_SIZE_MODE_LABELS = {
+    auto_from_ref: "Auto (ref aspect + megapixels)",
+    manual: "Manual (width \u00d7 height)",
+};
+
+function widgetComboValues(widget) {
+    const values = widget?.options?.values;
+    if (Array.isArray(values)) return values.map((v) => String(v));
+    if (values && typeof values === "object") return Object.keys(values).map(String);
+    return [];
+}
+
+function setWidgetValueFromUi(widget, value) {
+    if (!widget) return;
+    widget.value = value;
+    if (typeof widget.callback === "function") {
+        try { widget.callback(value); } catch (_) {}
+    }
+}
+
+function coerceWidgetBool(value) {
+    if (value === true || value === 1) return true;
+    if (value === false || value === 0 || value == null) return false;
+    if (typeof value === "string") {
+        const s = value.trim().toLowerCase();
+        if (s === "true" || s === "1" || s === "yes" || s === "on") return true;
+        if (s === "false" || s === "0" || s === "no" || s === "off" || s === "") return false;
+    }
+    return Boolean(value);
+}
+
+function syncRunRefineWidgetFromUi(runtime) {
+    if (!runtime?.runRefineWidget) return false;
+    const input = runtime.runRefineRow?.__h3Input;
+    if (input) {
+        const checked = Boolean(input.checked);
+        runtime.runRefineWidget.value = checked;
+        return checked;
+    }
+    return coerceWidgetBool(runtime.runRefineWidget.value);
+}
+
+function updateRefineSectionTitle(runtime) {
+    const section = runtime?.refineSection;
+    if (!section?.__h3Chevron) return;
+    const label = section.querySelector(".h3-ext-section-head span:last-child");
+    if (!label) return;
+    const on = coerceWidgetBool(runtime.runRefineWidget?.value);
+    label.textContent = on ? "Latent refine (ON)" : "Latent refine";
+    label.style.color = on ? "rgba(140, 210, 155, 0.95)" : "";
+}
+
+function createBoundSelectRow(labelText, widget, values, labelMap = null) {
+    const row = document.createElement("div");
+    row.className = "h3-ext-row";
+    const label = document.createElement("label");
+    label.textContent = labelText;
+    const select = document.createElement("select");
+    const opts = (values && values.length) ? values : widgetComboValues(widget);
+    for (const value of opts) {
+        const opt = document.createElement("option");
+        opt.value = String(value);
+        opt.textContent = (labelMap && labelMap[value]) || String(value);
+        select.appendChild(opt);
+    }
+    if (!opts.includes(String(widget?.value ?? "")) && opts.length) {
+        // Keep serialization intact even if the current value is temporarily missing.
+        const opt = document.createElement("option");
+        opt.value = String(widget?.value ?? "");
+        const missing = String(widget?.value ?? "");
+        opt.textContent = (labelMap && labelMap[missing]) || missing;
+        select.appendChild(opt);
+    }
+    select.value = String(widget?.value ?? opts[0] ?? "");
+    select.addEventListener("change", () => setWidgetValueFromUi(widget, select.value));
+    row.append(label, select);
+    row.__h3Select = select;
+    row.__h3Widget = widget;
+    return row;
+}
+
+function createBoundNumberRow(labelText, widget, { min = null, max = null, step = null } = {}) {
+    const row = document.createElement("div");
+    row.className = "h3-ext-row";
+    const label = document.createElement("label");
+    label.textContent = labelText;
+    const input = document.createElement("input");
+    input.type = "number";
+    if (min != null) input.min = String(min);
+    if (max != null) input.max = String(max);
+    if (step != null) input.step = String(step);
+    input.value = String(widget?.value ?? "");
+    input.addEventListener("change", () => {
+        const n = Number(input.value);
+        setWidgetValueFromUi(widget, Number.isFinite(n) ? n : widget.value);
+        input.value = String(widget.value);
+    });
+    row.append(label, input);
+    row.__h3Input = input;
+    row.__h3Widget = widget;
+    return row;
+}
+
+function createBoundCheckboxRow(labelText, widget) {
+    const row = document.createElement("div");
+    row.className = "h3-ext-row";
+    const label = document.createElement("label");
+    label.textContent = labelText;
+    const input = document.createElement("input");
+    input.type = "checkbox";
+    input.checked = coerceWidgetBool(widget?.value);
+    input.addEventListener("change", () => {
+        setWidgetValueFromUi(widget, Boolean(input.checked));
+        // Keep LiteGraph + Nodes 2.0 serialization in lockstep with the custom UI.
+        if (widget) widget.value = Boolean(input.checked);
+    });
+    row.append(label, input);
+    row.__h3Input = input;
+    row.__h3Widget = widget;
+    return row;
+}
+
+function createCollapsibleSection(title, { open = false, hint = "" } = {}) {
+    const section = document.createElement("div");
+    section.className = "h3-ext-section" + (open ? " open" : "");
+    const head = document.createElement("button");
+    head.type = "button";
+    head.className = "h3-ext-section-head";
+    const chevron = document.createElement("span");
+    chevron.className = "h3-ext-section-chevron";
+    chevron.textContent = open ? "▾" : "▸";
+    const label = document.createElement("span");
+    label.textContent = title;
+    head.append(chevron, label);
+    const body = document.createElement("div");
+    body.className = "h3-ext-section-body";
+    if (hint) {
+        const hintEl = document.createElement("p");
+        hintEl.className = "h3-ext-hint";
+        hintEl.textContent = hint;
+        body.appendChild(hintEl);
+    }
+    head.addEventListener("click", (e) => {
+        e.preventDefault();
+        const next = !section.classList.contains("open");
+        section.classList.toggle("open", next);
+        chevron.textContent = next ? "▾" : "▸";
+        const runtime = section.__h3Runtime;
+        if (runtime) {
+            requestAnimationFrame(() => syncDomHeight(runtime.__h3Node || null, runtime, true));
+        }
+    });
+    section.append(head, body);
+    section.__h3Body = body;
+    section.__h3Chevron = chevron;
+    return section;
+}
+
+function syncDecodeLayerToFinal(node, value) {
+    const finalNode = connectedFinalDecode(node);
+    if (!finalNode) return;
+    const widget = getWidget(finalNode, "latent_layer");
+    if (!widget) return;
+    const next = String(value || "auto");
+    if (String(widget.value) === next) return;
+    widget.value = next;
+    if (typeof widget.callback === "function") {
+        try { widget.callback(next); } catch (_) {}
+    }
+    finalNode.graph?.setDirtyCanvas(true, true);
+}
+
+function syncExtenderSections(node, runtime) {
+    if (!runtime) return;
+    const pddActive = isPddAccActive(node, runtime);
+    for (const row of runtime.pddDetailRows || []) {
+        row.style.display = pddActive ? "flex" : "none";
+    }
+    const refineOn = coerceWidgetBool(runtime.runRefineWidget?.value);
+    for (const row of runtime.refineDetailRows || []) {
+        row.style.display = refineOn ? "flex" : "none";
+    }
+    // Keep selects/inputs mirrored if native values changed elsewhere.
+    for (const row of [
+        ...(runtime.canvasSizeRows || []),
+        ...(runtime.pddAllRows || []),
+        ...(runtime.refineAllRows || []),
+    ]) {
+        const widget = row.__h3Widget;
+        if (!widget) continue;
+        if (row.__h3Select) row.__h3Select.value = String(widget.value ?? "");
+        if (row.__h3Input) {
+            if (row.__h3Input.type === "checkbox") row.__h3Input.checked = coerceWidgetBool(widget.value);
+            else row.__h3Input.value = String(widget.value ?? "");
+        }
+    }
+    updateRefineSectionTitle(runtime);
+    const mode = String(runtime.resolutionModeWidget?.value || "auto_from_ref");
+    if (runtime.megapixelsRow) {
+        // Megapixels only drives Auto; keep the control visible but quieter in Manual.
+        runtime.megapixelsRow.style.opacity = mode === "manual" ? "0.45" : "1";
+    }
+    if (runtime.decodeLayerSelect) {
+        const finalNode = connectedFinalDecode(node);
+        const finalWidget = finalNode ? getWidget(finalNode, "latent_layer") : null;
+        if (finalWidget) runtime.decodeLayerSelect.value = String(finalWidget.value || "auto");
+    }
+}
+
+function buildExtenderSections(node, runtime) {
+    ensureExtenderSectionStyles();
+    const wrap = document.createElement("div");
+    wrap.className = "h3-ext-sections";
+
+    const canvasPanel = document.createElement("div");
+    canvasPanel.className = "h3-ext-spotlight";
+    const canvasTitle = document.createElement("div");
+    canvasTitle.className = "h3-ext-spotlight-title";
+    canvasTitle.textContent = "Canvas size";
+    const canvasHint = document.createElement("p");
+    canvasHint.className = "h3-ext-hint";
+    canvasHint.textContent =
+        "Auto keeps aspect from the reference and scales to megapixels. Manual uses width \u00d7 height.";
+    const canvasModeRow = createBoundSelectRow(
+        "Size mode",
+        runtime.resolutionModeWidget,
+        ["auto_from_ref", "manual"],
+        CANVAS_SIZE_MODE_LABELS,
+    );
+    const megapixelsRow = createBoundNumberRow("Megapixels", runtime.megapixelsWidget, {
+        min: 0.01, max: 16, step: 0.01,
+    });
+    canvasPanel.append(canvasTitle, canvasHint, canvasModeRow, megapixelsRow);
+    runtime.canvasSizeRows = [canvasModeRow, megapixelsRow];
+    runtime.megapixelsRow = megapixelsRow;
+    canvasModeRow.__h3Select?.addEventListener("change", () => {
+        syncExtenderSections(node, runtime);
+    });
+
+    const pddSection = createCollapsibleSection("PDD Acc", {
+        open: false,
+        hint: "Alibaba PDD acceleration. When a PDD LoRA is selected, steps/scheduler are ignored.",
+    });
+    pddSection.__h3Runtime = runtime;
+    const pddLoraRow = createBoundSelectRow("PDD LoRA", runtime.pddAccLoraWidget);
+    const pddNfeRow = createBoundSelectRow("PDD NFE", runtime.pddNfeWidget);
+    const pddLoraStrengthRow = createBoundNumberRow("LoRA strength", runtime.pddLoraStrengthWidget, {
+        min: -2, max: 2, step: 0.01,
+    });
+    const pddHeadStrengthRow = createBoundNumberRow("Head strength", runtime.pddHeadStrengthWidget, {
+        min: 0, max: 2, step: 0.01,
+    });
+    runtime.pddAllRows = [pddLoraRow, pddNfeRow, pddLoraStrengthRow, pddHeadStrengthRow];
+    runtime.pddDetailRows = [pddNfeRow, pddLoraStrengthRow, pddHeadStrengthRow];
+    pddSection.__h3Body.append(pddLoraRow, pddNfeRow, pddLoraStrengthRow, pddHeadStrengthRow);
+    pddLoraRow.__h3Select?.addEventListener("change", () => {
+        enforcePddAccModeMatch(node, runtime, { alertUser: true });
+        syncModeSpecificNativeWidgets(node, runtime);
+        syncExtenderSections(node, runtime);
+        requestAnimationFrame(() => syncDomHeight(node, runtime, true));
+        if (runtime.status) runtime.status.textContent = runtime.statusText || "Ready";
+    });
+
+    const refineSection = createCollapsibleSection("Latent refine", {
+        open: false,
+        hint: "Second pass: keep draft, neural latent upscale + resample. Uses the same run_mode + Validated prefix as draft. Then Queue Final Decode.",
+    });
+    refineSection.__h3Runtime = runtime;
+    const runRefineRow = createBoundCheckboxRow("Run refine pass", runtime.runRefineWidget);
+    runtime.runRefineRow = runRefineRow;
+    const upscaleModelRow = createBoundSelectRow("Upscale model", runtime.latentUpscaleModelWidget);
+    const refineMpRow = createBoundNumberRow("Refine megapixels", runtime.refineMegapixelsWidget, {
+        min: 0.1, max: 8, step: 0.1,
+    });
+    const refineDenoiseRow = createBoundNumberRow("Refine denoise", runtime.refineDenoiseWidget, {
+        min: 0.01, max: 1, step: 0.01,
+    });
+    const refineStepsRow = createBoundNumberRow("Refine steps", runtime.refineStepsWidget, {
+        min: 1, max: 10000, step: 1,
+    });
+    const refinePrecisionRow = createBoundSelectRow("Upscale precision", runtime.latentUpscalePrecisionWidget, [
+        "fp16", "bf16", "fp32",
+    ]);
+
+    const decodeLayerRow = document.createElement("div");
+    decodeLayerRow.className = "h3-ext-row";
+    const decodeLabel = document.createElement("label");
+    decodeLabel.textContent = "Final Decode layer";
+    const decodeSelect = document.createElement("select");
+    for (const value of ["auto", "draft", "refine"]) {
+        const opt = document.createElement("option");
+        opt.value = value;
+        opt.textContent = value;
+        decodeSelect.appendChild(opt);
+    }
+    const finalNode = connectedFinalDecode(node);
+    decodeSelect.value = String(getWidget(finalNode, "latent_layer")?.value || "auto");
+    decodeSelect.addEventListener("change", () => {
+        syncDecodeLayerToFinal(node, decodeSelect.value);
+    });
+    decodeLayerRow.append(decodeLabel, decodeSelect);
+    runtime.decodeLayerSelect = decodeSelect;
+
+    runtime.refineAllRows = [
+        runRefineRow, upscaleModelRow, refineMpRow, refineDenoiseRow, refineStepsRow, refinePrecisionRow, decodeLayerRow,
+    ];
+    runtime.refineDetailRows = [
+        upscaleModelRow, refineMpRow, refineDenoiseRow, refineStepsRow, refinePrecisionRow,
+    ];
+    refineSection.__h3Body.append(
+        runRefineRow,
+        upscaleModelRow,
+        refineMpRow,
+        refineDenoiseRow,
+        refineStepsRow,
+        refinePrecisionRow,
+        decodeLayerRow,
+    );
+    runRefineRow.__h3Input?.addEventListener("change", () => {
+        syncExtenderSections(node, runtime);
+        render(node, runtime);
+        node.graph?.setDirtyCanvas(true, true);
+        requestAnimationFrame(() => syncDomHeight(node, runtime, true));
+    });
+
+    wrap.append(canvasPanel, pddSection, refineSection);
+    runtime.sectionsWrap = wrap;
+    runtime.canvasPanel = canvasPanel;
+    runtime.pddSection = pddSection;
+    runtime.refineSection = refineSection;
+    runtime.__h3Node = node;
+    syncExtenderSections(node, runtime);
+    return wrap;
 }
 
 function domWidgetRenderMode(element) {
@@ -1940,12 +2506,6 @@ function obviouslyPoisonedHeight(height, minimumHeight) {
     return h > Math.max(1800, Number(minimumHeight || 0) * 3);
 }
 
-function invalidateFrom(state, index) {
-    for (let i = Math.max(0, index); i < state.clips.length; i++) {
-        state.clips[i].validated = false;
-    }
-}
-
 function currentResolutionFromWidgets(node) {
     const width = Number(getWidget(node, "width")?.value || 0);
     const height = Number(getWidget(node, "height")?.value || 0);
@@ -1965,14 +2525,21 @@ function invalidateForResolutionChange(node, runtime) {
     if (current.width === expectedW && current.height === expectedH) return false;
 
     const hadValidated = runtime.state.clips.some((clip) => Boolean(clip?.validated));
+    const hadRefineValidated = runtime.state.clips.some((clip) => Boolean(clip?.refine_validated));
     const hadCached = Number(runtime.cachedCount || 0) > 0;
+    const hadRefineCached = Number(runtime.refineCachedCount || 0) > 0;
 
     // Once the requested geometry differs from the cache/project geometry,
     // every latent in that chain is incompatible. Reflect that immediately in
     // the cards instead of waiting for the backend to discover it at Queue.
-    for (const clip of runtime.state.clips) clip.validated = false;
+    for (const clip of runtime.state.clips) {
+        clip.validated = false;
+        clip.refine_validated = false;
+    }
     runtime.validatedCount = 0;
     runtime.cachedCount = 0;
+    runtime.refineValidatedCount = 0;
+    runtime.refineCachedCount = 0;
     runtime.computedIndices = new Set();
     runtime.computedClipIds = new Set();
     runtime.checkpointActive = false;
@@ -1983,10 +2550,10 @@ function invalidateForResolutionChange(node, runtime) {
         `Resolution changed: ${expectedW}x${expectedH} → ${current.width}x${current.height} | ` +
         `clips invalidated; cache resets on next run`;
 
-    if (hadValidated || hadCached) updateHidden(node, runtime);
+    if (hadValidated || hadCached || hadRefineValidated || hadRefineCached) updateHidden(node, runtime);
     render(node, runtime);
     node.graph?.setDirtyCanvas(true, true);
-    return hadValidated || hadCached;
+    return hadValidated || hadCached || hadRefineValidated || hadRefineCached;
 }
 
 function syncResolutionAndInvalidate(node, runtime) {
@@ -2016,21 +2583,27 @@ function advanceSeedAfterGenerate(clip) {
 function cardStatus(node, runtime, clip, index) {
     const activeIndex = Number(runtime.activeClipIndex);
     const activePhase = String(runtime.activePhase || "");
-    const runActive = ["preparing", "sampling", "complete"].includes(activePhase);
+    const runActive = ["preparing", "sampling", "complete", "refining"].includes(activePhase);
 
     if (activeIndex === index && runActive) {
         return "rendering";
     }
 
+    const refineMode = isRefineUiActive(runtime);
     const randomAccess = randomAccessMode(runtime.state);
-    const cached = randomAccess
-        ? runtime.cachedClipIds?.has(String(clip.id))
-        : index < Number(runtime.cachedCount || 0);
-    if (clip.validated && cached) return "validated";
-    const computed = randomAccess
-        ? runtime.computedClipIds?.has(String(clip.id))
-        : runtime.computedIndices?.has(index);
-    if (computed && cached) return "computed";
+    const cached = refineMode
+        ? index < Number(runtime.refineCachedCount || 0)
+        : randomAccess
+            ? runtime.cachedClipIds?.has(String(clip.id))
+            : index < Number(runtime.cachedCount || 0);
+    const isValidated = refineMode ? Boolean(clip.refine_validated) : Boolean(clip.validated);
+    if (isValidated && cached) return "validated";
+    if (!refineMode) {
+        const computed = randomAccess
+            ? runtime.computedClipIds?.has(String(clip.id))
+            : runtime.computedIndices?.has(index);
+        if (computed && cached) return "computed";
+    }
 
     // Ref2VA Motion OFF Full Batch follows the same live progression semantics
     // expected from the random-access batch UI: only the clip immediately before
@@ -2042,13 +2615,15 @@ function cardStatus(node, runtime, clip, index) {
     const ref2vaIndependentFullBatch =
         ref2vaIndependentMode(runtime.state)
         && String(getWidget(node, "run_mode")?.value || "clip_by_clip") === "full_batch";
-    if (ref2vaIndependentFullBatch && runActive && activeIndex >= 0) {
+    if (!refineMode && ref2vaIndependentFullBatch && runActive && activeIndex >= 0) {
         if (index === activeIndex - 1) return "current";
         if (cached) return "cached";
         return "future";
     }
 
-    const firstOpen = runtime.state.clips.findIndex((c) => !c.validated);
+    const firstOpen = (runtime.state.clips || []).findIndex((c) =>
+        refineMode ? !c.refine_validated : !c.validated
+    );
     if (index === firstOpen) return cached ? "candidate" : "current";
     if (cached) return "cached";
     return "future";
@@ -3601,7 +4176,7 @@ function collectProjectPayload(node, runtime) {
             settings,
             resolution: {
                 mode: String(getWidget(node, "resolution_mode")?.value || "manual"),
-                megapixels: Number(getWidget(node, "megapixels")?.value ?? 0.40),
+                megapixels: Number(getWidget(node, "megapixels")?.value ?? DEFAULT_MEGAPIXELS),
                 manual_width: Number(runtime.manualWidth || settings.width || 0),
                 manual_height: Number(runtime.manualHeight || settings.height || 0),
                 resolved_width: Number(runtime.resolvedWidth || runtime.expectedResolution?.width || 0),
@@ -5341,6 +5916,7 @@ function render(node, runtime) {
         seedBox.appendChild(seedMode);
 
         const durBox = document.createElement("div");
+        durBox.className = "h3-ext-spotlight-field";
         durBox.appendChild(makeFieldLabel("Duration s"));
         const duration = makeNumberInput(clip.duration, 0.25, 150, 0.1);
         duration.addEventListener("change", () => {
@@ -5366,198 +5942,250 @@ function render(node, runtime) {
         foot.style.alignItems = "center";
         foot.style.justifyContent = "space-between";
         foot.style.marginTop = "9px";
+        foot.style.gap = "8px";
 
-        const validateLabel = document.createElement("label");
-        validateLabel.style.display = "flex";
-        validateLabel.style.alignItems = "center";
-        validateLabel.style.gap = "6px";
-        validateLabel.style.cursor = "pointer";
-        const validated = document.createElement("input");
-        validated.type = "checkbox";
-        validated.checked = clip.validated;
-        validated.addEventListener("change", async () => {
-            const wasValidated = Boolean(clip.validated);
-            let persistValidation = false;
-            const fl2vaValidationSnapshot = fl2vaMode ? {
-                validated: (state.clips || []).map((item) => Boolean(item?.validated)),
-                validatedClipIds: new Set(runtime.validatedClipIds || []),
-                computedClipIds: new Set(runtime.computedClipIds || []),
-                computedIndices: new Set(runtime.computedIndices || []),
-            } : null;
+        // Outside the branch: foot.append below needs either control in scope.
+        let validateLabel = null;
+        let validationRow = null;
 
-            if (randomAccess) {
-                // Random-access plans/clips validate independently, but a clip
-                // can only be marked Validated when its physical cache exists.
-                if (validated.checked) {
-                    const cached = runtime.cachedClipIds?.has(String(clip.id));
-                    if (!cached) {
-                        clip.validated = false;
-                        validated.checked = false;
-                        runtime.statusText = `Clip ${index + 1} cannot be marked Validated because its cache does not exist yet.`;
-                    } else {
-                        clip.validated = true;
-                    }
-                } else {
-                    clip.validated = false;
-                }
-                if (Boolean(clip.validated) !== wasValidated) {
-                    if (independentRef2va) {
-                        persistValidation = true;
-                    } else if (fl2vaMode) {
-                        persistValidation = true;
-                        if (!Boolean(clip.validated)) {
-                            const affected = [index, ...fl2vaPreviousDependentIndices(state, index)];
-                            for (const affectedIndex of affected) {
-                                const affectedClip = state.clips?.[affectedIndex];
-                                if (!affectedClip) continue;
-                                affectedClip.validated = false;
-                                const affectedId = String(affectedClip.id || "");
-                                if (affectedId) {
-                                    runtime.validatedClipIds?.delete(affectedId);
-                                    runtime.computedClipIds?.delete(affectedId);
+        if (fl2vaMode || randomAccess) {
+                    validateLabel = document.createElement("label");
+                    validateLabel.style.display = "flex";
+                    validateLabel.style.alignItems = "center";
+                    validateLabel.style.gap = "6px";
+                    validateLabel.style.cursor = "pointer";
+                    const validated = document.createElement("input");
+                    validated.type = "checkbox";
+                    validated.checked = clip.validated;
+                    validated.addEventListener("change", async () => {
+                        const wasValidated = Boolean(clip.validated);
+                        let persistValidation = false;
+                        const fl2vaValidationSnapshot = fl2vaMode ? {
+                            validated: (state.clips || []).map((item) => Boolean(item?.validated)),
+                            validatedClipIds: new Set(runtime.validatedClipIds || []),
+                            computedClipIds: new Set(runtime.computedClipIds || []),
+                            computedIndices: new Set(runtime.computedIndices || []),
+                        } : null;
+
+                        if (randomAccess) {
+                            // Random-access plans/clips validate independently, but a clip
+                            // can only be marked Validated when its physical cache exists.
+                            if (validated.checked) {
+                                const cached = runtime.cachedClipIds?.has(String(clip.id));
+                                if (!cached) {
+                                    clip.validated = false;
+                                    validated.checked = false;
+                                    runtime.statusText = `Clip ${index + 1} cannot be marked Validated because its cache does not exist yet.`;
+                                } else {
+                                    clip.validated = true;
                                 }
-                                runtime.computedIndices?.delete(affectedIndex);
+                            } else {
+                                clip.validated = false;
                             }
-                            runtime.validatedCount = runtime.validatedClipIds?.size || 0;
-                        }
-                    }
-                }
-            } else {
-                if (validated.checked) {
-                    // Ref2VA Motion ON is sequential, but the UI may already
-                    // contain cards that have never been rendered. Match the
-                    // random-access modes here: a card without a physical cache
-                    // cannot be committed as Validated. This also prevents an
-                    // unnecessary out-of-range manifest request.
-                    if (!clipHasPhysicalCache(runtime, clip, index)) {
-                        clip.validated = false;
-                        validated.checked = false;
-                        runtime.statusText = `Clip ${index + 1} cannot be marked Validated because its cache does not exist yet.`;
-                    } else {
-                        clip.validated = true;
-                    }
-                } else {
-                    invalidateFrom(state, index);
-                }
-                let open = false;
-                for (const c of state.clips) {
-                    if (open) c.validated = false;
-                    else if (!c.validated) open = true;
-                }
-                // Ref2VA Motion ON is causal, but its disk manifest is still
-                // authoritative after a browser refresh. Persist the exact
-                // manual prefix change just like the random-access modes persist
-                // their explicit per-clip validation state.
-                if (String(state?.generation_mode || "ref2va") === "ref2va"
-                    && state?.motion_context !== false
-                    && Boolean(clip.validated) !== wasValidated) {
-                    persistValidation = true;
-                }
-            }
-            updateHidden(node, runtime);
-            // Nodes 2.0 captures native control edits around pointer events.
-            // Validation is a custom DOM checkbox that mutates clips_json after
-            // that capture point, so commit the new hidden-widget value now.
-            // Otherwise immediately changing run_mode can resurrect the previous
-            // validation snapshot and send a validated clip back to the sampler.
-            captureNativeWorkflowState(node, runtime);
-
-            // Validation is restored from the disk manifest after F5 in all
-            // three generation modes. Persist both manual directions so the
-            // authoritative manifest and the card checkbox always agree. In
-            // FL2VA, explicit Previous followers are invalidated together with
-            // their changed predecessor, while the first manual follower stops
-            // propagation.
-            if (persistValidation) {
-                const requestedValidated = Boolean(clip.validated);
-                validated.disabled = true;
-                const persisted = await persistLocalRefInvalidation(
-                    node, runtime, index, requestedValidated
-                );
-                validated.disabled = false;
-                if (!persisted) {
-                    if (fl2vaMode && fl2vaValidationSnapshot) {
-                        for (let i = 0; i < (state.clips || []).length; i++) {
-                            if (i < fl2vaValidationSnapshot.validated.length) {
-                                state.clips[i].validated = Boolean(fl2vaValidationSnapshot.validated[i]);
+                            if (Boolean(clip.validated) !== wasValidated) {
+                                if (independentRef2va) {
+                                    persistValidation = true;
+                                } else if (fl2vaMode) {
+                                    persistValidation = true;
+                                    if (!Boolean(clip.validated)) {
+                                        const affected = [index, ...fl2vaPreviousDependentIndices(state, index)];
+                                        for (const affectedIndex of affected) {
+                                            const affectedClip = state.clips?.[affectedIndex];
+                                            if (!affectedClip) continue;
+                                            affectedClip.validated = false;
+                                            const affectedId = String(affectedClip.id || "");
+                                            if (affectedId) {
+                                                runtime.validatedClipIds?.delete(affectedId);
+                                                runtime.computedClipIds?.delete(affectedId);
+                                            }
+                                            runtime.computedIndices?.delete(affectedIndex);
+                                        }
+                                        runtime.validatedCount = runtime.validatedClipIds?.size || 0;
+                                    }
+                                }
                             }
-                        }
-                        runtime.validatedClipIds = new Set(fl2vaValidationSnapshot.validatedClipIds);
-                        runtime.computedClipIds = new Set(fl2vaValidationSnapshot.computedClipIds);
-                        runtime.computedIndices = new Set(fl2vaValidationSnapshot.computedIndices);
-                        runtime.validatedCount = runtime.validatedClipIds.size;
-                        validated.checked = Boolean(state.clips?.[index]?.validated);
-                    } else {
-                        clip.validated = wasValidated;
-                        validated.checked = wasValidated;
-                        if (independentRef2va) {
-                            if (wasValidated) runtime.validatedClipIds?.add(String(clip.id));
-                            else runtime.validatedClipIds?.delete(String(clip.id));
-                            runtime.validatedCount = runtime.validatedClipIds?.size || 0;
                         } else {
-                            runtime.validatedCount = validatedPrefixFromState(state);
-                            runtime.validatedClipIds = new Set(
-                                (state.clips || [])
-                                    .slice(0, runtime.validatedCount)
-                                    .map((item) => String(item?.id || ""))
-                                    .filter(Boolean)
-                            );
-                        }
-                    }
-                    updateHidden(node, runtime);
-                    captureNativeWorkflowState(node, runtime);
-                    render(node, runtime);
-                    return;
-                }
-                if (independentRef2va) {
-                    if (requestedValidated) runtime.validatedClipIds?.add(String(clip.id));
-                    else runtime.validatedClipIds?.delete(String(clip.id));
-                    runtime.validatedCount = runtime.validatedClipIds?.size || 0;
-                } else if (fl2vaMode) {
-                    if (requestedValidated) {
-                        runtime.validatedClipIds?.add(String(clip.id));
-                        runtime.computedClipIds?.delete(String(clip.id));
-                        runtime.computedIndices?.delete(index);
-                    } else {
-                        const affected = [index, ...fl2vaPreviousDependentIndices(state, index)];
-                        for (const affectedIndex of affected) {
-                            const affectedClip = state.clips?.[affectedIndex];
-                            const affectedId = String(affectedClip?.id || "");
-                            if (affectedId) {
-                                runtime.validatedClipIds?.delete(affectedId);
-                                runtime.computedClipIds?.delete(affectedId);
+                            if (validated.checked) {
+                                // Ref2VA Motion ON: require physical cache before Validated
+                                // (same rule as random-access / upstream 2.7.8+).
+                                if (!clipHasPhysicalCache(runtime, clip, index)) {
+                                    clip.validated = false;
+                                    validated.checked = false;
+                                    runtime.statusText = `Clip ${index + 1} cannot be marked Validated because its cache does not exist yet.`;
+                                } else {
+                                    clip.validated = true;
+                                }
+                            } else {
+                                invalidateFrom(state, index);
                             }
-                            runtime.computedIndices?.delete(affectedIndex);
+                            let open = false;
+                            for (const c of state.clips) {
+                                if (open) c.validated = false;
+                                else if (!c.validated) open = true;
+                            }
+                            // Ref2VA Motion ON is causal, but its disk manifest is still
+                            // authoritative after a browser refresh. Persist the exact
+                            // manual prefix change just like the random-access modes persist
+                            // their explicit per-clip validation state.
+                            if (String(state?.generation_mode || "ref2va") === "ref2va"
+                                && state?.motion_context !== false
+                                && Boolean(clip.validated) !== wasValidated) {
+                                persistValidation = true;
+                            }
                         }
-                    }
-                    runtime.validatedCount = runtime.validatedClipIds?.size || 0;
-                } else {
-                    runtime.validatedCount = validatedPrefixFromState(state);
-                    runtime.validatedClipIds = new Set(
-                        (state.clips || [])
-                            .slice(0, runtime.validatedCount)
-                            .map((item) => String(item?.id || ""))
-                            .filter(Boolean)
-                    );
-                    // Keep the interrupted Full-Batch checkpoint labels causal:
-                    // validating a candidate consumes its own COMPUTED marker;
-                    // invalidating clip N revokes COMPUTED for N and every later
-                    // clip because they depend on that Motion Context chain.
-                    if (requestedValidated) {
-                        runtime.computedIndices?.delete(index);
-                    } else {
-                        runtime.computedIndices = new Set(
-                            [...(runtime.computedIndices || [])]
-                                .filter((value) => Number(value) < index)
-                        );
-                    }
-                }
-                snapshotModeValidation(runtime);
-            }
+                        updateHidden(node, runtime);
+                        // Nodes 2.0 captures native control edits around pointer events.
+                        // Validation is a custom DOM checkbox that mutates clips_json after
+                        // that capture point, so commit the new hidden-widget value now.
+                        // Otherwise immediately changing run_mode can resurrect the previous
+                        // validation snapshot and send a validated clip back to the sampler.
+                        captureNativeWorkflowState(node, runtime);
 
-            render(node, runtime);
-        });
-        validateLabel.append(validated, document.createTextNode("Validated"));
+                        // Validation is restored from the disk manifest after F5 in all
+                        // three generation modes. Persist both manual directions so the
+                        // authoritative manifest and the card checkbox always agree. In
+                        // FL2VA, explicit Previous followers are invalidated together with
+                        // their changed predecessor, while the first manual follower stops
+                        // propagation.
+                        if (persistValidation) {
+                            const requestedValidated = Boolean(clip.validated);
+                            validated.disabled = true;
+                            const persisted = await persistLocalRefInvalidation(
+                                node, runtime, index, requestedValidated
+                            );
+                            validated.disabled = false;
+                            if (!persisted) {
+                                if (fl2vaMode && fl2vaValidationSnapshot) {
+                                    for (let i = 0; i < (state.clips || []).length; i++) {
+                                        if (i < fl2vaValidationSnapshot.validated.length) {
+                                            state.clips[i].validated = Boolean(fl2vaValidationSnapshot.validated[i]);
+                                        }
+                                    }
+                                    runtime.validatedClipIds = new Set(fl2vaValidationSnapshot.validatedClipIds);
+                                    runtime.computedClipIds = new Set(fl2vaValidationSnapshot.computedClipIds);
+                                    runtime.computedIndices = new Set(fl2vaValidationSnapshot.computedIndices);
+                                    runtime.validatedCount = runtime.validatedClipIds.size;
+                                    validated.checked = Boolean(state.clips?.[index]?.validated);
+                                } else {
+                                    clip.validated = wasValidated;
+                                    validated.checked = wasValidated;
+                                    if (independentRef2va) {
+                                        if (wasValidated) runtime.validatedClipIds?.add(String(clip.id));
+                                        else runtime.validatedClipIds?.delete(String(clip.id));
+                                        runtime.validatedCount = runtime.validatedClipIds?.size || 0;
+                                    } else {
+                                        runtime.validatedCount = validatedPrefixFromState(state);
+                                        runtime.validatedClipIds = new Set(
+                                            (state.clips || [])
+                                                .slice(0, runtime.validatedCount)
+                                                .map((item) => String(item?.id || ""))
+                                                .filter(Boolean)
+                                        );
+                                    }
+                                }
+                                updateHidden(node, runtime);
+                                captureNativeWorkflowState(node, runtime);
+                                render(node, runtime);
+                                return;
+                            }
+                            if (independentRef2va) {
+                                if (requestedValidated) runtime.validatedClipIds?.add(String(clip.id));
+                                else runtime.validatedClipIds?.delete(String(clip.id));
+                                runtime.validatedCount = runtime.validatedClipIds?.size || 0;
+                            } else if (fl2vaMode) {
+                                if (requestedValidated) {
+                                    runtime.validatedClipIds?.add(String(clip.id));
+                                    runtime.computedClipIds?.delete(String(clip.id));
+                                    runtime.computedIndices?.delete(index);
+                                } else {
+                                    const affected = [index, ...fl2vaPreviousDependentIndices(state, index)];
+                                    for (const affectedIndex of affected) {
+                                        const affectedClip = state.clips?.[affectedIndex];
+                                        const affectedId = String(affectedClip?.id || "");
+                                        if (affectedId) {
+                                            runtime.validatedClipIds?.delete(affectedId);
+                                            runtime.computedClipIds?.delete(affectedId);
+                                        }
+                                        runtime.computedIndices?.delete(affectedIndex);
+                                    }
+                                }
+                                runtime.validatedCount = runtime.validatedClipIds?.size || 0;
+                            } else {
+                                runtime.validatedCount = validatedPrefixFromState(state);
+                                runtime.validatedClipIds = new Set(
+                                    (state.clips || [])
+                                        .slice(0, runtime.validatedCount)
+                                        .map((item) => String(item?.id || ""))
+                                        .filter(Boolean)
+                                );
+                                // Keep the interrupted Full-Batch checkpoint labels causal:
+                                // validating a candidate consumes its own COMPUTED marker;
+                                // invalidating clip N revokes COMPUTED for N and every later
+                                // clip because they depend on that Motion Context chain.
+                                if (requestedValidated) {
+                                    runtime.computedIndices?.delete(index);
+                                } else {
+                                    runtime.computedIndices = new Set(
+                                        [...(runtime.computedIndices || [])]
+                                            .filter((value) => Number(value) < index)
+                                    );
+                                }
+                            }
+                            snapshotModeValidation(runtime);
+                        }
+
+                        render(node, runtime);
+                    });
+                    validateLabel.append(validated, document.createTextNode("Validated"));
+        } else {
+                    validationRow = document.createElement("div");
+                    validationRow.style.display = "flex";
+                    validationRow.style.alignItems = "center";
+                    validationRow.style.gap = "8px";
+                    validationRow.style.flexWrap = "wrap";
+                    validationRow.style.minWidth = "0";
+
+                    const validationTitle = document.createElement("span");
+                    validationTitle.textContent = "Validation:";
+                    validationTitle.style.fontSize = "10px";
+                    validationTitle.style.opacity = "0.72";
+                    validationTitle.style.flex = "0 0 auto";
+                    validationRow.appendChild(validationTitle);
+
+                    if (fl2vaMode) {
+                        // FL2VA plans are independent: one validation flag per card.
+                        validationRow.appendChild(makeValidationCheckbox("Draft", clip.validated, (checked) => {
+                            clip.validated = checked;
+                            updateHidden(node, runtime);
+                            render(node, runtime);
+                        }));
+                    } else {
+                        // REF2VA keeps separate draft/refine prefixes. Both are always visible
+                        // so clip_by_clip users can lock draft N and refine N without flipping
+                        // Run refine pass just to reach the other checkbox.
+                        const hasRefineCache = Number(runtime.refineCachedCount || 0) > 0
+                            || Boolean(runtime.runRefineWidget?.value)
+                            || (state.clips || []).some((c) => Boolean(c?.refine_validated));
+                        validationRow.appendChild(makeValidationCheckbox("Draft", clip.validated, (checked) => {
+                            if (checked) clip.validated = true;
+                            else invalidateFrom(state, index, false);
+                            enforceValidatedPrefix(state.clips, "validated");
+                            updateHidden(node, runtime);
+                            render(node, runtime);
+                        }));
+                        const refineBox = makeValidationCheckbox("Refine", clip.refine_validated, (checked) => {
+                            if (checked) clip.refine_validated = true;
+                            else invalidateFrom(state, index, true);
+                            enforceValidatedPrefix(state.clips, "refine_validated");
+                            updateHidden(node, runtime);
+                            render(node, runtime);
+                        });
+                        // Dim when refine has never been used, but keep it clickable so the
+                        // user always sees both locks side by side.
+                        if (!hasRefineCache) refineBox.style.opacity = "0.55";
+                        validationRow.appendChild(refineBox);
+                    }
+        }
 
         const infoWrap = document.createElement("div");
         infoWrap.style.display = "flex";
@@ -5590,9 +6218,13 @@ function render(node, runtime) {
         info.textContent = `${aligned}f / ${(aligned / 24).toFixed(3)}s`;
         info.style.fontSize = "10px";
         info.style.opacity = ".65";
-        infoWrap.appendChild(info);
-
-        foot.append(validateLabel, infoWrap);
+        if (fl2vaMode || randomAccess) {
+            infoWrap.appendChild(info);
+            foot.append(validateLabel, infoWrap);
+        } else {
+            info.style.flex = "0 0 auto";
+            foot.append(validationRow, info);
+        }
         card.appendChild(foot);
         cards.appendChild(card);
         restorePromptUiState(prompt, runtime, clip.id);
@@ -5706,6 +6338,30 @@ function ensureNodes2TimelineObserver(node, runtime, timelineRow) {
     runtime.nodes2ObservedTimelineRow = timelineRow || null;
 }
 
+function enforceValidatedPrefix(clips, field = "validated") {
+    let open = false;
+    for (const clip of clips || []) {
+        if (open) clip[field] = false;
+        else if (!clip[field]) open = true;
+    }
+}
+
+function makeValidationCheckbox(labelText, checked, onChange) {
+    const wrap = document.createElement("label");
+    wrap.style.display = "inline-flex";
+    wrap.style.alignItems = "center";
+    wrap.style.gap = "4px";
+    wrap.style.cursor = "pointer";
+    wrap.style.fontSize = "10px";
+    wrap.style.userSelect = "none";
+    const input = document.createElement("input");
+    input.type = "checkbox";
+    input.checked = Boolean(checked);
+    input.addEventListener("change", () => onChange(Boolean(input.checked)));
+    wrap.append(input, document.createTextNode(labelText));
+    return wrap;
+}
+
 function syncDomHeight(node, runtime, forceMin = false, retry = 0) {
     if (!node || !runtime?.domWidget || runtime.syncingDomHeight) return;
 
@@ -5724,7 +6380,7 @@ function syncDomHeight(node, runtime, forceMin = false, retry = 0) {
         setLegacyExtenderWidgetFullWidth(runtime, false);
         const currentH = Number(node.size?.[1] || 0);
         const y = Number(runtime.domWidget.last_y);
-        const nodes2MinH = nodes2MinHeightForState(runtime.state);
+        const nodes2MinH = nodes2MinHeightForState(runtime.state, runtime);
         const fallbackH = Number.isFinite(y) && y > 0
             ? y + nodes2MinH + BOTTOM_PAD
             : nodes2MinH + 180;
@@ -5800,7 +6456,7 @@ function syncDomHeight(node, runtime, forceMin = false, retry = 0) {
     try {
         let w = Math.max(NODE_MIN_WIDTH, Number(node.size?.[0] || NODE_MIN_WIDTH));
         let h = Number(node.size?.[1] || 0);
-        const uiMinH = uiMinHeightForState(runtime.state);
+        const uiMinH = uiMinHeightForState(runtime.state, runtime);
         const minNodeH = y + uiMinH + BOTTOM_PAD;
         const returningFromNodes2 = runtime.lastRenderMode === "nodes2";
 
@@ -5832,8 +6488,9 @@ function syncDomHeight(node, runtime, forceMin = false, retry = 0) {
 
         const actualH = Number(node.size?.[1] || h);
         const available = Math.max(uiMinH, actualH - y - BOTTOM_PAD);
+        const sectionsH = sectionsStackHeight(runtime);
         runtime.root.style.height = `${available}px`;
-        runtime.cards.style.height = `${Math.max(340, available - 55 - REF_SECTION_HEIGHT)}px`;
+        runtime.cards.style.height = `${Math.max(340, available - 55 - REF_SECTION_HEIGHT - sectionsH)}px`;
         runtime.cards.style.flex = "0 0 auto";
         runtime.cards.style.minHeight = "";
         runtime.domHeight = available;
@@ -5932,11 +6589,42 @@ function buildUi(node) {
     const motionContextWidget = getWidget(node, "motion_context");
     const contextLengthWidget = getWidget(node, "context_length");
     const audioContextLengthWidget = getWidget(node, "audio_context_length");
+    const stepsWidget = getWidget(node, "steps");
+    const schedulerWidget = getWidget(node, "scheduler");
+    const pddAccLoraWidget = getWidget(node, "pdd_acc_lora");
+    const pddNfeWidget = getWidget(node, "pdd_nfe");
+    const pddLoraStrengthWidget = getWidget(node, "pdd_lora_strength");
+    const pddHeadStrengthWidget = getWidget(node, "pdd_head_strength");
+    const resolutionModeWidget = getWidget(node, "resolution_mode");
+    const megapixelsWidget = getWidget(node, "megapixels");
+    const runRefineWidget = getWidget(node, "run_refine");
+    const latentUpscaleModelWidget = getWidget(node, "latent_upscale_model");
+    const refineMegapixelsWidget = getWidget(node, "refine_megapixels");
+    const refineDenoiseWidget = getWidget(node, "refine_denoise");
+    const refineStepsWidget = getWidget(node, "refine_steps");
+    const latentUpscalePrecisionWidget = getWidget(node, "latent_upscale_precision");
     if (!jsonWidget || !refsWidget || !generationModeWidget || !motionContextWidget) return null;
     hideNativeWidget(node, jsonWidget);
     hideNativeWidget(node, refsWidget);
     hideNativeWidget(node, generationModeWidget);
     hideNativeWidget(node, motionContextWidget);
+    // Canvas size + PDD + Latent refine live in the custom section stack.
+    for (const widget of [
+        resolutionModeWidget,
+        megapixelsWidget,
+        pddAccLoraWidget,
+        pddNfeWidget,
+        pddLoraStrengthWidget,
+        pddHeadStrengthWidget,
+        runRefineWidget,
+        latentUpscaleModelWidget,
+        refineMegapixelsWidget,
+        refineDenoiseWidget,
+        refineStepsWidget,
+        latentUpscalePrecisionWidget,
+    ]) {
+        hideNativeWidget(node, widget);
+    }
 
     const state = parseState(jsonWidget.value);
     // Initial node construction can happen before a saved workflow has been
@@ -6000,6 +6688,8 @@ function buildUi(node) {
         runtime.cachedCount = 0;
         runtime.validatedCount = 0;
         runtime.cacheStateRestored = false;
+        // Drop a trunk-mismatched PDD Acc when flipping Ref2VA ↔ FL2VA.
+        enforcePddAccModeMatch(node, runtime, { alertUser: true });
         updateHidden(node, runtime);
         captureNativeWorkflowState(node, runtime);
         render(node, runtime);
@@ -6189,10 +6879,8 @@ function buildUi(node) {
     cards.style.scrollbarGutter = "stable";
     cards.style.boxSizing = "border-box";
     cards.style.scrollBehavior = "smooth";
-    cards.style.height = `${Math.max(340, initialUiMinHeight - 55 - REF_SECTION_HEIGHT)}px`;
+    cards.style.height = `${Math.max(340, initialUiMinHeight - 55 - REF_SECTION_HEIGHT - SECTIONS_COLLAPSED_RESERVE)}px`;
     cards.style.minHeight = `${cardMinHeightForState(state) + CARD_SCROLLBAR_SPACE}px`;
-
-    root.append(toolbar, refsSection, cards, refFileInput, frameFileInput);
 
     const restoredValidatedPrefix = validatedPrefixFromState(state);
     const runtime = {
@@ -6219,6 +6907,20 @@ function buildUi(node) {
         motionContextWidget,
         contextLengthWidget,
         audioContextLengthWidget,
+        stepsWidget,
+        schedulerWidget,
+        pddAccLoraWidget,
+        pddNfeWidget,
+        pddLoraStrengthWidget,
+        pddHeadStrengthWidget,
+        resolutionModeWidget,
+        megapixelsWidget,
+        runRefineWidget,
+        latentUpscaleModelWidget,
+        refineMegapixelsWidget,
+        refineDenoiseWidget,
+        refineStepsWidget,
+        latentUpscalePrecisionWidget,
         modeButton,
         motionButton,
         pendingRefSlot: -1,
@@ -6244,6 +6946,8 @@ function buildUi(node) {
         // immediately, then replace it with the authoritative disk manifest below.
         cachedCount: restoredValidatedPrefix,
         validatedCount: restoredValidatedPrefix,
+        refineCachedCount: validatedPrefixFromState(state, true),
+        refineValidatedCount: validatedPrefixFromState(state, true),
         statusText: restoredValidatedPrefix
             ? `Restoring cache | validated ${restoredValidatedPrefix}`
             : "Ready",
@@ -6378,6 +7082,10 @@ function buildUi(node) {
         }
     });
 
+    const sectionsWrap = buildExtenderSections(node, runtime);
+    // Immediately under native megapixels / sampling widgets, above MODE / clips UI.
+    root.append(sectionsWrap, toolbar, refsSection, cards, refFileInput, frameFileInput);
+
     const domWidget = node.addDOMWidget("h3_extender_timeline", "timeline", root, {
         serialize: false,
         hideOnZoom: false,
@@ -6386,12 +7094,25 @@ function buildUi(node) {
         // Legacy minimum unchanged.
         getMinHeight: () =>
             globalThis.LiteGraph?.vueNodesMode
-                ? nodes2MinHeightForState(runtime.state)
-                : uiMinHeightForState(runtime.state),
+                ? nodes2MinHeightForState(runtime.state, runtime)
+                : uiMinHeightForState(runtime.state, runtime),
         getHeight: () => runtime.domHeight,
         afterResize: (resizedNode) => {
             const mode = domWidgetRenderMode(root);
             if (mode === "nodes2") {
+                // Re-assert only intrinsic CSS. Never derive anything from
+                // node.size while Vue is resolving its grid.
+                const nodes2MinH = nodes2MinHeightForState(runtime.state, runtime);
+                root.style.height = "auto";
+                root.style.minHeight = `${nodes2MinH}px`;
+                root.style.setProperty("--comfy-widget-min-height", `${nodes2MinH}px`);
+                root.style.maxHeight = "none";
+                root.style.flex = "1 1 auto";
+                root.style.paddingTop = `${5 + NODES2_TOP_GAP}px`;
+                root.style.overflow = "visible";
+                cards.style.height = "auto";
+                cards.style.flex = "1 1 auto";
+                cards.style.minHeight = `${cardMinHeightForState(runtime.state) + CARD_SCROLLBAR_SPACE}px`;
                 // Nodes 2.0 updates its WidgetGrid row after the resize callback.
                 // Wait for Vue's next layout pass, then read the row/wrapper
                 // height in syncDomHeight(). No node.size -> getHeight feedback
@@ -6425,8 +7146,12 @@ function buildUi(node) {
 
     installInvalidationHooks(node, runtime);
     wrapResolutionWidgetCallbacks(node, runtime);
+    installPddWidgetHooks(node, runtime);
+    enforcePddAccModeMatch(node, runtime, { alertUser: false });
+    syncExtenderSections(node, runtime);
     render(node, runtime);
     refreshLoraNames(node, runtime);
+    requestAnimationFrame(() => syncDomHeight(node, runtime, true));
 
     const oldConfigure = node.onConfigure;
     node.onConfigure = function (info) {
@@ -6604,6 +7329,27 @@ app.registerExtension({
             clearTransientRenderingState();
         });
 
+        // Custom refine checkbox can drift from the serialized widget after F5.
+        // Push the visible checkbox state into the widget right before queue.
+        const originalGraphToPrompt = app.graphToPrompt?.bind(app);
+        if (typeof originalGraphToPrompt === "function") {
+            app.graphToPrompt = async function () {
+                const graph = app.graph;
+                for (const node of graph?._nodes || []) {
+                    if (
+                        node?.comfyClass !== TARGET &&
+                        node?.type !== TARGET
+                    ) {
+                        continue;
+                    }
+                    const runtime = node.__h3Extender;
+                    if (!runtime) continue;
+                    syncRunRefineWidgetFromUi(runtime);
+                    syncExtenderSections(node, runtime);
+                }
+                return await originalGraphToPrompt(...arguments);
+            };
+        }
         api.addEventListener(PROMPT_PACK_EVENT, ({ detail }) => {
             const node = findExtenderNodeByExecutionId(detail?.node);
             if (!node) return;
@@ -6642,9 +7388,13 @@ app.registerExtension({
             const skipped = Array.isArray(detail?.skipped_slots)
                 ? detail.skipped_slots.map((value) => Number(value)).filter((value) => Number.isInteger(value) && value >= 1 && value <= MAX_IMAGE_REFS)
                 : [];
+            const cleared = Array.isArray(detail?.cleared_slots)
+                ? detail.cleared_slots.map((value) => Number(value)).filter((value) => Number.isInteger(value) && value >= 1 && value <= MAX_IMAGE_REFS)
+                : [];
             const source = String(detail?.source || "External reference pack");
             const parts = [];
             if (slots.length) parts.push(`imported Ref ${slots.join(", ")}`);
+            if (cleared.length) parts.push(`cleared Ref ${cleared.join(", ")}`);
             if (skipped.length) parts.push(`ignored local-reserved Ref ${skipped.join(", ")}`);
             runtime.statusText = parts.length
                 ? `${source}: ${parts.join(" • ")}`
@@ -6750,16 +7500,16 @@ app.registerExtension({
             }
     
             const generated = Array.isArray(info.generated) ? info.generated : [];
-            for (const [i, clip] of runtime.state.clips.entries()) {
-                if (clip.validated) continue;
-                const next = nextSeeds.get(clip.id);
-                if (next && next.seed_mode === clip.seed_mode) {
-                    // Completion may describe an older queued run. Keep the
-                    // seeds already prepared by afterQueued, including clips
-                    // that this execution did not reach.
-                    clip.seed = next.seed;
-                } else if (generated.some((index) => Number(index) === i + 1)) {
-                    // A backend-imported clip may not have existed at queue time.
+            const refineRun = Boolean(info.refined || info.run_refine);
+            for (const humanIndex of generated) {
+                const i = Number(humanIndex) - 1;
+                const clip = runtime.state.clips[i];
+                // Only prepare a next seed for a candidate. A validated cached
+                // clip is never touched by this automatic seed behavior.
+                const locked = refineRun
+                    ? Boolean(clip?.refine_validated)
+                    : Boolean(clip?.validated);
+                if (clip && !locked) {
                     advanceSeedAfterGenerate(clip);
                 }
             }
@@ -6770,10 +7520,19 @@ app.registerExtension({
             // fixed seed needs the resumable nonce added after an interruption.
             let persistExecutionState = generated.length > 0;
 
-            runtime.cachedCount = Number(info.cached_count || 0);
-            runtime.validatedCount = Number(info.validated_count || 0);
-            runtime.cachedClipIds = new Set(Array.isArray(info.cached_clip_ids) ? info.cached_clip_ids.map(String) : []);
-            runtime.validatedClipIds = new Set(Array.isArray(info.validated_clip_ids) ? info.validated_clip_ids.map(String) : []);
+            if (refineRun) {
+                runtime.refineCachedCount = Number(
+                    info.refine_cached_count ?? info.cached_count ?? 0
+                );
+                runtime.refineValidatedCount = Number(
+                    info.refine_validated_count ?? info.validated_count ?? 0
+                );
+            } else {
+                runtime.cachedCount = Number(info.cached_count || 0);
+                runtime.validatedCount = Number(info.validated_count || 0);
+                runtime.cachedClipIds = new Set(Array.isArray(info.cached_clip_ids) ? info.cached_clip_ids.map(String) : []);
+                runtime.validatedClipIds = new Set(Array.isArray(info.validated_clip_ids) ? info.validated_clip_ids.map(String) : []);
+            }
             if (String(runtime.state?.generation_mode || "ref2va") === "ref2va" && runtime.state?.motion_context !== false) {
                 const returnedOrder = Array.isArray(info.cached_clip_ids) ? info.cached_clip_ids.map(String) : [];
                 runtime.state.causal_lineage = returnedOrder.length
