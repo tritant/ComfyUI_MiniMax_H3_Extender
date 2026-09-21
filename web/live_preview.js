@@ -153,26 +153,47 @@ function hideCompatibilityWidget(node, name) {
 function ensureLatentUpscaleWidgetDefaults(node) {
     // Newly appended Final Decode combos are '' in older workflow JSON until
     // the user touches them. Coerce to safe defaults so prompt validation passes.
+    // Also repair shifted widgets_values junk (e.g. ai_skip_first=1 → latent_layer,
+    // fp16 → latent_upscale_model).
     const layer = getWidget(node, "latent_layer");
-    if (layer && (layer.value === "" || layer.value == null)) {
-        layer.value = "auto";
+    if (layer) {
+        const text = String(layer.value ?? "").trim().toLowerCase();
+        if (!["auto", "draft", "refine"].includes(text)) {
+            layer.value = "auto";
+        }
     }
     const model = getWidget(node, "latent_upscale_model");
-    if (model && (model.value === "" || model.value == null)) {
-        // Prefer bf16 H3 weights when present; else first real checkpoint.
-        const opts = model.options || model.values || [];
-        const list = Array.isArray(opts) ? opts : [];
-        const bf16 = list.find((v) => v && v !== "None" && String(v).toLowerCase().includes("bf16"));
-        const any = list.find((v) => v && v !== "None");
-        model.value = bf16 || any || "None";
+    if (model) {
+        const raw = String(model.value ?? "").trim();
+        const low = raw.toLowerCase();
+        const junk = (
+            raw === ""
+            || low === "null"
+            || ["auto", "draft", "refine", "fp16", "bf16", "fp32"].includes(low)
+            || (!Number.isNaN(Number(raw)) && raw !== "")
+        );
+        if (junk) {
+            model.value = "None";
+        } else {
+            const options = Array.isArray(model.options) ? model.options.map(String) : null;
+            if (options && options.length && !options.includes(raw)) {
+                model.value = "None";
+            }
+        }
     }
     const precision = getWidget(node, "latent_upscale_precision");
-    if (precision && (precision.value === "" || precision.value == null)) {
-        precision.value = "bf16";
+    if (precision) {
+        const text = String(precision.value ?? "").trim().toLowerCase();
+        if (!["fp16", "bf16", "fp32"].includes(text)) {
+            precision.value = "bf16";
+        }
     }
     const mp = getWidget(node, "latent_upscale_megapixels");
-    if (mp && (mp.value === "" || mp.value == null || Number.isNaN(Number(mp.value)))) {
-        mp.value = 1.2;
+    if (mp) {
+        const n = Number(mp.value);
+        if (mp.value === "" || mp.value == null || Number.isNaN(n) || n < 0.1 || n > 8) {
+            mp.value = 1.2;
+        }
     }
     ensureStitchWidgetDefaults(node);
 }
@@ -208,17 +229,16 @@ function hideFinalDecodeGenerationWidgets(node) {
     // Generation / layer controls live on the Extender (Latent refine section).
     // Final Decode keeps the values for serialization + decode, but the player UI
     // should stay play-only.
+    // Soft-hide only — never converted-widget (that shifts widgets_values and
+    // used to land ai_skip_first=1 into latent_layer).
     for (const name of [
         "latent_layer",
         "latent_upscale_model",
         "latent_upscale_megapixels",
         "latent_upscale_precision",
+        ...STITCH_WIDGET_NAMES,
+        "stitch_json",
     ]) {
-        hideCompatibilityWidget(node, name);
-    }
-    // Stitch knobs: hide visually but NEVER convert type — converted-widget was
-    // dropping/shifting widgets_values (offset flipped to 2 = rife_multiplier default).
-    for (const name of [...STITCH_WIDGET_NAMES, "stitch_json"]) {
         softHideSerializedWidget(node, name);
     }
 }

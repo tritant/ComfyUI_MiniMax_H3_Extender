@@ -596,25 +596,13 @@ def run(
     ref_pack,
     export_profile,
     kwargs,
-    pdd_acc_lora="None",
-    pdd_nfe="8",
-    pdd_lora_strength=1.0,
-    pdd_head_strength=1.0,
+    sigmas=None,
 ):
     """Execute Ref2VA with no Motion Context and random-access clip caches."""
     from . import extender as e
     from . import motion_context_disk as d
 
-    model, pdd_sigmas = e._prepare_pdd_model(
-        model,
-        generation_mode="ref2va",
-        pdd_acc_lora=pdd_acc_lora,
-        pdd_nfe=pdd_nfe,
-        pdd_lora_strength=pdd_lora_strength,
-        pdd_head_strength=pdd_head_strength,
-        denoise=denoise,
-        sampler_name=sampler_name,
-    )
+    sample_sigmas = e._resolve_sample_sigmas(sigmas, denoise)
 
     clip_ids = [str(cfg.get("id") or f"clip_{i + 1}") for i, cfg in enumerate(clips)]
     data_path, manifest_path, manifest = sync_manifest(owner, e.FPS, clip_ids)
@@ -966,7 +954,7 @@ def run(
             str(scheduler),
             int(steps),
             float(denoise),
-            sigmas=pdd_sigmas,
+            sigmas=sample_sigmas,
         )
 
         _handle, _proxy, manifest, cache_status, _cache_mb = store_segment(

@@ -34,7 +34,7 @@ const MAX_IMAGE_REFS = 9;
 const MAX_MIXED_REFS = 12;
 const MAX_FL2VA_GUIDES = 3;
 const MAX_RESOLUTION = 4096;
-const DEFAULT_MEGAPIXELS = 0.70;
+const DEFAULT_MEGAPIXELS = 0.40;
 
 // Nodes 2.0 lifecycle guard. Workflow loading is bracketed by the official
 // beforeConfigureGraph/afterConfigureGraph extension hooks; while this flag is
@@ -106,10 +106,24 @@ const PROJECT_WIDGETS = [
     "refs_json",
     "generation_mode",
     "motion_context",
+    "run_refine",
+    "latent_upscale_model",
+    "refine_megapixels",
+    "refine_denoise",
+    "refine_steps",
+    "latent_upscale_precision",
+];
+
+// Removed from Extender when PDD moved to external MiniMaxH3PDDAccApply.
+// Old workflows still serialize these four slots in widgets_values.
+const LEGACY_PDD_WIDGETS = [
     "pdd_acc_lora",
     "pdd_nfe",
     "pdd_lora_strength",
     "pdd_head_strength",
+];
+
+const REFINE_WIDGETS = [
     "run_refine",
     "latent_upscale_model",
     "refine_megapixels",
@@ -1906,65 +1920,11 @@ function setNativeWidgetVisibility(node, widget, visible) {
     node?.graph?.setDirtyCanvas(true, true);
 }
 
-function isPddAccActive(node, runtime) {
-    const widget = runtime?.pddAccLoraWidget || getWidget(node, "pdd_acc_lora");
-    const value = String(widget?.value ?? "None").trim();
-    return Boolean(value) && value !== "None";
-}
-
-/** Mirror pdd_bridge.validate_pdd_file_for_mode filename heuristic. */
-function pddAccTrunkFromName(name) {
-    const low = String(name || "").toLowerCase().replace(/-/g, "_");
-    const hasFl = low.includes("fl2va");
-    const hasRef = low.includes("ref2va");
-    if (hasFl && !hasRef) return "fl2va";
-    if (hasRef && !hasFl) return "ref2va";
-    return null;
-}
-
-function pddAccModeMismatchMessage(pddFile, generationMode) {
-    const value = String(pddFile || "").trim();
-    if (!value || value === "None") return null;
-    const expected = String(generationMode || "ref2va").toLowerCase() === "fl2va" ? "fl2va" : "ref2va";
-    const trunk = pddAccTrunkFromName(value);
-    if (!trunk || trunk === expected) return null;
-    return (
-        `PDD Acc '${value}' looks like a ${trunk.toUpperCase()} distill, but generation mode is ${expected}. `
-        + `Use the matching ${expected.toUpperCase()} Acc LoRA (models/pdd_acc/).`
-    );
-}
-
-/**
- * If the selected PDD Acc filename targets the other trunk, clear it to None
- * and surface the reason in the Extender status (optionally via alert).
- * Backend validate_pdd_file_for_mode remains the hard Queue-time guard.
- */
-function enforcePddAccModeMatch(node, runtime, { alertUser = false } = {}) {
-    const widget = runtime?.pddAccLoraWidget || getWidget(node, "pdd_acc_lora");
-    if (!widget) return true;
-    const value = String(widget.value ?? "None").trim() || "None";
-    const mode = String(
-        runtime?.state?.generation_mode
-        || getWidget(node, "generation_mode")?.value
-        || "ref2va",
-    );
-    const message = pddAccModeMismatchMessage(value, mode);
-    if (!message) return true;
-
-    widget.value = "None";
-    for (const row of runtime?.pddAllRows || []) {
-        if (row?.__h3Widget === widget && row.__h3Select) {
-            row.__h3Select.value = "None";
-        }
+function hasExternalSigmas(node) {
+    const inputs = node?.inputs || [];
+    for (const input of inputs) {
+        if (input?.name === "sigmas" && input.link != null) return true;
     }
-    if (runtime) runtime.statusText = message;
-    if (alertUser) {
-        try { alert(message); } catch (_) { /* headless / blocked */ }
-    }
-    syncModeSpecificNativeWidgets(node, runtime);
-    syncExtenderSections(node, runtime);
-    if (runtime?.status) runtime.status.textContent = runtime.statusText;
-    node?.graph?.setDirtyCanvas(true, true);
     return false;
 }
 
@@ -1986,26 +1946,10 @@ function syncModeSpecificNativeWidgets(node, runtime) {
     setNativeWidgetVisibility(node, runtime?.contextLengthWidget, causalRef2va);
     setNativeWidgetVisibility(node, runtime?.audioContextLengthWidget, causalRef2va);
 
-    // When PDD Acc is selected the backend uses the trained sigma grid from
-    // pdd_nfe. Hide the ordinary steps/scheduler so they cannot confuse the run.
-    const pddActive = isPddAccActive(node, runtime);
-    setNativeWidgetVisibility(node, runtime?.stepsWidget, !pddActive);
-    setNativeWidgetVisibility(node, runtime?.schedulerWidget, !pddActive);
-}
-
-
-function installPddWidgetHooks(node, runtime) {
-    const pddWidget = runtime?.pddAccLoraWidget || getWidget(node, "pdd_acc_lora");
-    if (!pddWidget || pddWidget.__h3PddHooked) return;
-    pddWidget.__h3PddHooked = true;
-    const prev = pddWidget.callback;
-    pddWidget.callback = function () {
-        if (typeof prev === "function") prev.apply(this, arguments);
-        enforcePddAccModeMatch(node, runtime, { alertUser: true });
-        syncModeSpecificNativeWidgets(node, runtime);
-        syncExtenderSections(node, runtime);
-        node?.graph?.setDirtyCanvas(true, true);
-    };
+    // External SIGMAS (e.g. MiniMaxH3PDDAccApply) replace steps/scheduler.
+    const sigmasActive = hasExternalSigmas(node);
+    setNativeWidgetVisibility(node, runtime?.stepsWidget, !sigmasActive);
+    setNativeWidgetVisibility(node, runtime?.schedulerWidget, !sigmasActive);
 }
 
 function ensureExtenderSectionStyles() {
@@ -2288,18 +2232,19 @@ function syncDecodeLayerToFinal(node, value) {
 
 function syncExtenderSections(node, runtime) {
     if (!runtime) return;
-    const pddActive = isPddAccActive(node, runtime);
-    for (const row of runtime.pddDetailRows || []) {
-        row.style.display = pddActive ? "flex" : "none";
-    }
     const refineOn = coerceWidgetBool(runtime.runRefineWidget?.value);
+    const sigmasActive = hasExternalSigmas(node);
     for (const row of runtime.refineDetailRows || []) {
+        if (row === runtime.refineStepsRow) {
+            // External SIGMAS are denoise-trimmed for refine; steps are ignored.
+            row.style.display = refineOn && !sigmasActive ? "flex" : "none";
+            continue;
+        }
         row.style.display = refineOn ? "flex" : "none";
     }
     // Keep selects/inputs mirrored if native values changed elsewhere.
     for (const row of [
         ...(runtime.canvasSizeRows || []),
-        ...(runtime.pddAllRows || []),
         ...(runtime.refineAllRows || []),
     ]) {
         const widget = row.__h3Widget;
@@ -2353,33 +2298,9 @@ function buildExtenderSections(node, runtime) {
         syncExtenderSections(node, runtime);
     });
 
-    const pddSection = createCollapsibleSection("PDD Acc", {
-        open: false,
-        hint: "Alibaba PDD acceleration. When a PDD LoRA is selected, steps/scheduler are ignored.",
-    });
-    pddSection.__h3Runtime = runtime;
-    const pddLoraRow = createBoundSelectRow("PDD LoRA", runtime.pddAccLoraWidget);
-    const pddNfeRow = createBoundSelectRow("PDD NFE", runtime.pddNfeWidget);
-    const pddLoraStrengthRow = createBoundNumberRow("LoRA strength", runtime.pddLoraStrengthWidget, {
-        min: -2, max: 2, step: 0.01,
-    });
-    const pddHeadStrengthRow = createBoundNumberRow("Head strength", runtime.pddHeadStrengthWidget, {
-        min: 0, max: 2, step: 0.01,
-    });
-    runtime.pddAllRows = [pddLoraRow, pddNfeRow, pddLoraStrengthRow, pddHeadStrengthRow];
-    runtime.pddDetailRows = [pddNfeRow, pddLoraStrengthRow, pddHeadStrengthRow];
-    pddSection.__h3Body.append(pddLoraRow, pddNfeRow, pddLoraStrengthRow, pddHeadStrengthRow);
-    pddLoraRow.__h3Select?.addEventListener("change", () => {
-        enforcePddAccModeMatch(node, runtime, { alertUser: true });
-        syncModeSpecificNativeWidgets(node, runtime);
-        syncExtenderSections(node, runtime);
-        requestAnimationFrame(() => syncDomHeight(node, runtime, true));
-        if (runtime.status) runtime.status.textContent = runtime.statusText || "Ready";
-    });
-
     const refineSection = createCollapsibleSection("Latent refine", {
         open: false,
-        hint: "Second pass: keep draft, neural latent upscale + resample. Uses the same run_mode + Validated prefix as draft. Then Queue Final Decode.",
+        hint: "Second pass: keep draft, neural latent upscale + resample. Uses the same run_mode + Validated prefix as draft. With external SIGMAS connected, refine denoise-trims those sigmas (refine steps ignored). Then Queue Final Decode.",
     });
     refineSection.__h3Runtime = runtime;
     const runRefineRow = createBoundCheckboxRow("Run refine pass", runtime.runRefineWidget);
@@ -2394,6 +2315,7 @@ function buildExtenderSections(node, runtime) {
     const refineStepsRow = createBoundNumberRow("Refine steps", runtime.refineStepsWidget, {
         min: 1, max: 10000, step: 1,
     });
+    runtime.refineStepsRow = refineStepsRow;
     const refinePrecisionRow = createBoundSelectRow("Upscale precision", runtime.latentUpscalePrecisionWidget, [
         "fp16", "bf16", "fp32",
     ]);
@@ -2439,10 +2361,9 @@ function buildExtenderSections(node, runtime) {
         requestAnimationFrame(() => syncDomHeight(node, runtime, true));
     });
 
-    wrap.append(canvasPanel, pddSection, refineSection);
+    wrap.append(canvasPanel, refineSection);
     runtime.sectionsWrap = wrap;
     runtime.canvasPanel = canvasPanel;
-    runtime.pddSection = pddSection;
     runtime.refineSection = refineSection;
     runtime.__h3Node = node;
     syncExtenderSections(node, runtime);
@@ -4213,6 +4134,120 @@ function setWidgetValue(node, name, value) {
     if (!widget || value === undefined) return false;
     widget.value = value;
     return true;
+}
+
+function looksLikeLegacyPddNfe(value) {
+    const text = String(value ?? "").trim();
+    return text === "4" || text === "6" || text === "8";
+}
+
+function looksLikeUpscaleModelName(value) {
+    const text = String(value ?? "").trim().toLowerCase();
+    return text.endsWith(".safetensors") || text.endsWith(".pth") || text.endsWith(".ckpt");
+}
+
+/**
+ * Remap widgets_values from builds that still had internal PDD Acc widgets.
+ * Saved layout after motion_context was: pdd_×4 + refine_×6.
+ * Current layout is refine_×6 only; positional restore otherwise maps
+ * pdd_nfe='8' onto latent_upscale_model and drops the real refine tail.
+ */
+function migrateLegacyPddWidgetsValues(node, savedWidgetValues) {
+    if (!node || !Array.isArray(savedWidgetValues) || !savedWidgetValues.length) return false;
+
+    const live = (node.widgets || []).filter((w) => w && w.name);
+    const liveNames = live.map((w) => w.name);
+    const motionIdx = liveNames.indexOf("motion_context");
+    if (motionIdx < 0) return false;
+
+    const legacyNames = [
+        ...liveNames.slice(0, motionIdx + 1),
+        ...LEGACY_PDD_WIDGETS,
+        ...REFINE_WIDGETS,
+        ...liveNames.slice(motionIdx + 1 + REFINE_WIDGETS.length),
+    ];
+
+    // Full old array still present in the workflow JSON.
+    if (savedWidgetValues.length === legacyNames.length) {
+        const base = motionIdx + 1;
+        for (let i = 0; i < REFINE_WIDGETS.length; i++) {
+            setWidgetValue(node, REFINE_WIDGETS[i], savedWidgetValues[base + LEGACY_PDD_WIDGETS.length + i]);
+        }
+        ensureRefineWidgetDefaults(node);
+        return true;
+    }
+
+    // Already truncated / shifted into current length — repair obvious junk.
+    return ensureRefineWidgetDefaults(node);
+}
+
+function ensureRefineWidgetDefaults(node) {
+    const model = getWidget(node, "latent_upscale_model");
+    const precision = getWidget(node, "latent_upscale_precision");
+    const steps = getWidget(node, "refine_steps");
+    const mp = getWidget(node, "refine_megapixels");
+    const denoise = getWidget(node, "refine_denoise");
+    let changed = false;
+
+    const modelRaw = String(model?.value ?? "").trim();
+    const precisionRaw = String(precision?.value ?? "").trim();
+    const modelLow = modelRaw.toLowerCase();
+    const precisionLow = precisionRaw.toLowerCase();
+
+    const modelJunk = (
+        !model
+        || modelRaw === ""
+        || looksLikeLegacyPddNfe(modelRaw)
+        || ["auto", "draft", "refine", "fp16", "bf16", "fp32"].includes(modelLow)
+        || (!Number.isNaN(Number(modelRaw)) && modelRaw !== "")
+    );
+    if (model && modelJunk) {
+        // If precision holds the real model path from the shift, salvage it.
+        if (looksLikeUpscaleModelName(precisionRaw)) {
+            model.value = precisionRaw;
+            if (precision) precision.value = "bf16";
+        } else {
+            model.value = "None";
+        }
+        changed = true;
+    } else if (model) {
+        const options = Array.isArray(model.options) ? model.options.map(String) : null;
+        if (options && options.length && !options.includes(modelRaw) && modelRaw !== "None") {
+            model.value = "None";
+            changed = true;
+        }
+    }
+
+    if (precision && !["fp16", "bf16", "fp32"].includes(precisionLow)) {
+        precision.value = "bf16";
+        changed = true;
+    }
+
+    if (steps) {
+        const n = Number(steps.value);
+        if (!Number.isFinite(n) || n < 1) {
+            steps.value = 4;
+            changed = true;
+        }
+    }
+
+    if (mp) {
+        const n = Number(mp.value);
+        if (!Number.isFinite(n) || n < 0.1 || n > 8) {
+            mp.value = 1.2;
+            changed = true;
+        }
+    }
+
+    if (denoise) {
+        const n = Number(denoise.value);
+        if (!Number.isFinite(n) || n < 0.01 || n > 1) {
+            denoise.value = 0.3;
+            changed = true;
+        }
+    }
+
+    return changed;
 }
 
 function applyProjectPayload(node, runtime, projectPayload) {
@@ -6591,10 +6626,6 @@ function buildUi(node) {
     const audioContextLengthWidget = getWidget(node, "audio_context_length");
     const stepsWidget = getWidget(node, "steps");
     const schedulerWidget = getWidget(node, "scheduler");
-    const pddAccLoraWidget = getWidget(node, "pdd_acc_lora");
-    const pddNfeWidget = getWidget(node, "pdd_nfe");
-    const pddLoraStrengthWidget = getWidget(node, "pdd_lora_strength");
-    const pddHeadStrengthWidget = getWidget(node, "pdd_head_strength");
     const resolutionModeWidget = getWidget(node, "resolution_mode");
     const megapixelsWidget = getWidget(node, "megapixels");
     const runRefineWidget = getWidget(node, "run_refine");
@@ -6608,14 +6639,10 @@ function buildUi(node) {
     hideNativeWidget(node, refsWidget);
     hideNativeWidget(node, generationModeWidget);
     hideNativeWidget(node, motionContextWidget);
-    // Canvas size + PDD + Latent refine live in the custom section stack.
+    // Canvas size + Latent refine live in the custom section stack.
     for (const widget of [
         resolutionModeWidget,
         megapixelsWidget,
-        pddAccLoraWidget,
-        pddNfeWidget,
-        pddLoraStrengthWidget,
-        pddHeadStrengthWidget,
         runRefineWidget,
         latentUpscaleModelWidget,
         refineMegapixelsWidget,
@@ -6688,8 +6715,6 @@ function buildUi(node) {
         runtime.cachedCount = 0;
         runtime.validatedCount = 0;
         runtime.cacheStateRestored = false;
-        // Drop a trunk-mismatched PDD Acc when flipping Ref2VA ↔ FL2VA.
-        enforcePddAccModeMatch(node, runtime, { alertUser: true });
         updateHidden(node, runtime);
         captureNativeWorkflowState(node, runtime);
         render(node, runtime);
@@ -6909,10 +6934,6 @@ function buildUi(node) {
         audioContextLengthWidget,
         stepsWidget,
         schedulerWidget,
-        pddAccLoraWidget,
-        pddNfeWidget,
-        pddLoraStrengthWidget,
-        pddHeadStrengthWidget,
         resolutionModeWidget,
         megapixelsWidget,
         runRefineWidget,
@@ -7146,8 +7167,8 @@ function buildUi(node) {
 
     installInvalidationHooks(node, runtime);
     wrapResolutionWidgetCallbacks(node, runtime);
-    installPddWidgetHooks(node, runtime);
-    enforcePddAccModeMatch(node, runtime, { alertUser: false });
+    ensureRefineWidgetDefaults(node);
+    syncModeSpecificNativeWidgets(node, runtime);
     syncExtenderSections(node, runtime);
     render(node, runtime);
     refreshLoraNames(node, runtime);
@@ -7166,6 +7187,11 @@ function buildUi(node) {
         );
         if (savedWidgetValues && !hasSavedResolutionMode) {
             setWidgetValue(this, "resolution_mode", "manual");
+        }
+        if (savedWidgetValues) {
+            migrateLegacyPddWidgetsValues(this, savedWidgetValues);
+        } else {
+            ensureRefineWidgetDefaults(this);
         }
 
         // Direct configure() calls outside a full graph load (copy/paste and a
@@ -7458,6 +7484,11 @@ app.registerExtension({
             // LiteGraph mutates link target slots during the callback; defer the
             // socket grow/shrink pass until that mutation has completed.
             deferDynamicAVReferenceSync(this);
+            const runtime = this.__h3Extender;
+            if (runtime) {
+                syncModeSpecificNativeWidgets(this, runtime);
+                syncExtenderSections(this, runtime);
+            }
             return result;
         };
 

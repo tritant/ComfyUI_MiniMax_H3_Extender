@@ -121,6 +121,7 @@ def run_refine_pass(
     prepare_standalone_audio_refs,
     apply_per_clip_loras,
     sample_h3,
+    sample_sigmas=None,
     motion,
     duration_to_frames,
     reference_count,
@@ -169,14 +170,23 @@ def run_refine_pass(
     )
     resolved_width = int(w_out * VAE_DOWNSAMPLE)
     resolved_height = int(h_out * VAE_DOWNSAMPLE)
+    if sample_sigmas is not None:
+        sample_step_count = max(1, int(sample_sigmas.shape[-1]) - 1)
+        steps_label = f"{sample_step_count} (external SIGMAS, denoise={float(refine_denoise):.3f})"
+    else:
+        sample_step_count = int(refine_steps)
+        steps_label = f"{sample_step_count} (scheduler)"
     refine_meta = {
         "upscale_model": str(upscale_model),
         "megapixels": float(refine_megapixels),
         "denoise": float(refine_denoise),
-        "steps": int(refine_steps),
+        # Persist the step count that actually drives sampling so cache matches
+        # stay consistent when external SIGMAS replace refine_steps.
+        "steps": int(sample_step_count),
         "precision": str(upscale_precision),
         "width": resolved_width,
         "height": resolved_height,
+        "external_sigmas": bool(sample_sigmas is not None),
     }
     _LOG.info(
         "Refine pass %sx%s -> %sx%s (scale=%.3f, denoise=%.3f, steps=%s, mode=%s)",
@@ -186,7 +196,7 @@ def run_refine_pass(
         resolved_height,
         effective_scale,
         float(refine_denoise),
-        int(refine_steps),
+        steps_label,
         mode,
     )
 
@@ -199,7 +209,7 @@ def run_refine_pass(
         upscale_model=upscale_model,
         megapixels=refine_megapixels,
         denoise=refine_denoise,
-        steps=refine_steps,
+        steps=sample_step_count,
         precision=upscale_precision,
         width=resolved_width,
         height=resolved_height,
@@ -290,6 +300,20 @@ def run_refine_pass(
 
             draft_video = _load_segment_video(data_path, draft_desc)
             draft_audio = _load_segment_audio(data_path, draft_desc)
+            _LOG.info(
+                "Refine clip %s/%s: latent upscale %s -> target ~%.2f MP (can take a while, no step bar)",
+                i + 1,
+                len(clips),
+                str(upscale_model),
+                float(refine_megapixels),
+            )
+            send_progress(
+                owner,
+                i,
+                len(clips),
+                "upscaling",
+                f"Latent upscale clip {i + 1}/{len(clips)}",
+            )
             up_video = upscale_video_latent(
                 draft_video,
                 str(upscale_model),
@@ -301,6 +325,19 @@ def run_refine_pass(
                 force_unload=True,
             )
             del draft_video
+            _LOG.info(
+                "Refine clip %s/%s: upscale done, sampling %s",
+                i + 1,
+                len(clips),
+                steps_label,
+            )
+            send_progress(
+                owner,
+                i,
+                len(clips),
+                "refining",
+                f"Refine sample clip {i + 1}/{len(clips)} ({steps_label})",
+            )
 
             selected_ref_audios, selected_audio_slots, selected_audio_offsets = (
                 standalone_audio_clip_plan[i]
@@ -428,6 +465,7 @@ def run_refine_pass(
                 str(scheduler),
                 int(refine_steps),
                 float(refine_denoise),
+                sigmas=sample_sigmas,
             )
 
             # Preserve draft audio exactly; refine only the video stream.
