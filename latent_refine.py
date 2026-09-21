@@ -11,11 +11,13 @@ rules as the draft Extender pass.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import time
 
 import comfy.nested_tensor
 import comfy.model_management
+import torch
 
 from .latent_upscaler import (
     offload_upscale_models,
@@ -55,7 +57,32 @@ def _enforce_refine_validated_prefix(clips):
     return clips
 
 
-def _refine_settings_match(manifest, *, upscale_model, megapixels, denoise, steps, precision, width, height):
+def _sigmas_cache_signature(sigmas) -> str:
+    """Compact fingerprint of an external SIGMAS grid for refine cache matching."""
+    if sigmas is None:
+        return ""
+    if not torch.is_tensor(sigmas):
+        return ""
+    flat = sigmas.detach().float().reshape(-1).cpu().tolist()
+    if not flat:
+        return ""
+    payload = f"{len(flat)}:" + ",".join(f"{float(v):.8g}" for v in flat)
+    return hashlib.sha1(payload.encode("utf-8")).hexdigest()[:20]
+
+
+def _refine_settings_match(
+    manifest,
+    *,
+    upscale_model,
+    megapixels,
+    denoise,
+    steps,
+    precision,
+    width,
+    height,
+    external_sigmas=False,
+    sigmas_signature="",
+):
     meta = (manifest or {}).get("refine") if isinstance(manifest, dict) else None
     if not isinstance(meta, dict):
         return False
@@ -68,6 +95,8 @@ def _refine_settings_match(manifest, *, upscale_model, megapixels, denoise, step
             and str(meta.get("precision") or "") == str(precision)
             and int(meta.get("width", -1)) == int(width)
             and int(meta.get("height", -1)) == int(height)
+            and bool(meta.get("external_sigmas", False)) == bool(external_sigmas)
+            and str(meta.get("sigmas_signature") or "") == str(sigmas_signature or "")
         )
     except (TypeError, ValueError):
         return False
@@ -145,8 +174,7 @@ def run_refine_pass(
     draft_segments = list(draft_manifest.get("segments", []))
     if not draft_segments:
         raise ValueError(
-            "MiniMax H3 Extender: refine needs at least one draft clip in cache. "
-            "Generate draft first with run_refine=False."
+            "MiniMax H3 Extender: refine needs at least one draft clip in cache."
         )
     # clip_by_clip testing: refine only the drafted prefix. Cards beyond the
     # current draft chain wait until more draft clips exist.
@@ -176,6 +204,8 @@ def run_refine_pass(
     else:
         sample_step_count = int(refine_steps)
         steps_label = f"{sample_step_count} (scheduler)"
+    used_external_sigmas = bool(sample_sigmas is not None)
+    sigmas_signature = _sigmas_cache_signature(sample_sigmas)
     refine_meta = {
         "upscale_model": str(upscale_model),
         "megapixels": float(refine_megapixels),
@@ -186,7 +216,8 @@ def run_refine_pass(
         "precision": str(upscale_precision),
         "width": resolved_width,
         "height": resolved_height,
-        "external_sigmas": bool(sample_sigmas is not None),
+        "external_sigmas": used_external_sigmas,
+        "sigmas_signature": sigmas_signature,
     }
     _LOG.info(
         "Refine pass %sx%s -> %sx%s (scale=%.3f, denoise=%.3f, steps=%s, mode=%s)",
@@ -213,6 +244,8 @@ def run_refine_pass(
         precision=upscale_precision,
         width=resolved_width,
         height=resolved_height,
+        external_sigmas=used_external_sigmas,
+        sigmas_signature=sigmas_signature,
     ):
         refine_data, refine_manifest_path, refine_manifest = existing
         refine_manifest = dict(refine_manifest)

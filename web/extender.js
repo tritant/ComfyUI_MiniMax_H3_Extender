@@ -670,16 +670,18 @@ function normalizeDynamicReferenceInputOrder(node, linkSnapshot = null) {
     // below the already-visible video sockets. Rebuild only the visual socket
     // order after each sync while preserving the exact input objects and cables.
     // Desired order:
-    //   static model inputs
+    //   static model inputs (except trailing sigmas)
     //   ref_audio_1..3
     //   ref_video_1 / fps_1 / video_audio_1
     //   ref_video_2 / fps_2 / video_audio_2
     //   ref_video_3 / fps_3 / video_audio_3
     //   ref_pack / prompt_pack
+    //   sigmas (always last — never shift older optional indexes)
     if (!node?.inputs?.length) return false;
 
     const packOrder = ["ref_pack", "prompt_pack"];
-    const dynamicNames = new Set(packOrder);
+    const trailingNames = new Set(["sigmas"]);
+    const dynamicNames = new Set([...packOrder, ...trailingNames]);
     for (let i = 1; i <= MAX_STANDALONE_AUDIO_REFS; i++) {
         dynamicNames.add(`ref_audio_${i}`);
     }
@@ -713,6 +715,10 @@ function normalizeDynamicReferenceInputOrder(node, linkSnapshot = null) {
         }
     }
     for (const name of packOrder) {
+        const input = byName.get(name);
+        if (input) desired.push(input);
+    }
+    for (const name of trailingNames) {
         const input = byName.get(name);
         if (input) desired.push(input);
     }
@@ -2089,6 +2095,19 @@ function coerceWidgetBool(value) {
     return Boolean(value);
 }
 
+function uiSectionOpen(node, key, defaultOpen = false) {
+    if (!node) return Boolean(defaultOpen);
+    if (!node.properties || typeof node.properties !== "object") return Boolean(defaultOpen);
+    if (!Object.prototype.hasOwnProperty.call(node.properties, key)) return Boolean(defaultOpen);
+    return Boolean(node.properties[key]);
+}
+
+function setUiSectionOpen(node, key, open) {
+    if (!node) return;
+    if (!node.properties || typeof node.properties !== "object") node.properties = {};
+    node.properties[key] = Boolean(open);
+}
+
 function syncRunRefineWidgetFromUi(runtime) {
     if (!runtime?.runRefineWidget) return false;
     const input = runtime.runRefineRow?.__h3Input;
@@ -2180,7 +2199,7 @@ function createBoundCheckboxRow(labelText, widget) {
     return row;
 }
 
-function createCollapsibleSection(title, { open = false, hint = "" } = {}) {
+function createCollapsibleSection(title, { open = false, hint = "", onToggle = null } = {}) {
     const section = document.createElement("div");
     section.className = "h3-ext-section" + (open ? " open" : "");
     const head = document.createElement("button");
@@ -2205,6 +2224,9 @@ function createCollapsibleSection(title, { open = false, hint = "" } = {}) {
         const next = !section.classList.contains("open");
         section.classList.toggle("open", next);
         chevron.textContent = next ? "▾" : "▸";
+        if (typeof onToggle === "function") {
+            try { onToggle(next); } catch (_) {}
+        }
         const runtime = section.__h3Runtime;
         if (runtime) {
             requestAnimationFrame(() => syncDomHeight(runtime.__h3Node || null, runtime, true));
@@ -2255,6 +2277,15 @@ function syncExtenderSections(node, runtime) {
             else row.__h3Input.value = String(widget.value ?? "");
         }
     }
+    // Section open/closed is a UI property, not a backend widget.
+    const refineSection = runtime.refineSection;
+    if (refineSection) {
+        const open = uiSectionOpen(node, "h3_ui_refine_open", false);
+        refineSection.classList.toggle("open", open);
+        if (refineSection.__h3Chevron) {
+            refineSection.__h3Chevron.textContent = open ? "▾" : "▸";
+        }
+    }
     updateRefineSectionTitle(runtime);
     const mode = String(runtime.resolutionModeWidget?.value || "auto_from_ref");
     if (runtime.megapixelsRow) {
@@ -2299,8 +2330,9 @@ function buildExtenderSections(node, runtime) {
     });
 
     const refineSection = createCollapsibleSection("Latent refine", {
-        open: false,
-        hint: "Second pass: keep draft, neural latent upscale + resample. Uses the same run_mode + Validated prefix as draft. With external SIGMAS connected, refine denoise-trims those sigmas (refine steps ignored). Then Queue Final Decode.",
+        open: uiSectionOpen(node, "h3_ui_refine_open", false),
+        hint: "Second pass: keep draft, neural latent upscale + resample. Uses the same run_mode + Validated prefix as draft. With no draft yet, Queue generates draft then refine automatically. With external SIGMAS connected, refine denoise-trims those sigmas (refine steps ignored). Then Queue Final Decode.",
+        onToggle: (open) => setUiSectionOpen(node, "h3_ui_refine_open", open),
     });
     refineSection.__h3Runtime = runtime;
     const runRefineRow = createBoundCheckboxRow("Run refine pass", runtime.runRefineWidget);
@@ -4353,6 +4385,8 @@ function applyProjectPayload(node, runtime, projectPayload) {
     }
 
     node.graph?.setDirtyCanvas(true, true);
+    // Project settings land on native widgets first; mirror into custom DOM.
+    syncExtenderSections(node, runtime);
 }
 
 function freshProjectState(runtime) {
@@ -6608,6 +6642,9 @@ function hydrateRuntimeFromNativeWidgets(node, runtime, restoreCache = false) {
 
     render(node, runtime);
     syncResolutionMirror(node, runtime);
+    // Native widgets are authoritative after configure/project load; push them
+    // into the custom DOM so megapixels / run_refine / section state cannot drift.
+    syncExtenderSections(node, runtime);
     syncDomHeight(node, runtime, true);
     if (restoreCache) restoreCacheState(node, runtime);
 }

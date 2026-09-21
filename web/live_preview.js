@@ -14,8 +14,8 @@ function ensureSavePreviewButtonStyle() {
     style.textContent = `
         .h3-save-preview-button {
             height: 22px;
-            min-width: 118px;
-            padding: 0 14px;
+            min-width: 96px;
+            padding: 0 10px;
             border: 1px solid rgba(120, 220, 160, 0.72);
             border-radius: 5px;
             background: linear-gradient(180deg, rgba(51, 145, 92, 0.96), rgba(35, 108, 70, 0.96));
@@ -433,13 +433,13 @@ function ensureStitchSectionStyles() {
             display: flex;
             align-items: center;
             justify-content: flex-end;
+            flex-wrap: wrap;
             gap: 8px;
             width: 100%;
-            height: 22px;
             min-height: 22px;
             margin-top: 8px;
             flex: 0 0 auto;
-            overflow: hidden;
+            overflow: visible;
         }
     `;
     document.head.appendChild(style);
@@ -454,6 +454,19 @@ function coerceWidgetBool(value) {
         if (s === "false" || s === "0" || s === "no" || s === "off" || s === "") return false;
     }
     return Boolean(value);
+}
+
+function uiSectionOpen(node, key, defaultOpen = false) {
+    if (!node) return Boolean(defaultOpen);
+    if (!node.properties || typeof node.properties !== "object") return Boolean(defaultOpen);
+    if (!Object.prototype.hasOwnProperty.call(node.properties, key)) return Boolean(defaultOpen);
+    return Boolean(node.properties[key]);
+}
+
+function setUiSectionOpen(node, key, open) {
+    if (!node) return;
+    if (!node.properties || typeof node.properties !== "object") node.properties = {};
+    node.properties[key] = Boolean(open);
 }
 
 function setWidgetValueFromUi(widget, value) {
@@ -561,6 +574,12 @@ function syncStitchSection(node, state) {
     ensureStitchRows(node, state);
     const active = isOriginalImagesConnected(node);
     state.stitchSection.classList.toggle("is-off", !active);
+    // Collapse state lives on node.properties (UI-only), restored after configure.
+    const open = uiSectionOpen(node, "h3_ui_stitch_open", true);
+    state.stitchSection.classList.toggle("open", open);
+    if (state.stitchChevron) {
+        state.stitchChevron.textContent = open ? "▾" : "▸";
+    }
     if (state.stitchBadge) {
         state.stitchBadge.textContent = active ? "ON" : "OFF";
         state.stitchBadge.className = "h3-final-stitch-badge " + (active ? "on" : "off");
@@ -637,15 +656,16 @@ function buildStitchSection(node, state) {
     }
     ensureStitchSectionStyles();
 
+    const sectionOpen = uiSectionOpen(node, "h3_ui_stitch_open", true);
     const section = document.createElement("div");
-    section.className = "h3-final-stitch open";
+    section.className = "h3-final-stitch" + (sectionOpen ? " open" : "");
 
     const head = document.createElement("button");
     head.type = "button";
     head.className = "h3-final-stitch-head";
     const chevron = document.createElement("span");
     chevron.className = "h3-final-stitch-chevron";
-    chevron.textContent = "▾";
+    chevron.textContent = sectionOpen ? "▾" : "▸";
     const title = document.createElement("span");
     title.textContent = "Seamless Stitch (RIFE)";
     const badge = document.createElement("span");
@@ -656,6 +676,7 @@ function buildStitchSection(node, state) {
         const next = !section.classList.contains("open");
         section.classList.toggle("open", next);
         chevron.textContent = next ? "▾" : "▸";
+        setUiSectionOpen(node, "h3_ui_stitch_open", next);
         requestAnimationFrame(() => syncPlayerToNode(node, state, true));
     });
 
@@ -791,7 +812,9 @@ const STITCH_LABEL_HEIGHT = 14;
 const STITCH_LABEL_GAP = 3;
 const TOOLBAR_HEIGHT = 22;
 const TOOLBAR_GAP = 8;
-const BOTTOM_PAD = 14;
+// LiteGraph node chrome eats more than the old 14px; short BOTTOM_PAD clips
+// the lowres / refined / SAVE PREVIEW toolbar against the node border.
+const BOTTOM_PAD = 32;
 
 // Accent colors for clip borders (fills stay dark gray).
 const CLIP_STRIP_PALETTE = [
@@ -1164,7 +1187,9 @@ function stitchChromeHeight(state) {
     return state.stitchSection?.classList.contains("open") ? 210 : 34;
 }
 
-function toolbarChromeHeight() {
+function toolbarChromeHeight(state = null) {
+    const measured = Number(state?.toolbar?.offsetHeight || 0);
+    if (measured > 0) return measured + TOOLBAR_GAP;
     return TOOLBAR_HEIGHT + TOOLBAR_GAP;
 }
 
@@ -1173,7 +1198,7 @@ function effectivePlayerMinHeight(state) {
         PLAYER_MIN_HEIGHT
         + stripChromeHeight(state)
         + stitchChromeHeight(state)
-        + toolbarChromeHeight()
+        + toolbarChromeHeight(state)
     );
 }
 
@@ -1183,7 +1208,7 @@ function videoChromePadding(state) {
         + LABEL_HEIGHT
         + PREVIEW_HEADER_GAP
         + stripChromeHeight(state)
-        + toolbarChromeHeight()
+        + toolbarChromeHeight(state)
         + 4
     );
 }
@@ -1775,8 +1800,24 @@ function syncPlayerToNode(node, state, growNodeIfNeeded = false, retry = 0) {
     state.box.style.maxHeight = "none";
     state.box.style.flex = "0 0 auto";
     state.box.style.overflow = "hidden";
-    state.video.style.minHeight = "0";
-    state.video.style.flex = "0 0 auto";
+    state.box.style.paddingBottom = "4px";
+    // Flex children: chrome stays fixed, video absorbs leftover height so the
+    // bottom toolbar never gets clipped when stitch chrome is open.
+    if (state.toolbar) {
+        state.toolbar.style.flex = "0 0 auto";
+        state.toolbar.style.flexShrink = "0";
+    }
+    if (state.header) {
+        state.header.style.flex = "0 0 auto";
+    }
+    if (state.stripHost) {
+        state.stripHost.style.flex = "0 0 auto";
+    }
+    if (state.stitchWrap) {
+        state.stitchWrap.style.flex = "0 0 auto";
+    }
+    state.video.style.minHeight = "60px";
+    state.video.style.flex = "1 1 auto";
 
     state.syncingPlayer = true;
     try {
@@ -1802,7 +1843,9 @@ function syncPlayerToNode(node, state, growNodeIfNeeded = false, retry = 0) {
             previewHeightIsPoisoned(nodeH, minimumNodeH)
         ) {
             nodeH = minimumNodeH;
-        } else if (growNodeIfNeeded && nodeH < minimumNodeH) {
+        } else if (nodeH < minimumNodeH) {
+            // Always grow when the open stitch panel + toolbar need more room.
+            // A saved short node height previously clipped the bottom buttons.
             nodeH = minimumNodeH;
         }
 
@@ -1825,8 +1868,11 @@ function syncPlayerToNode(node, state, growNodeIfNeeded = false, retry = 0) {
         }
         state.lastRenderMode = "legacy";
         state.box.style.height = `${availableH}px`;
-        state.video.style.height =
-            `${Math.max(80, availableH - videoChromePadding(state))}px`;
+        // Height 0 + flex:1 lets the video fill leftover space after stitch /
+        // header / strip / toolbar instead of an absolute px guess that can
+        // overshoot and clip the toolbar.
+        state.video.style.height = "0px";
+        state.video.style.minHeight = "60px";
         node.graph?.setDirtyCanvas(true, true);
     } finally {
         state.syncingPlayer = false;

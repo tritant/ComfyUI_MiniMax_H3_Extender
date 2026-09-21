@@ -4466,12 +4466,6 @@ class MiniMaxH3Extender:
                     "tooltip": "Optional MiniMax H3 FL2VA model. Evaluated only while MODE is FL2VA.",
                 },
             ),
-            "sigmas": (
-                "SIGMAS",
-                {
-                    "tooltip": "Optional external sigmas (e.g. MiniMaxH3PDDAccApply). When connected, steps/scheduler are ignored. Feed the matching PDD-patched MODEL into model or fl2va_model; you can insert other model nodes between Apply and the Extender.",
-                },
-            ),
             "audio_vae": ("VAE", {"forceInput": True}),
             "ref_audio": (
                 "AUDIO",
@@ -4576,6 +4570,14 @@ class MiniMaxH3Extender:
                 PROMPT_PACK_TYPE,
                 {
                     "tooltip": "Optional external prompt pack. New/changed packs are imported into the normal clip textareas and synchronize the clip count."
+                },
+            ),
+            # Appended last so older workflows keep stable optional-input indexes
+            # after fl2va_model / audio_vae / dynamic refs / packs.
+            "sigmas": (
+                "SIGMAS",
+                {
+                    "tooltip": "Optional external sigmas (e.g. MiniMaxH3PDDAccApply). When connected, steps/scheduler are ignored. Feed the matching PDD-patched MODEL into model or fl2va_model; you can insert other model nodes between Apply and the Extender.",
                 },
             ),
         }
@@ -5488,109 +5490,112 @@ class MiniMaxH3Extender:
         if bool(run_refine):
             from .latent_refine import run_refine_pass
 
+            def _finalize_with_refine(draft_manifest_for_refine, *, draft_then_refine=False):
+                refine_result = run_refine_pass(
+                    owner=owner,
+                    data_path=data_path,
+                    draft_manifest=draft_manifest_for_refine,
+                    clips=clips,
+                    model=model,
+                    clip=clip,
+                    vae=vae,
+                    audio_vae=audio_vae,
+                    refs=refs,
+                    ref_videos=ref_videos,
+                    ref_video_fps=ref_video_fps,
+                    ref_video_audios=ref_video_audios,
+                    standalone_audio_clip_plan=standalone_audio_clip_plan,
+                    active_ref_video_count=active_ref_video_count,
+                    prepared_image_blocks=prepared_image_blocks,
+                    prepared_video_blocks_by_frame_count=prepared_video_blocks_by_frame_count,
+                    ref_image_size=ref_image_size,
+                    context_length=context_length,
+                    audio_context_length=audio_context_length,
+                    sampler_name=sampler_name,
+                    scheduler=scheduler,
+                    upscale_model=latent_upscale_model,
+                    refine_megapixels=refine_megapixels,
+                    refine_denoise=refine_denoise,
+                    refine_steps=refine_steps,
+                    upscale_precision=latent_upscale_precision,
+                    make_ref2va_conditioning=_make_ref2va_conditioning,
+                    prepare_shared_refs=_prepare_shared_refs,
+                    prepare_standalone_audio_refs=_prepare_standalone_audio_refs,
+                    apply_per_clip_loras=_apply_per_clip_loras,
+                    sample_h3=_sample_h3,
+                    sample_sigmas=_resolve_sample_sigmas(external_sigmas, refine_denoise),
+                    motion=motion,
+                    duration_to_frames=_duration_to_frames,
+                    reference_count=_reference_count,
+                    max_mixed_ref_items=MAX_MIXED_REF_ITEMS,
+                    fps=FPS,
+                    send_progress=_send_extender_progress,
+                    extender_self=self,
+                    run_mode=str(run_mode),
+                )
+                refine_cached = int(refine_result.get("cached_count", 0))
+                refine_validated = int(refine_result.get("validated_count", 0))
+                refine_generated = list(refine_result.get("generated") or [])
+                status = (
+                    f"refine {str(run_mode)} | cached {refine_cached}/{len(clips)} | "
+                    f"validated {refine_validated} | draft preserved"
+                )
+                if draft_then_refine:
+                    status = "draft then " + status
+                if refine_generated:
+                    status += " | generated " + ",".join(str(i + 1) for i in refine_generated)
+                else:
+                    status += " | disk only"
+                refine_handle = {
+                    "version": CACHE_VERSION,
+                    "data_path": str(Path(data_path).resolve()),
+                    "manifest_path": str(Path(manifest_path).resolve()),
+                    "run_mode": str(run_mode),
+                    "stop": True,
+                    "next_index": int(len(draft_manifest_for_refine.get("segments", []))),
+                    "status": status,
+                }
+                size = _cache_size_mb(data_path, manifest_path)
+                _send_extender_progress(owner, -1, len(clips), "idle", status)
+                ui_state = {
+                    "generation_mode": "ref2va",
+                    "clips_json": _state_json(clips, active_prompt_pack_signature, generation_mode),
+                    "clip_count": len(clips),
+                    "cached_count": refine_cached,
+                    "validated_count": refine_validated,
+                    "refine_cached_count": refine_cached,
+                    "refine_validated_count": refine_validated,
+                    "generated": [i + 1 for i in refine_generated],
+                    "status": status,
+                    "build": BUILD,
+                    "refined": True,
+                    "run_refine": True,
+                    "draft_then_refine": bool(draft_then_refine),
+                }
+                return {
+                    "ui": {"h3_extender_state": [ui_state]},
+                    "result": (
+                        refine_handle,
+                        int(len(clips)),
+                        int(refine_validated),
+                        status,
+                        float(size),
+                        BUILD,
+                    ),
+                }
+
             current_manifest = _load_manifest_from_paths(data_path, manifest_path)
-            if current_manifest is None:
-                raise ValueError(
-                    "MiniMax H3 Extender: run_refine needs an existing draft cache."
-                )
             draft_n = len((current_manifest or {}).get("segments") or [])
-            if draft_n < 1:
-                raise ValueError(
-                    "MiniMax H3 Extender: Run refine pass is ON, but draft cache "
-                    "is empty. Expand Latent refine, uncheck Run refine pass, "
-                    "Queue to generate draft, then enable refine again."
-                )
-            refine_result = run_refine_pass(
-                owner=owner,
-                data_path=data_path,
-                draft_manifest=current_manifest,
-                clips=clips,
-                model=model,
-                clip=clip,
-                vae=vae,
-                audio_vae=audio_vae,
-                refs=refs,
-                ref_videos=ref_videos,
-                ref_video_fps=ref_video_fps,
-                ref_video_audios=ref_video_audios,
-                standalone_audio_clip_plan=standalone_audio_clip_plan,
-                active_ref_video_count=active_ref_video_count,
-                prepared_image_blocks=prepared_image_blocks,
-                prepared_video_blocks_by_frame_count=prepared_video_blocks_by_frame_count,
-                ref_image_size=ref_image_size,
-                context_length=context_length,
-                audio_context_length=audio_context_length,
-                sampler_name=sampler_name,
-                scheduler=scheduler,
-                upscale_model=latent_upscale_model,
-                refine_megapixels=refine_megapixels,
-                refine_denoise=refine_denoise,
-                refine_steps=refine_steps,
-                upscale_precision=latent_upscale_precision,
-                make_ref2va_conditioning=_make_ref2va_conditioning,
-                prepare_shared_refs=_prepare_shared_refs,
-                prepare_standalone_audio_refs=_prepare_standalone_audio_refs,
-                apply_per_clip_loras=_apply_per_clip_loras,
-                sample_h3=_sample_h3,
-                sample_sigmas=_resolve_sample_sigmas(external_sigmas, refine_denoise),
-                motion=motion,
-                duration_to_frames=_duration_to_frames,
-                reference_count=_reference_count,
-                max_mixed_ref_items=MAX_MIXED_REF_ITEMS,
-                fps=FPS,
-                send_progress=_send_extender_progress,
-                extender_self=self,
-                run_mode=str(run_mode),
+            if current_manifest is not None and draft_n >= 1:
+                # Existing draft: skip draft generation, refine only.
+                return _finalize_with_refine(current_manifest, draft_then_refine=False)
+            logging.info(
+                "run_refine ON with empty draft — generating draft then refine "
+                "(run_mode=%s, clips=%d)",
+                run_mode,
+                len(clips),
             )
-            refine_cached = int(refine_result.get("cached_count", 0))
-            refine_validated = int(refine_result.get("validated_count", 0))
-            refine_generated = list(refine_result.get("generated") or [])
-            # Draft cache handle; Final Decode latent_layer=auto picks a complete
-            # refine sidecar. Partial refine is available via latent_layer=refine.
-            status = (
-                f"refine {str(run_mode)} | cached {refine_cached}/{len(clips)} | "
-                f"validated {refine_validated} | draft preserved"
-            )
-            if refine_generated:
-                status += " | generated " + ",".join(str(i + 1) for i in refine_generated)
-            else:
-                status += " | disk only"
-            previous_handle = {
-                "version": CACHE_VERSION,
-                "data_path": str(Path(data_path).resolve()),
-                "manifest_path": str(Path(manifest_path).resolve()),
-                "run_mode": str(run_mode),
-                "stop": True,
-                "next_index": int(len(current_manifest.get("segments", []))),
-                "status": status,
-            }
-            size = _cache_size_mb(data_path, manifest_path)
-            _send_extender_progress(owner, -1, len(clips), "idle", status)
-            ui_state = {
-                "generation_mode": "ref2va",
-                "clips_json": _state_json(clips, active_prompt_pack_signature, generation_mode),
-                "clip_count": len(clips),
-                "cached_count": refine_cached,
-                "validated_count": refine_validated,
-                "refine_cached_count": refine_cached,
-                "refine_validated_count": refine_validated,
-                "generated": [i + 1 for i in refine_generated],
-                "status": status,
-                "build": BUILD,
-                "refined": True,
-                "run_refine": True,
-            }
-            return {
-                "ui": {"h3_extender_state": [ui_state]},
-                "result": (
-                    previous_handle,
-                    int(len(clips)),
-                    int(refine_validated),
-                    status,
-                    float(size),
-                    BUILD,
-                ),
-            }
+            # Fall through to the normal draft walk, then refine below.
 
         # Walk the card list in order. Cached TRUE clips are metadata-only;
         # active clips sample and are written immediately to disk.
@@ -6145,6 +6150,13 @@ class MiniMaxH3Extender:
             "per_clip_lora_count": int(sum(len(cfg.get("loras") or []) for cfg in clips)),
             "build": BUILD,
         }
+
+        if bool(run_refine) and not interrupted:
+            # New project with refine ON: draft just completed — continue into refine.
+            current_manifest = _load_manifest_from_paths(data_path, manifest_path)
+            draft_n = len((current_manifest or {}).get("segments") or [])
+            if current_manifest is not None and draft_n >= 1:
+                return _finalize_with_refine(current_manifest, draft_then_refine=True)
 
         return {
             "ui": {"h3_extender_state": [ui_state]},

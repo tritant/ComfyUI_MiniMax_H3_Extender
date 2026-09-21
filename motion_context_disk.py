@@ -5764,11 +5764,12 @@ class MiniMaxH3MotionContextDiskFinalDecode:
         latent_layer=None,
         latent_upscale_model=None,
         latent_upscale_precision=None,
-        **_kwargs,
+        latent_upscale_megapixels=None,
     ):
-        # Never block Queue on these combos. Old workflows, converted-widget
-        # reshuffles, and combo indexes can land '' / 1 / True here; export()
-        # coerces to safe defaults.
+        # Only the newer refine/upscale compatibility fields. Old workflows and
+        # shifted widgets_values can land '' / 1 / True here; export() coerces.
+        # Do not accept arbitrary **kwargs — that bypasses normal validation for
+        # every other constant input as well.
         return True
 
     @staticmethod
