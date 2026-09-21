@@ -1,4 +1,4 @@
-__version__ = "2.8.2"
+__version__ = "2.8.4"
 
 from .node import (
     NODE_CLASS_MAPPINGS as UTILITY_NODE_CLASS_MAPPINGS,

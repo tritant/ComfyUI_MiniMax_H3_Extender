@@ -2428,6 +2428,10 @@ function obviouslyPoisonedHeight(height, minimumHeight) {
 }
 
 function currentResolutionFromWidgets(node) {
+    const widthInput = node?.inputs?.find((input) => input?.name === "width");
+    const heightInput = node?.inputs?.find((input) => input?.name === "height");
+    if (widthInput?.link != null || heightInput?.link != null) return null;
+
     const width = Number(getWidget(node, "width")?.value || 0);
     const height = Number(getWidget(node, "height")?.value || 0);
     if (!(width > 0) || !(height > 0)) return null;

@@ -34,6 +34,7 @@ import subprocess
 import time
 import uuid
 import zipfile
+from collections.abc import Mapping
 import numpy as np
 import torch
 import torchaudio
@@ -108,7 +109,7 @@ from .ref2va_independent import (
     run as _run_ref2va_independent,
 )
 
-BUILD = "minimax-h3-extender-v2.8.2"
+BUILD = "minimax-h3-extender-v2.8.4"
 _LOG = logging.getLogger(__name__)
 FPS = 24
 AUDIO_LATENT_FPS = 40
@@ -1259,7 +1260,7 @@ def _resize_ref_video_qwen_frames(
     return resized, target_positions
 
 def _audio_duration_seconds(audio):
-    if not isinstance(audio, dict) or "waveform" not in audio:
+    if not isinstance(audio, Mapping) or "waveform" not in audio:
         raise ValueError("MiniMax H3 Extender: invalid AUDIO reference payload.")
     waveform = audio["waveform"]
     if not torch.is_tensor(waveform) or waveform.ndim < 2:
@@ -1277,7 +1278,7 @@ def _slice_ref_audio(audio, start_seconds: float, duration_seconds: float, label
     Standalone timeline refs and video soundtracks use require_full=False so a
     source may end naturally inside the requested window.
     """
-    if not isinstance(audio, dict) or "waveform" not in audio:
+    if not isinstance(audio, Mapping) or "waveform" not in audio:
         raise ValueError(f"MiniMax H3 Extender: {label} is not a valid AUDIO payload.")
     waveform = audio["waveform"]
     if not torch.is_tensor(waveform) or waveform.ndim < 2:

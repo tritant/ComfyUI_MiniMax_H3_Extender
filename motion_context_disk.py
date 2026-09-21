@@ -61,7 +61,7 @@ from .motion_context_ram import (
     _streams_from_latent,
 )
 
-BUILD = "motion-context-disk-v2.8.2"
+BUILD = "motion-context-disk-v2.8.4"
 PREVIEW_AUDIO_MODE = "pcm_single_aac_gain_chain_v3_entry_ramp"
 CACHE_VERSION = 12
 PREVIEW_ROTATION_SLOTS = 3
@@ -4935,7 +4935,15 @@ if web is not None and PromptServer is not None and getattr(PromptServer, "insta
                 # Manual unvalidation clears the selected clip and everything
                 # after it. Manual validation may only extend the existing
                 # validated prefix by the selected cached segment.
-                if clip_index < 0 or clip_index >= len(segments):
+                if clip_index < 0:
+                    return web.json_response({"ok": False, "error": "Invalid clip index."}, status=400)
+                if clip_index >= len(segments):
+                    # Recovery path for a stale workflow validation flag after the
+                    # physical cache was removed. There is nothing on disk to
+                    # invalidate, so allow manual unvalidation to clear the UI
+                    # state. Validation still requires a real cached segment.
+                    if not requested_validated:
+                        return web.json_response({"ok": True, "found": False})
                     return web.json_response({"ok": False, "error": "Invalid clip index."}, status=400)
                 if requested_validated:
                     if any(not bool(segments[i].get("validated", False)) for i in range(clip_index)):
