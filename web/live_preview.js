@@ -469,6 +469,17 @@ function setUiSectionOpen(node, key, open) {
     node.properties[key] = Boolean(open);
 }
 
+function notifyFinalWorkflowChanged(node) {
+    const graph = node?.graph || app.graph;
+    try { graph?.change?.(); } catch (_) {}
+    graph?.setDirtyCanvas?.(true, true);
+    try {
+        const tracker = app?.extensionManager?.workflow?.activeWorkflow?.changeTracker;
+        if (typeof tracker?.captureCanvasState === "function") tracker.captureCanvasState();
+        else if (typeof tracker?.checkState === "function") tracker.checkState();
+    } catch (_) {}
+}
+
 function setWidgetValueFromUi(widget, value) {
     if (!widget) return;
     widget.value = value;
@@ -508,6 +519,7 @@ function createStitchSelectRow(node, labelText, key, widget) {
         const next = readStitchState(node);
         next[key] = select.value;
         writeStitchState(node, next);
+        notifyFinalWorkflowChanged(node);
         select.value = String(readStitchState(node)[key] ?? "");
     });
     row.append(label, select);
@@ -533,6 +545,7 @@ function createStitchNumberRow(node, labelText, key, widget, { min = null, max =
         const next = readStitchState(node);
         if (Number.isFinite(n)) next[key] = n;
         writeStitchState(node, next);
+        notifyFinalWorkflowChanged(node);
         input.value = String(readStitchState(node)[key] ?? "");
     });
     row.append(label, input);
@@ -554,6 +567,7 @@ function createStitchCheckboxRow(node, labelText, key, widget) {
         const next = readStitchState(node);
         next[key] = Boolean(input.checked);
         writeStitchState(node, next);
+        notifyFinalWorkflowChanged(node);
         input.checked = Boolean(readStitchState(node)[key]);
     });
     row.append(label, input);
@@ -677,6 +691,7 @@ function buildStitchSection(node, state) {
         section.classList.toggle("open", next);
         chevron.textContent = next ? "▾" : "▸";
         setUiSectionOpen(node, "h3_ui_stitch_open", next);
+        notifyFinalWorkflowChanged(node);
         requestAnimationFrame(() => syncPlayerToNode(node, state, true));
     });
 

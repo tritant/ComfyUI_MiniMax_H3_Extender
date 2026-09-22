@@ -141,6 +141,12 @@ const FINAL_PROJECT_WIDGETS = [
     "audio_bitrate",
     "auto_save_project",
     "save_individual_clips",
+    // #83 Final Decode state must travel with portable .ext projects too.
+    "latent_layer",
+    "latent_upscale_model",
+    "latent_upscale_megapixels",
+    "latent_upscale_precision",
+    "stitch_json",
 ];
 
 function boolValue(value, defaultValue = true) {
@@ -449,7 +455,7 @@ function localRefsConflictSummary(node, runtime, clip) {
     return conflicts;
 }
 
-async function persistLocalRefInvalidation(node, runtime, clipIndex, validatedState = false) {
+async function persistLocalRefInvalidation(node, runtime, clipIndex, validatedState = false, layer = "draft") {
     const index = Number(clipIndex);
     if (!Number.isInteger(index) || index < 0) return false;
     const generationMode = String(runtime?.state?.generation_mode || "ref2va") === "fl2va" ? "fl2va" : "ref2va";
@@ -469,6 +475,7 @@ async function persistLocalRefInvalidation(node, runtime, clipIndex, validatedSt
                 clip_index: index,
                 clip_id: String(runtime?.state?.clips?.[index]?.id || ""),
                 validated: Boolean(validatedState),
+                layer: String(layer || "draft"),
                 dependent_clip_ids: fl2vaDependentClipIds,
             }),
         });
@@ -2076,11 +2083,15 @@ function widgetComboValues(widget) {
     return [];
 }
 
-function setWidgetValueFromUi(widget, value) {
+function setWidgetValueFromUi(widget, value, node = null, runtime = null) {
     if (!widget) return;
     widget.value = value;
     if (typeof widget.callback === "function") {
         try { widget.callback(value); } catch (_) {}
+    }
+    if (node) {
+        notifyWorkflowChanged(node, runtime);
+        captureNativeWorkflowState(node, runtime);
     }
 }
 
@@ -2108,17 +2119,6 @@ function setUiSectionOpen(node, key, open) {
     node.properties[key] = Boolean(open);
 }
 
-function syncRunRefineWidgetFromUi(runtime) {
-    if (!runtime?.runRefineWidget) return false;
-    const input = runtime.runRefineRow?.__h3Input;
-    if (input) {
-        const checked = Boolean(input.checked);
-        runtime.runRefineWidget.value = checked;
-        return checked;
-    }
-    return coerceWidgetBool(runtime.runRefineWidget.value);
-}
-
 function updateRefineSectionTitle(runtime) {
     const section = runtime?.refineSection;
     if (!section?.__h3Chevron) return;
@@ -2129,7 +2129,7 @@ function updateRefineSectionTitle(runtime) {
     label.style.color = on ? "rgba(140, 210, 155, 0.95)" : "";
 }
 
-function createBoundSelectRow(labelText, widget, values, labelMap = null) {
+function createBoundSelectRow(labelText, widget, values, labelMap = null, node = null, runtime = null) {
     const row = document.createElement("div");
     row.className = "h3-ext-row";
     const label = document.createElement("label");
@@ -2151,14 +2151,14 @@ function createBoundSelectRow(labelText, widget, values, labelMap = null) {
         select.appendChild(opt);
     }
     select.value = String(widget?.value ?? opts[0] ?? "");
-    select.addEventListener("change", () => setWidgetValueFromUi(widget, select.value));
+    select.addEventListener("change", () => setWidgetValueFromUi(widget, select.value, node, runtime));
     row.append(label, select);
     row.__h3Select = select;
     row.__h3Widget = widget;
     return row;
 }
 
-function createBoundNumberRow(labelText, widget, { min = null, max = null, step = null } = {}) {
+function createBoundNumberRow(labelText, widget, { min = null, max = null, step = null } = {}, node = null, runtime = null) {
     const row = document.createElement("div");
     row.className = "h3-ext-row";
     const label = document.createElement("label");
@@ -2171,7 +2171,7 @@ function createBoundNumberRow(labelText, widget, { min = null, max = null, step 
     input.value = String(widget?.value ?? "");
     input.addEventListener("change", () => {
         const n = Number(input.value);
-        setWidgetValueFromUi(widget, Number.isFinite(n) ? n : widget.value);
+        setWidgetValueFromUi(widget, Number.isFinite(n) ? n : widget.value, node, runtime);
         input.value = String(widget.value);
     });
     row.append(label, input);
@@ -2180,7 +2180,7 @@ function createBoundNumberRow(labelText, widget, { min = null, max = null, step 
     return row;
 }
 
-function createBoundCheckboxRow(labelText, widget) {
+function createBoundCheckboxRow(labelText, widget, node = null, runtime = null) {
     const row = document.createElement("div");
     row.className = "h3-ext-row";
     const label = document.createElement("label");
@@ -2189,7 +2189,7 @@ function createBoundCheckboxRow(labelText, widget) {
     input.type = "checkbox";
     input.checked = coerceWidgetBool(widget?.value);
     input.addEventListener("change", () => {
-        setWidgetValueFromUi(widget, Boolean(input.checked));
+        setWidgetValueFromUi(widget, Boolean(input.checked), node, runtime);
         // Keep LiteGraph + Nodes 2.0 serialization in lockstep with the custom UI.
         if (widget) widget.value = Boolean(input.checked);
     });
@@ -2249,7 +2249,9 @@ function syncDecodeLayerToFinal(node, value) {
     if (typeof widget.callback === "function") {
         try { widget.callback(next); } catch (_) {}
     }
+    try { finalNode.graph?.change?.(); } catch (_) {}
     finalNode.graph?.setDirtyCanvas(true, true);
+    captureNativeWorkflowState(finalNode, null);
 }
 
 function syncExtenderSections(node, runtime) {
@@ -2318,10 +2320,12 @@ function buildExtenderSections(node, runtime) {
         runtime.resolutionModeWidget,
         ["auto_from_ref", "manual"],
         CANVAS_SIZE_MODE_LABELS,
+        node,
+        runtime,
     );
     const megapixelsRow = createBoundNumberRow("Megapixels", runtime.megapixelsWidget, {
         min: 0.01, max: 16, step: 0.01,
-    });
+    }, node, runtime);
     canvasPanel.append(canvasTitle, canvasHint, canvasModeRow, megapixelsRow);
     runtime.canvasSizeRows = [canvasModeRow, megapixelsRow];
     runtime.megapixelsRow = megapixelsRow;
@@ -2331,26 +2335,30 @@ function buildExtenderSections(node, runtime) {
 
     const refineSection = createCollapsibleSection("Latent refine", {
         open: uiSectionOpen(node, "h3_ui_refine_open", false),
-        hint: "Second pass: keep draft, neural latent upscale + resample. Uses the same run_mode + Validated prefix as draft. With no draft yet, Queue generates draft then refine automatically. With external SIGMAS connected, refine denoise-trims those sigmas (refine steps ignored). Then Queue Final Decode.",
-        onToggle: (open) => setUiSectionOpen(node, "h3_ui_refine_open", open),
+        hint: "Second pass over an existing Draft cache: keep draft, neural latent upscale + resample. Generate/review the Draft project first, then enable Refine. With external SIGMAS connected, refine denoise-trims those sigmas (refine steps ignored).",
+        onToggle: (open) => {
+            setUiSectionOpen(node, "h3_ui_refine_open", open);
+            notifyWorkflowChanged(node, runtime);
+            captureNativeWorkflowState(node, runtime);
+        },
     });
     refineSection.__h3Runtime = runtime;
-    const runRefineRow = createBoundCheckboxRow("Run refine pass", runtime.runRefineWidget);
+    const runRefineRow = createBoundCheckboxRow("Run refine pass", runtime.runRefineWidget, node, runtime);
     runtime.runRefineRow = runRefineRow;
-    const upscaleModelRow = createBoundSelectRow("Upscale model", runtime.latentUpscaleModelWidget);
+    const upscaleModelRow = createBoundSelectRow("Upscale model", runtime.latentUpscaleModelWidget, null, null, node, runtime);
     const refineMpRow = createBoundNumberRow("Refine megapixels", runtime.refineMegapixelsWidget, {
         min: 0.1, max: 8, step: 0.1,
-    });
+    }, node, runtime);
     const refineDenoiseRow = createBoundNumberRow("Refine denoise", runtime.refineDenoiseWidget, {
         min: 0.01, max: 1, step: 0.01,
-    });
+    }, node, runtime);
     const refineStepsRow = createBoundNumberRow("Refine steps", runtime.refineStepsWidget, {
         min: 1, max: 10000, step: 1,
-    });
+    }, node, runtime);
     runtime.refineStepsRow = refineStepsRow;
     const refinePrecisionRow = createBoundSelectRow("Upscale precision", runtime.latentUpscalePrecisionWidget, [
         "fp16", "bf16", "fp32",
-    ]);
+    ], null, node, runtime);
 
     const decodeLayerRow = document.createElement("div");
     decodeLayerRow.className = "h3-ext-row";
@@ -4146,11 +4154,17 @@ function collectProjectPayload(node, runtime) {
             refs_json: serializeRefsState(runtime.refsState),
             references: runtime.refsState.refs.map((ref) => ref ? { ...ref } : null),
             connections: collectConnectionSummary(node),
+            ui: {
+                refine_open: uiSectionOpen(node, "h3_ui_refine_open", false),
+            },
         },
         final_decode: finalNode ? {
             class_name: FINAL_TARGET,
             node_id: String(finalNode.id),
             settings: collectWidgetValues(finalNode, FINAL_PROJECT_WIDGETS),
+            ui: {
+                stitch_open: Boolean(finalNode?.properties?.h3_ui_stitch_open ?? true),
+            },
             preview: (() => {
                 const previewState = finalNode.__h3LivePreview;
                 const previewMeta = previewState?.currentPreviewMeta || {};
@@ -4366,8 +4380,24 @@ function applyProjectPayload(node, runtime, projectPayload) {
     updateHidden(node, runtime);
     captureNativeWorkflowState(node, runtime);
 
+    if (projectPayload?.extender?.ui && typeof projectPayload.extender.ui === "object") {
+        setUiSectionOpen(node, "h3_ui_refine_open", Boolean(projectPayload.extender.ui.refine_open));
+    }
+
     const finalSettings = projectPayload?.final_decode?.settings;
     const finalNode = connectedFinalDecode(node);
+    if (finalNode && projectPayload?.final_decode?.ui && typeof projectPayload.final_decode.ui === "object") {
+        if (!finalNode.properties || typeof finalNode.properties !== "object") finalNode.properties = {};
+        finalNode.properties.h3_ui_stitch_open = Boolean(projectPayload.final_decode.ui.stitch_open);
+        const stitchSection = finalNode.__h3LivePreview?.stitchSection;
+        if (stitchSection) {
+            const stitchOpen = Boolean(finalNode.properties.h3_ui_stitch_open);
+            stitchSection.classList.toggle("open", stitchOpen);
+            if (finalNode.__h3LivePreview?.stitchChevron) {
+                finalNode.__h3LivePreview.stitchChevron.textContent = stitchOpen ? "▾" : "▸";
+            }
+        }
+    }
     if (finalNode && finalSettings && typeof finalSettings === "object") {
         // Older projects predate autosave: loading them keeps it opt-in.
         if (!Object.prototype.hasOwnProperty.call(finalSettings, "auto_save_project")) {
@@ -4381,6 +4411,25 @@ function applyProjectPayload(node, runtime, projectPayload) {
                 setWidgetValue(finalNode, name, finalSettings[name]);
             }
         }
+        // If the Final Decode DOM already exists, mirror restored stitch_json
+        // immediately instead of waiting for a later preview/player rebuild.
+        try {
+            const rawStitch = String(getWidget(finalNode, "stitch_json")?.value || "");
+            const stitch = rawStitch ? JSON.parse(rawStitch) : null;
+            if (stitch && typeof stitch === "object") {
+                for (const row of finalNode.__h3LivePreview?.stitchRows || []) {
+                    const key = row?.__h3Key;
+                    if (!key || !Object.prototype.hasOwnProperty.call(stitch, key)) continue;
+                    const value = stitch[key];
+                    if (row.__h3Select) row.__h3Select.value = String(value ?? "");
+                    if (row.__h3Input) {
+                        if (row.__h3Input.type === "checkbox") row.__h3Input.checked = Boolean(value);
+                        else row.__h3Input.value = String(value ?? "");
+                    }
+                }
+            }
+        } catch (_) {}
+        try { finalNode.graph?.change?.(); } catch (_) {}
         finalNode.graph?.setDirtyCanvas(true, true);
     }
 
@@ -6233,29 +6282,99 @@ function render(node, runtime) {
                             render(node, runtime);
                         }));
                     } else {
-                        // REF2VA keeps separate draft/refine prefixes. Both are always visible
-                        // so clip_by_clip users can lock draft N and refine N without flipping
-                        // Run refine pass just to reach the other checkbox.
-                        const hasRefineCache = Number(runtime.refineCachedCount || 0) > 0
-                            || Boolean(runtime.runRefineWidget?.value)
-                            || (state.clips || []).some((c) => Boolean(c?.refine_validated));
-                        validationRow.appendChild(makeValidationCheckbox("Draft", clip.validated, (checked) => {
-                            if (checked) clip.validated = true;
-                            else invalidateFrom(state, index, false);
+                        // REF2VA Motion ON keeps separate Draft/Refine validated prefixes,
+                        // but both locks remain disk-authoritative exactly like the 2.8.4
+                        // Draft validation. A checkbox can never validate bytes that do not
+                        // physically exist.
+                        const draftBox = makeValidationCheckbox("Draft", clip.validated, async (checked) => {
+                            const wasDraft = Boolean(clip.validated);
+                            const oldDraftFlags = (state.clips || []).map((c) => Boolean(c?.validated));
+                            const oldRefineFlags = (state.clips || []).map((c) => Boolean(c?.refine_validated));
+                            if (checked) {
+                                if (!clipHasPhysicalCache(runtime, clip, index)) {
+                                    runtime.statusText = `Clip ${index + 1} cannot be marked Draft Validated because its cache does not exist yet.`;
+                                    render(node, runtime);
+                                    return;
+                                }
+                                clip.validated = true;
+                            } else {
+                                invalidateFrom(state, index, false);
+                                // A refined result depends on this Draft causal chain.
+                                for (let j = index; j < (state.clips || []).length; j++) {
+                                    state.clips[j].refine_validated = false;
+                                }
+                            }
                             enforceValidatedPrefix(state.clips, "validated");
                             updateHidden(node, runtime);
-                            render(node, runtime);
-                        }));
-                        const refineBox = makeValidationCheckbox("Refine", clip.refine_validated, (checked) => {
-                            if (checked) clip.refine_validated = true;
-                            else invalidateFrom(state, index, true);
-                            enforceValidatedPrefix(state.clips, "refine_validated");
+                            captureNativeWorkflowState(node, runtime);
+                            const requested = Boolean(clip.validated);
+                            const persisted = (requested === wasDraft)
+                                ? true
+                                : await persistLocalRefInvalidation(node, runtime, index, requested, "draft");
+                            if (!persisted) {
+                                for (let j = 0; j < (state.clips || []).length; j++) {
+                                    state.clips[j].validated = oldDraftFlags[j];
+                                    state.clips[j].refine_validated = oldRefineFlags[j];
+                                }
+                            } else {
+                                runtime.validatedCount = validatedPrefixFromState(state);
+                                runtime.validatedClipIds = new Set(
+                                    (state.clips || []).slice(0, runtime.validatedCount)
+                                        .map((item) => String(item?.id || "")).filter(Boolean)
+                                );
+                                runtime.refineValidatedCount = (state.clips || []).findIndex((c) => !c.refine_validated);
+                                if (runtime.refineValidatedCount < 0) runtime.refineValidatedCount = (state.clips || []).length;
+                            }
                             updateHidden(node, runtime);
+                            captureNativeWorkflowState(node, runtime);
                             render(node, runtime);
                         });
-                        // Dim when refine has never been used, but keep it clickable so the
-                        // user always sees both locks side by side.
-                        if (!hasRefineCache) refineBox.style.opacity = "0.55";
+                        validationRow.appendChild(draftBox);
+
+                        const hasRefinePhysicalCache = index < Number(runtime.refineCachedCount || 0);
+                        const refineBox = makeValidationCheckbox("Refine", clip.refine_validated, async (checked) => {
+                            const wasRefine = Boolean(clip.refine_validated);
+                            const oldFlags = (state.clips || []).map((c) => Boolean(c?.refine_validated));
+                            if (checked) {
+                                if (!hasRefinePhysicalCache) {
+                                    runtime.statusText = `Clip ${index + 1} cannot be marked Refine Validated because its refine cache does not exist yet.`;
+                                    render(node, runtime);
+                                    return;
+                                }
+                                if (!Boolean(clip.validated)) {
+                                    runtime.statusText = `Clip ${index + 1} Draft must be Validated before its Refine can be Validated.`;
+                                    render(node, runtime);
+                                    return;
+                                }
+                                clip.refine_validated = true;
+                            } else {
+                                invalidateFrom(state, index, true);
+                            }
+                            enforceValidatedPrefix(state.clips, "refine_validated");
+                            updateHidden(node, runtime);
+                            captureNativeWorkflowState(node, runtime);
+                            const requested = Boolean(clip.refine_validated);
+                            const persisted = (requested === wasRefine)
+                                ? true
+                                : await persistLocalRefInvalidation(node, runtime, index, requested, "refine");
+                            if (!persisted) {
+                                for (let j = 0; j < (state.clips || []).length; j++) {
+                                    state.clips[j].refine_validated = oldFlags[j];
+                                }
+                            } else {
+                                runtime.refineValidatedCount = (state.clips || []).findIndex((c) => !c.refine_validated);
+                                if (runtime.refineValidatedCount < 0) runtime.refineValidatedCount = (state.clips || []).length;
+                            }
+                            updateHidden(node, runtime);
+                            captureNativeWorkflowState(node, runtime);
+                            render(node, runtime);
+                        });
+                        if (refineBox.__h3Input) refineBox.__h3Input.disabled = !hasRefinePhysicalCache;
+                        if (!hasRefinePhysicalCache) {
+                            refineBox.title = "Generate the Refine cache for this clip first.";
+                            refineBox.style.opacity = "0.55";
+                            refineBox.style.cursor = "default";
+                        }
                         validationRow.appendChild(refineBox);
                     }
         }
@@ -6432,6 +6551,7 @@ function makeValidationCheckbox(labelText, checked, onChange) {
     input.checked = Boolean(checked);
     input.addEventListener("change", () => onChange(Boolean(input.checked)));
     wrap.append(input, document.createTextNode(labelText));
+    wrap.__h3Input = input;
     return wrap;
 }
 
@@ -7113,8 +7233,11 @@ function buildUi(node) {
         // Prepare the next seeds here so queued prompts have distinct inputs.
         // serializeState also synchronizes the active mode_clips entry; the
         // inactive mode is an independent timeline and must stay untouched.
-        for (const clip of runtime.state.clips) {
-            if (!clip.validated) advanceSeedAfterGenerate(clip);
+        const refineQueue = coerceWidgetBool(runtime.runRefineWidget?.value);
+        if (!refineQueue) {
+            for (const clip of runtime.state.clips) {
+                if (!clip.validated) advanceSeedAfterGenerate(clip);
+            }
         }
         updateHidden(node, runtime);
         render(node, runtime);
@@ -7396,27 +7519,6 @@ app.registerExtension({
             clearTransientRenderingState();
         });
 
-        // Custom refine checkbox can drift from the serialized widget after F5.
-        // Push the visible checkbox state into the widget right before queue.
-        const originalGraphToPrompt = app.graphToPrompt?.bind(app);
-        if (typeof originalGraphToPrompt === "function") {
-            app.graphToPrompt = async function () {
-                const graph = app.graph;
-                for (const node of graph?._nodes || []) {
-                    if (
-                        node?.comfyClass !== TARGET &&
-                        node?.type !== TARGET
-                    ) {
-                        continue;
-                    }
-                    const runtime = node.__h3Extender;
-                    if (!runtime) continue;
-                    syncRunRefineWidgetFromUi(runtime);
-                    syncExtenderSections(node, runtime);
-                }
-                return await originalGraphToPrompt(...arguments);
-            };
-        }
         api.addEventListener(PROMPT_PACK_EVENT, ({ detail }) => {
             const node = findExtenderNodeByExecutionId(detail?.node);
             if (!node) return;
@@ -7573,18 +7675,22 @@ app.registerExtension({
     
             const generated = Array.isArray(info.generated) ? info.generated : [];
             const refineRun = Boolean(info.refined || info.run_refine);
-            for (const humanIndex of generated) {
-                const i = Number(humanIndex) - 1;
-                const clip = runtime.state.clips[i];
-                // Only prepare a next seed for a candidate. A validated cached
-                // clip is never touched by this automatic seed behavior.
-                const locked = refineRun
-                    ? Boolean(clip?.refine_validated)
-                    : Boolean(clip?.validated);
-                if (clip && !locked) {
-                    advanceSeedAfterGenerate(clip);
+            if (!refineRun) {
+                for (const [i, clip] of runtime.state.clips.entries()) {
+                    if (clip.validated) continue;
+                    const next = nextSeeds.get(clip.id);
+                    if (next && next.seed_mode === clip.seed_mode) {
+                        // Completion can belong to an older queued run. Preserve
+                        // seeds already prepared by afterQueued, exactly as 2.8.4.
+                        clip.seed = next.seed;
+                    } else if (generated.some((index) => Number(index) === i + 1)) {
+                        // Backend-imported clip not present at queue time.
+                        advanceSeedAfterGenerate(clip);
+                    }
                 }
             }
+            // Refine is a finishing pass over the Draft. It must never advance
+            // or rewind the Draft seed timeline.
             runtime.jsonWidget.value = serializeState(runtime.state);
 
             // Defer clips_json persistence until checkpoint state is known below.
