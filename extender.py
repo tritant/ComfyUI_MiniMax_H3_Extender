@@ -5490,7 +5490,7 @@ class MiniMaxH3Extender:
         if bool(run_refine):
             from .latent_refine import run_refine_pass
 
-            def _finalize_with_refine(draft_manifest_for_refine, *, draft_then_refine=False):
+            def _finalize_with_refine(draft_manifest_for_refine):
                 refine_result = run_refine_pass(
                     owner=owner,
                     data_path=data_path,
@@ -5540,8 +5540,6 @@ class MiniMaxH3Extender:
                     f"refine {str(run_mode)} | cached {refine_cached}/{len(clips)} | "
                     f"validated {refine_validated} | draft preserved"
                 )
-                if draft_then_refine:
-                    status = "draft then " + status
                 if refine_generated:
                     status += " | generated " + ",".join(str(i + 1) for i in refine_generated)
                 else:
@@ -5570,7 +5568,6 @@ class MiniMaxH3Extender:
                     "build": BUILD,
                     "refined": True,
                     "run_refine": True,
-                    "draft_then_refine": bool(draft_then_refine),
                 }
                 return {
                     "ui": {"h3_extender_state": [ui_state]},
@@ -5586,16 +5583,20 @@ class MiniMaxH3Extender:
 
             current_manifest = _load_manifest_from_paths(data_path, manifest_path)
             draft_n = len((current_manifest or {}).get("segments") or [])
-            if current_manifest is not None and draft_n >= 1:
-                # Existing draft: skip draft generation, refine only.
-                return _finalize_with_refine(current_manifest, draft_then_refine=False)
-            logging.info(
-                "run_refine ON with empty draft — generating draft then refine "
-                "(run_mode=%s, clips=%d)",
-                run_mode,
-                len(clips),
-            )
-            # Fall through to the normal draft walk, then refine below.
+            if current_manifest is None or draft_n < 1:
+                raise RuntimeError(
+                    "MiniMax H3 Extender: Refine requires an existing Draft cache. "
+                    "Disable Run refine pass, generate/review the Draft project first, "
+                    "then enable Refine."
+                )
+            if draft_n < len(clips):
+                raise RuntimeError(
+                    f"MiniMax H3 Extender: Draft project is incomplete ({draft_n}/{len(clips)} clips). "
+                    "Disable Run refine pass and finish the Draft project first."
+                )
+            # Refine is deliberately a separate finishing phase. It never creates
+            # or completes Draft clips.
+            return _finalize_with_refine(current_manifest)
 
         # Walk the card list in order. Cached TRUE clips are metadata-only;
         # active clips sample and are written immediately to disk.
@@ -6150,13 +6151,6 @@ class MiniMaxH3Extender:
             "per_clip_lora_count": int(sum(len(cfg.get("loras") or []) for cfg in clips)),
             "build": BUILD,
         }
-
-        if bool(run_refine) and not interrupted:
-            # New project with refine ON: draft just completed — continue into refine.
-            current_manifest = _load_manifest_from_paths(data_path, manifest_path)
-            draft_n = len((current_manifest or {}).get("segments") or [])
-            if current_manifest is not None and draft_n >= 1:
-                return _finalize_with_refine(current_manifest, draft_then_refine=True)
 
         return {
             "ui": {"h3_extender_state": [ui_state]},

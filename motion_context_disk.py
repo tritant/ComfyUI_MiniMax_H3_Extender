@@ -4881,6 +4881,9 @@ if web is not None and PromptServer is not None and getattr(PromptServer, "insta
             clip_index = int(body.get("clip_index", -1))
             clip_id = str(body.get("clip_id") or "").strip()
             requested_validated = _request_bool(body.get("validated"), False)
+            validation_layer = str(body.get("layer") or "draft").strip().lower()
+            if validation_layer not in {"draft", "refine"}:
+                validation_layer = "draft"
             if not owner_id:
                 return web.json_response({"ok": False, "error": "Missing owner id."}, status=400)
 
@@ -4888,11 +4891,44 @@ if web is not None and PromptServer is not None and getattr(PromptServer, "insta
             data_path, manifest_path = _chain_paths(cache_owner)
             manifest = _load_manifest_from_paths(data_path, manifest_path)
             if manifest is None:
-                # No generated cache yet: clips_json is the only persistence
-                # source, so there is nothing on disk to invalidate.
+                # Recovery may always clear a stale validation flag, but a new
+                # validation can never be created without physical cache bytes.
+                if requested_validated:
+                    return web.json_response({
+                        "ok": False,
+                        "error": "Cannot validate a clip whose physical cache does not exist.",
+                    }, status=400)
                 return web.json_response({"ok": True, "found": False})
 
-            segments = [dict(x) for x in manifest.get("segments", [])]
+            target_manifest_path = manifest_path
+            target_manifest = manifest
+            if validation_layer == "refine":
+                if runtime_mode != "ref2va_motion":
+                    return web.json_response({
+                        "ok": False,
+                        "error": "Refine validation is only available for Ref2VA Motion Context.",
+                    }, status=400)
+                draft_segments = list(manifest.get("segments", []))
+                if requested_validated and (
+                    clip_index < 0
+                    or clip_index >= len(draft_segments)
+                    or not bool(draft_segments[clip_index].get("validated", False))
+                ):
+                    return web.json_response({
+                        "ok": False,
+                        "error": "Validate the corresponding Draft clip before validating its Refine.",
+                    }, status=400)
+                refine = _load_refine_sidecar(data_path, manifest, require_complete=False)
+                if refine is None:
+                    if not requested_validated:
+                        return web.json_response({"ok": True, "found": False, "refine_validated_count": 0})
+                    return web.json_response({
+                        "ok": False,
+                        "error": "Refine cache does not exist for this clip.",
+                    }, status=400)
+                _refine_data, target_manifest_path, target_manifest = refine
+
+            segments = [dict(x) for x in target_manifest.get("segments", [])]
             if runtime_mode == "ref2va_independent":
                 target = None
                 if clip_id:
@@ -4972,19 +5008,44 @@ if web is not None and PromptServer is not None and getattr(PromptServer, "insta
                         # may remain on disk for preview/history purposes.
                         segments[i].pop("computed", None)
 
-            manifest = dict(manifest)
-            manifest["segments"] = segments
-            manifest["updated_at"] = time.time()
-            _write_json_atomic(manifest_path, manifest)
-            return web.json_response({
+            target_manifest = dict(target_manifest)
+            target_manifest["segments"] = segments
+            target_manifest["updated_at"] = time.time()
+            _write_json_atomic(target_manifest_path, target_manifest)
+
+            validated_count = int(
+                sum(bool(x.get("validated", False)) for x in segments)
+                if runtime_mode in {"fl2va", "ref2va_independent"}
+                else _validated_prefix_count(segments)
+            )
+
+            # Draft unvalidation also unlocks the dependent refine suffix while
+            # preserving the refine bytes for preview/history.
+            refine_validated_count = None
+            if validation_layer == "draft" and runtime_mode == "ref2va_motion" and not requested_validated:
+                refine = _load_refine_sidecar(data_path, manifest, require_complete=False)
+                if refine is not None:
+                    _rdata, rmanifest_path, rmanifest = refine
+                    rsegments = [dict(x) for x in rmanifest.get("segments", [])]
+                    for i in range(max(0, clip_index), len(rsegments)):
+                        rsegments[i]["validated"] = False
+                        rsegments[i].pop("computed", None)
+                    rmanifest = dict(rmanifest)
+                    rmanifest["segments"] = rsegments
+                    rmanifest["updated_at"] = time.time()
+                    _write_json_atomic(rmanifest_path, rmanifest)
+                    refine_validated_count = int(_validated_prefix_count(rsegments))
+
+            payload = {
                 "ok": True,
                 "found": True,
-                "validated_count": int(
-                    sum(bool(x.get("validated", False)) for x in segments)
-                    if runtime_mode in {"fl2va", "ref2va_independent"}
-                    else _validated_prefix_count(segments)
-                ),
-            })
+                "validated_count": validated_count,
+            }
+            if validation_layer == "refine":
+                payload["refine_validated_count"] = validated_count
+            elif refine_validated_count is not None:
+                payload["refine_validated_count"] = refine_validated_count
+            return web.json_response(payload)
         except Exception as exc:
             _LOG.exception("H3 validation persistence failed")
             return web.json_response({"ok": False, "error": str(exc)}, status=500)
@@ -5948,6 +6009,18 @@ class MiniMaxH3MotionContextDiskFinalDecode:
                 preset=preset,
                 audio_bitrate=audio_bitrate,
                 autoplay=autoplay,
+                latent_layer_setting=latent_layer,
+                latent_upscale_model=latent_upscale_model,
+                latent_upscale_megapixels=latent_upscale_megapixels,
+                latent_upscale_precision=latent_upscale_precision,
+                stitch_json=json.dumps({
+                    "ref_frames_offset": int(ref_frames_offset),
+                    "rife_multiplier": int(rife_multiplier),
+                    "rife_ckpt": str(rife_ckpt or ""),
+                    "rife_fast_mode": bool(rife_fast_mode),
+                    "rife_ensemble": bool(rife_ensemble),
+                    "ai_skip_first": int(ai_skip_first),
+                }, separators=(",", ":")),
                 original_images=original_images,
                 ref_frames_offset=ref_frames_offset,
                 rife_multiplier=rife_multiplier,
@@ -5987,6 +6060,11 @@ class MiniMaxH3MotionContextDiskFinalDecode:
         preset="fast",
         audio_bitrate="192k",
         autoplay=True,
+        latent_layer_setting="auto",
+        latent_upscale_model="None",
+        latent_upscale_megapixels=1.2,
+        latent_upscale_precision="bf16",
+        stitch_json="",
         original_images=None,
         ref_frames_offset=20,
         rife_multiplier=2,
@@ -6024,6 +6102,11 @@ class MiniMaxH3MotionContextDiskFinalDecode:
                 "audio_bitrate": audio_bitrate, "autoplay": autoplay,
                 "auto_save_project": True,
                 "save_individual_clips": bool(save_individual_clips),
+                "latent_layer": str(latent_layer_setting or "auto"),
+                "latent_upscale_model": str(latent_upscale_model or "None"),
+                "latent_upscale_megapixels": float(latent_upscale_megapixels),
+                "latent_upscale_precision": str(latent_upscale_precision or "bf16"),
+                "stitch_json": str(stitch_json or ""),
             }
         segments = [dict(x) for x in manifest.get("segments", [])]
         if not segments:
@@ -6056,6 +6139,11 @@ class MiniMaxH3MotionContextDiskFinalDecode:
             raise ValueError(
                 "MiniMax H3 Final Decode: original_images seamless stitch is "
                 "supported for Ref2VA exports only (not FL2VA yet)."
+            )
+        if do_stitch and sequence_mode == "ref2va_independent":
+            raise ValueError(
+                "MiniMax H3 Final Decode: original_images seamless stitch is "
+                "supported for Ref2VA Motion Context exports only (not Motion OFF yet)."
             )
         if sequence_mode == "ref2va_independent":
             from .ref2va_independent import export_final as export_ref2va_independent_final
