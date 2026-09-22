@@ -150,13 +150,18 @@ class Autosave(unittest.TestCase):
         ns = {'CACHE_TYPE': 'CACHE'}
         exec(compile(ast.Module(body=[method], type_ignores=[]), 'schema', 'exec'), ns)
         required = ns['INPUT_TYPES'](None)['required']
-        self.assertEqual(list(required)[-1], 'auto_save_project')
+        self.assertIn('auto_save_project', required)
         self.assertIs(required['auto_save_project'][1]['default'], False)
-        for filename, function in [('motion_context_disk.py', 'export'), ('fl2va_engine.py', 'export_fl2va_final')]:
+        # Existing positional widgets stay in their historical order; #83-only
+        # Final Decode widgets are appended afterwards for old-workflow safety.
+        keys = list(required)
+        self.assertLess(keys.index('auto_save_project'), keys.index('save_individual_clips'))
+        self.assertLess(keys.index('save_individual_clips'), keys.index('latent_layer'))
+        for filename, function in [('motion_context_disk.py', '_export_after_layer_select'), ('fl2va_engine.py', 'export_fl2va_final')]:
             module = ast.parse((ROOT/filename).read_text())
             node = next(n for n in ast.walk(module) if isinstance(n, ast.FunctionDef) and n.name == function)
             arg_names = [arg.arg for arg in node.args.args]
-            self.assertIn("auto_save_project" if function == "export" else "project_autosave_settings", arg_names)
+            self.assertIn("auto_save_project" if function == "_export_after_layer_select" else "project_autosave_settings", arg_names)
             text = ast.unparse(node)
             self.assertLess(text.index('_embed_final_metadata_in_place(output_path'), text.index('_maybe_auto_save_project('))
             self.assertLess(text.index('_maybe_auto_save_project('), text.index('**project_autosave_info'))

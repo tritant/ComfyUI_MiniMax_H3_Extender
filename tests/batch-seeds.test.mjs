@@ -33,6 +33,10 @@ async function fixture(clips, mode = "ref2va", inactive = [clip("inactive")], mo
         installInvalidationHooks = () => {};
         wrapResolutionWidgetCallbacks = () => {};
         refreshLoraNames = () => {};
+        // #83 adds a large custom Canvas/Refine DOM. Seed tests intentionally
+        // isolate queue/execution semantics from that unrelated UI layer.
+        buildExtenderSections = () => ({});
+        syncExtenderSections = () => {};
         render = (node, runtime) => { node.displayedSeeds = runtime.state.clips.map(c => c.seed); };
         syncResolutionMirror = () => {};
         syncDomHeight = () => {};
@@ -48,6 +52,7 @@ async function fixture(clips, mode = "ref2va", inactive = [clip("inactive")], mo
                 { name: "refs_json", value: "{}" },
                 { name: "generation_mode", value: mode },
                 { name: "motion_context", value: motionContext },
+                { name: "run_refine", value: false },
             ];
             this.graph = { change() {}, setDirtyCanvas() {} };
         }
@@ -209,4 +214,15 @@ test("queued project metadata captures independent Manual fallback without advan
     assert.deepEqual(second.project_manual_resolution, { width: 896, height: 576 });
     assert.equal(second.clips[0].seed, 11);
     assert.deepEqual(first.project_manual_resolution, { width: 1024, height: 640 });
+});
+
+test("refine queues never advance or rewind the Draft seed timeline", async () => {
+    const f = await fixture([clip("draft", "increment", 42)], "ref2va", [], true);
+    const refineWidget = f.node.widgets.find((w) => w.name === "run_refine");
+    refineWidget.value = true;
+    const submitted = f.queue();
+    assert.equal(submitted.clips[0].seed, 42);
+    assert.equal(f.state().clips[0].seed, 42);
+    f.complete(submitted, { refined: true, run_refine: true, generated: [1] });
+    assert.equal(f.state().clips[0].seed, 42);
 });
