@@ -26,10 +26,9 @@ const CARD_MIN_HEIGHT_FL2VA = 560;
 const REF_SLOT_WIDTH = 96;
 const FL2VA_FRAME_SLOT_WIDTH = 145;
 const REF_THUMB_HEIGHT = 96;
-// Reserve the scrollbar inside the existing reference section only.
-// Do not grow the DOM widget or alter card sizing/layout for this.
 const REF_SCROLLBAR_SPACE = 14;
 const REF_SECTION_HEIGHT = 160;
+const REF_LIBRARY_HEIGHT = 108;
 const MAX_IMAGE_REFS = 9;
 const MAX_MIXED_REFS = 12;
 const MAX_FL2VA_GUIDES = 3;
@@ -66,11 +65,11 @@ function cardMinHeightForState(state) {
 }
 
 function uiMinHeightForState(state) {
-    // Both modes own the same media strip above the cards: Ref2VA shows the
-    // nine internal references, FL2VA shows each plan's First/Last frames.
-    // Keeping one fixed strip height also prevents mode switches from pulling
-    // the DOM widget upward into the native widgets in Nodes 2.0.
-    return Math.max(UI_MIN_HEIGHT, 55 + REF_SECTION_HEIGHT + cardMinHeightForState(state) + CARD_SCROLLBAR_SPACE);
+    return Math.max(UI_MIN_HEIGHT, 55 + referenceSectionHeight(state) + cardMinHeightForState(state) + CARD_SCROLLBAR_SPACE);
+}
+
+function referenceSectionHeight(state) {
+    return REF_SECTION_HEIGHT + (String(state?.generation_mode || "ref2va") === "fl2va" ? 0 : REF_LIBRARY_HEIGHT);
 }
 
 function nodes2MinHeightForState(state) {
@@ -148,7 +147,7 @@ function validationStateKey(modeOrState = "ref2va", motionContext = null) {
 
 
 function emptyRefsState() {
-    return { version: 2, refs: Array(MAX_IMAGE_REFS).fill(null) };
+    return { version: 3, refs: Array(MAX_IMAGE_REFS).fill(null), library: [] };
 }
 
 function normalizeRefDescriptor(value) {
@@ -211,7 +210,7 @@ function localMediaPreviewUrl(value) {
 }
 
 function emptyLocalRefs() {
-    return { version: 1, images: [], videos: [], audios: [] };
+    return { version: 1, images: [], selected_images: null, videos: [], audios: [] };
 }
 
 function normalizeLocalRefs(value) {
@@ -237,6 +236,17 @@ function normalizeLocalRefs(value) {
         out[key].sort((a, b) => a.slot - b.slot);
     };
     normalizeRows("images", MAX_IMAGE_REFS);
+    if (Array.isArray(raw.selected_images)) {
+        out.selected_images = [];
+        const seen = new Set();
+        for (const value of raw.selected_images) {
+            const ref = normalizeRefDescriptor(value?.ref || value);
+            if (!ref || seen.has(ref.id)) continue;
+            out.selected_images.push(ref);
+            seen.add(ref.id);
+            if (out.selected_images.length >= MAX_IMAGE_REFS) break;
+        }
+    }
     normalizeRows("videos", MAX_VIDEO_REFS, "video");
     normalizeRows("audios", MAX_STANDALONE_AUDIO_REFS, "audio");
     return out;
@@ -244,7 +254,29 @@ function normalizeLocalRefs(value) {
 
 function localRefCount(clip) {
     const local = normalizeLocalRefs(clip?.local_refs);
-    return local.images.length + local.videos.length + local.audios.length;
+    return (local.selected_images === null ? local.images.length : local.selected_images.length)
+        + local.videos.length + local.audios.length;
+}
+
+function normalizeRefLibrary(values) {
+    const refs = [];
+    const seen = new Set();
+    for (const value of Array.isArray(values) ? values : []) {
+        const ref = normalizeRefDescriptor(value);
+        if (!ref || seen.has(ref.id)) continue;
+        refs.push(ref);
+        seen.add(ref.id);
+    }
+    return refs;
+}
+
+function syncLibraryFromClips(runtime) {
+    const clips = runtime?.state?.mode_clips?.ref2va || runtime?.state?.clips || [];
+    const images = clips.flatMap((clip) => {
+        const local = normalizeLocalRefs(clip.local_refs);
+        return local.selected_images === null ? local.images.map((item) => item.ref) : local.selected_images;
+    });
+    runtime.refsState.library = normalizeRefLibrary([...(runtime.refsState.library || []), ...images]);
 }
 
 function normalizeRefsArray(values) {
@@ -262,14 +294,22 @@ function parseRefsState(raw) {
     try {
         const parsed = typeof raw === "string" ? JSON.parse(raw || "{}") : raw;
         const refs = Array.isArray(parsed) ? parsed : parsed?.refs;
-        return { version: 2, refs: normalizeRefsArray(Array.isArray(refs) ? refs : []) };
+        return {
+            version: 3,
+            refs: normalizeRefsArray(Array.isArray(refs) ? refs : []),
+            library: normalizeRefLibrary(parsed?.library),
+        };
     } catch (_) {
         return emptyRefsState();
     }
 }
 
 function serializeRefsState(state) {
-    return JSON.stringify({ version: 2, refs: normalizeRefsArray(state?.refs || []) });
+    return JSON.stringify({
+        version: 3,
+        refs: normalizeRefsArray(state?.refs || []),
+        library: normalizeRefLibrary(state?.library),
+    });
 }
 
 function refCount(runtime) {
@@ -381,12 +421,9 @@ function usedLocalSlots(clip, kind) {
 }
 
 function localSlotReservations(runtime, kind) {
-    // Local slot numbers are clip-local identities, so different clips may reuse
-    // the same logical number. A GLOBAL slot, however, must stay unavailable as
-    // long as at least one clip owns that number locally; otherwise adding a new
-    // global later would silently collide with an existing clip-local tag.
     const reserved = new Set();
     for (const clip of runtime?.state?.clips || []) {
+        if (kind === "picture" && normalizeLocalRefs(clip?.local_refs).selected_images !== null) continue;
         for (const slot of usedLocalSlots(clip, kind)) reserved.add(Number(slot));
     }
     return reserved;
@@ -407,10 +444,58 @@ function localRefsConflictSummary(node, runtime, clip) {
     const occupied = globalReferenceOccupancy(node, runtime);
     const local = normalizeLocalRefs(clip?.local_refs);
     const conflicts = [];
-    for (const item of local.images) if (occupied.pictures.has(item.slot)) conflicts.push(`Picture ${item.slot}`);
+    if (local.selected_images === null) {
+        for (const item of local.images) if (occupied.pictures.has(item.slot)) conflicts.push(`Picture ${item.slot}`);
+    }
     for (const item of local.videos) if (occupied.videos.has(item.slot)) conflicts.push(`Video ${item.slot}`);
     for (const item of local.audios) if (occupied.audios.has(item.slot)) conflicts.push(`Audio ${item.slot}`);
     return conflicts;
+}
+
+function pictureBindingKeys(runtime, clip) {
+    const globals = runtime?.refsState?.refs || [];
+    const local = normalizeLocalRefs(clip?.local_refs);
+    if (local.selected_images !== null) {
+        return [
+            ...globals.map((ref, index) => ref ? `global:${index}` : null).filter(Boolean),
+            ...local.selected_images.map((ref) => `local:${ref.id}`),
+        ];
+    }
+    const keys = globals.map((ref, index) => ref ? `global:${index}` : null);
+    for (const item of local.images) keys[item.slot - 1] = `local:${item.ref.id}`;
+    return keys;
+}
+
+function remapPicturePrompt(prompt, before, after) {
+    const positions = new Map(after.map((key, index) => [key, index + 1]).filter(([key]) => key));
+    return String(prompt || "").replace(/<Picture\s+(\d+)>/gi, (tag, raw) => {
+        const key = before[Number(raw) - 1];
+        if (!key) return tag;
+        const next = positions.get(key);
+        return next ? `<Picture ${next}>` : "";
+    });
+}
+
+function remapManagedPrompts(runtime, before) {
+    for (const clip of runtime?.state?.clips || []) {
+        const oldKeys = before.get(String(clip.id));
+        if (!oldKeys) continue;
+        clip.prompt = remapPicturePrompt(clip.prompt, oldKeys, pictureBindingKeys(runtime, clip));
+    }
+}
+
+function managedPromptBindings(runtime) {
+    return new Map((runtime?.state?.clips || [])
+        .filter((clip) => normalizeLocalRefs(clip?.local_refs).selected_images !== null)
+        .map((clip) => [String(clip.id), pictureBindingKeys(runtime, clip)]));
+}
+
+function globalPictureCapacity(runtime) {
+    const count = (runtime?.refsState?.refs || []).filter(Boolean).length;
+    return (runtime?.state?.clips || []).every((clip) => {
+        const selected = normalizeLocalRefs(clip?.local_refs).selected_images;
+        return selected === null || count + selected.length < MAX_IMAGE_REFS;
+    });
 }
 
 async function persistLocalRefInvalidation(node, runtime, clipIndex, validatedState = false) {
@@ -2267,6 +2352,7 @@ function openReferenceEditor(node, runtime, slotIndex, ref, target = null) {
     const targetKind = String(target?.kind || "");
     const isFrame = Boolean(target && ["first", "last", "guide"].includes(targetKind));
     const isLocalPicture = Boolean(target && targetKind === "local_picture");
+    const isLibraryPicture = targetKind === "library_picture";
     const frameClipIndex = isFrame ? Number(target.clipIndex) : -1;
     const frameKind = isFrame ? targetKind : "";
     const frameGuideIndex = frameKind === "guide" ? Number(target?.guideIndex) : -1;
@@ -2281,6 +2367,8 @@ function openReferenceEditor(node, runtime, slotIndex, ref, target = null) {
         ? `Clip ${frameClipIndex + 1} ${frameKindLabel}`
         : isLocalPicture
             ? `Clip ${localClipIndex + 1} Picture ${localSlot}`
+            : isLibraryPicture
+                ? "Local Picture"
             : `Ref ${slotIndex + 1}`;
     const defaultName = isFrame
         ? (frameKind === "guide"
@@ -2288,6 +2376,8 @@ function openReferenceEditor(node, runtime, slotIndex, ref, target = null) {
             : `clip_${frameClipIndex + 1}_${frameKind}.png`)
         : isLocalPicture
             ? `clip_${localClipIndex + 1}_picture_${localSlot}.png`
+            : isLibraryPicture
+                ? "local_picture.png"
             : `ref_${slotIndex + 1}.png`;
     if (projectBusy(runtime) || runtime.refBusy || runtime.projectOperationBusy) {
         alert("Wait for the current clip generation to finish before editing a reference image.");
@@ -2584,6 +2674,8 @@ function openReferenceEditor(node, runtime, slotIndex, ref, target = null) {
                 ? (frameKind === "guide"
                     ? runtime.state?.clips?.[frameClipIndex]?.guides?.[frameGuideIndex]?.frame
                     : runtime.state?.clips?.[frameClipIndex]?.[`${frameKind}_frame`])
+                : isLibraryPicture
+                    ? (runtime.refsState.library || []).find((item) => item.id === String(target.id))
                 : isLocalPicture
                     ? (() => {
                         const localClip = runtime.state?.clips?.[localClipIndex];
@@ -2610,6 +2702,42 @@ function openReferenceEditor(node, runtime, slotIndex, ref, target = null) {
                 runtime.statusText = sameRefContent(ref, newRef)
                     ? `${frameLabel} unchanged`
                     : `${frameLabel} adjusted | validations unchanged`;
+                render(node, runtime);
+            } else if (isLibraryPicture) {
+                const changed = !sameRefContent(ref, newRef);
+                const affected = (runtime.state?.clips || [])
+                    .map((clip, index) => {
+                        const local = normalizeLocalRefs(clip.local_refs);
+                        const selected = local.selected_images === null
+                            ? local.images.map((item) => item.ref) : local.selected_images;
+                        return selected.some((item) => item.id === ref.id) ? index : -1;
+                    })
+                    .filter((index) => index >= 0);
+                if (changed) {
+                    const invalidations = randomAccessMode(runtime.state) ? affected : affected.slice(0, 1);
+                    for (const index of invalidations) {
+                        if (!(await prepareLocalRefMutation(node, runtime, index))) {
+                            throw new Error("Local Picture could not invalidate its clip cache.");
+                        }
+                    }
+                }
+                runtime.refsState.library = normalizeRefLibrary(
+                    (runtime.refsState.library || []).map((item) => item.id === ref.id ? newRef : item)
+                );
+                for (const index of affected) {
+                    const clip = runtime.state.clips[index];
+                    const local = normalizeLocalRefs(clip.local_refs);
+                    if (local.selected_images === null) {
+                        for (const item of local.images) if (item.ref.id === ref.id) item.ref = newRef;
+                    } else {
+                        local.selected_images = local.selected_images.map((item) => item.id === ref.id ? newRef : item);
+                    }
+                    clip.local_refs = local;
+                }
+                updateRefsHidden(node, runtime);
+                updateHidden(node, runtime);
+                captureNativeWorkflowState(node, runtime);
+                runtime.statusText = changed ? "Local Picture adjusted" : "Local Picture unchanged";
                 render(node, runtime);
             } else if (isLocalPicture) {
                 if (!localItem) throw new Error(`${frameLabel} changed while the editor was open.`);
@@ -2702,6 +2830,10 @@ async function uploadReference(node, runtime, slotIndex, file) {
         return;
     }
     const logicalSlot = Number(slotIndex) + 1;
+    if (!runtime.refsState.refs[slotIndex] && !globalPictureCapacity(runtime)) {
+        alert("A clip already uses all 9 Picture references. Remove a local selection before adding a global Picture.");
+        return;
+    }
     if (localSlotReservations(runtime, "picture").has(logicalSlot)) {
         alert(`Picture ${logicalSlot} is reserved by a clip-local reference. Remove the local reference first.`);
         render(node, runtime);
@@ -2734,7 +2866,12 @@ async function uploadReference(node, runtime, slotIndex, file) {
             return;
         }
 
+        const bindings = managedPromptBindings(runtime);
         runtime.refsState.refs[slotIndex] = newRef;
+        if (bindings.size) {
+            remapManagedPrompts(runtime, bindings);
+            updateHidden(node, runtime);
+        }
         handleReferenceChange(node, runtime, `Ref ${slotIndex + 1} loaded`);
     } catch (error) {
         runtime.statusText = "Reference load failed";
@@ -2746,44 +2883,77 @@ async function uploadReference(node, runtime, slotIndex, file) {
     }
 }
 
-async function uploadLocalPicture(node, runtime, clipIndex, file) {
-    const clip = runtime?.state?.clips?.[clipIndex];
-    if (!clip || !file) return false;
-    const slot = firstFreeLocalSlot(node, runtime, clip, "picture");
-    if (slot === null) {
-        alert("No free Picture slot remains for this clip (global + local maximum is 9).");
-        return false;
-    }
+async function uploadLibraryPictures(node, runtime, files) {
+    if (!node || !runtime || !files?.length || projectBusy(runtime) || runtime.refBusy) return [];
+    const images = Array.from(files).filter((file) =>
+        String(file?.type || "").toLowerCase().startsWith("image/")
+        || /\.(png|jpe?g|webp|bmp|tiff?)$/i.test(String(file?.name || ""))
+    );
+    if (!images.length) return [];
     runtime.refBusy = true;
-    runtime.statusText = `Loading local Picture ${slot} for Clip ${clipIndex + 1}…`;
-    render(node, runtime);
+    const uploaded = [];
     try {
-        const form = new FormData();
-        form.append("ref_file", file, file.name);
-        const response = await fetch(api.apiURL("/h3_extender/ref/upload"), { method: "POST", body: form });
-        const payload = await response.json().catch(() => ({}));
-        if (!response.ok || !payload?.ok || !payload?.ref) {
-            throw new Error(payload?.error || `Local picture upload failed (${response.status}).`);
+        for (const file of images) {
+            const form = new FormData();
+            form.append("ref_file", file, file.name);
+            const response = await fetch(api.apiURL("/h3_extender/ref/upload"), { method: "POST", body: form });
+            const payload = await response.json().catch(() => ({}));
+            if (!response.ok || !payload?.ok || !payload?.ref) {
+                throw new Error(payload?.error || `Picture upload failed (${response.status}).`);
+            }
+            const ref = normalizeRefDescriptor(payload.ref);
+            if (!ref) throw new Error("Backend returned invalid Picture metadata.");
+            runtime.refsState.library = normalizeRefLibrary([...(runtime.refsState.library || []), ref]);
+            uploaded.push(ref);
         }
-        const ref = normalizeRefDescriptor(payload.ref);
-        if (!ref) throw new Error("Backend returned invalid local picture metadata.");
-        if (!(await prepareLocalRefMutation(node, runtime, clipIndex))) return false;
-        clip.local_refs = normalizeLocalRefs(clip.local_refs);
-        clip.local_refs.images.push({ slot, ref });
-        clip.local_refs = normalizeLocalRefs(clip.local_refs);
-        updateHidden(node, runtime);
-        captureNativeWorkflowState(node, runtime);
-        syncDynamicAVReferenceInputs(node, runtime);
-        runtime.statusText = `Clip ${clipIndex + 1}: local Picture ${slot} loaded`;
-        return true;
+        runtime.statusText = `${uploaded.length} local Picture${uploaded.length === 1 ? "" : "s"} added`;
     } catch (error) {
-        runtime.statusText = "Local picture load failed";
+        runtime.statusText = "Local Picture upload failed";
         alert(String(error?.message || error));
-        return false;
     } finally {
+        if (uploaded.length) {
+            updateRefsHidden(node, runtime);
+            captureNativeWorkflowState(node, runtime);
+        }
         runtime.refBusy = false;
         render(node, runtime);
     }
+    return uploaded;
+}
+
+async function toggleLibraryPicture(node, runtime, clipIndex, refId) {
+    const clip = runtime?.state?.clips?.[clipIndex];
+    const libraryRef = (runtime?.refsState?.library || []).find((ref) => ref.id === refId);
+    if (!clip || !libraryRef || projectBusy(runtime)) return false;
+    const local = normalizeLocalRefs(clip.local_refs);
+    const existing = local.selected_images === null ? local.images.map((item) => item.ref) : local.selected_images;
+    const selected = existing.some((ref) => ref.id === refId);
+    const next = selected ? existing.filter((ref) => ref.id !== refId) : [...existing, libraryRef];
+    if ((runtime.refsState.refs || []).filter(Boolean).length + next.length > MAX_IMAGE_REFS) {
+        alert(`A clip can use at most ${MAX_IMAGE_REFS} Picture references in total.`);
+        return false;
+    }
+    const before = pictureBindingKeys(runtime, clip);
+    if (!(await prepareLocalRefMutation(node, runtime, clipIndex))) return false;
+    const current = runtime.state.clips[clipIndex];
+    current.local_refs = normalizeLocalRefs(current.local_refs);
+    current.local_refs.images = [];
+    current.local_refs.selected_images = normalizeRefLibrary(next);
+    current.prompt = remapPicturePrompt(current.prompt, before, pictureBindingKeys(runtime, current));
+    updateHidden(node, runtime);
+    captureNativeWorkflowState(node, runtime);
+    runtime.statusText = `Clip ${clipIndex + 1}: Picture selection updated`;
+    render(node, runtime);
+    return true;
+}
+
+async function uploadLocalPicture(node, runtime, clipIndex, file) {
+    const [ref] = await uploadLibraryPictures(node, runtime, [file]);
+    if (!ref) return false;
+    const local = normalizeLocalRefs(runtime.state?.clips?.[clipIndex]?.local_refs);
+    const selected = local.selected_images === null ? local.images.map((item) => item.ref) : local.selected_images;
+    if (selected.some((item) => item.id === ref.id)) return true;
+    return toggleLibraryPicture(node, runtime, clipIndex, ref.id);
 }
 
 async function uploadLocalMedia(node, runtime, clipIndex, kind, file) {
@@ -2833,6 +3003,9 @@ async function uploadLocalMedia(node, runtime, clipIndex, kind, file) {
 async function removeLocalRef(node, runtime, clipIndex, kind, slot) {
     const clip = runtime?.state?.clips?.[clipIndex];
     if (!clip) return false;
+    if (kind === "picture" && normalizeLocalRefs(clip.local_refs).selected_images !== null) {
+        return toggleLibraryPicture(node, runtime, clipIndex, String(slot));
+    }
     if (!(await prepareLocalRefMutation(node, runtime, clipIndex))) return false;
     const local = normalizeLocalRefs(clip.local_refs);
     const key = kind === "picture" ? "images" : (kind === "video" ? "videos" : "audios");
@@ -2851,6 +3024,15 @@ function openLocalRefsPanel(node, runtime, clipIndex) {
     if (!clip || String(runtime.state?.generation_mode || "ref2va") !== "ref2va") return;
     if (projectBusy(runtime) || runtime.refBusy || runtime.projectOperationBusy) return;
     clip.local_refs = normalizeLocalRefs(clip.local_refs);
+    const existingPictures = clip.local_refs.selected_images === null
+        ? clip.local_refs.images.map((item) => item.ref)
+        : clip.local_refs.selected_images;
+    const library = normalizeRefLibrary([...(runtime.refsState.library || []), ...existingPictures]);
+    if (library.length !== (runtime.refsState.library || []).length) {
+        runtime.refsState.library = library;
+        updateRefsHidden(node, runtime);
+        renderReferenceLibrary(node, runtime);
+    }
 
     // Only one local-refs manager should be open at a time.
     try {
@@ -2910,7 +3092,7 @@ function openLocalRefsPanel(node, runtime, clipIndex) {
         header.style.justifyContent = "space-between";
         header.style.gap = "10px";
         const title = document.createElement("strong");
-        title.textContent = `Local References — Clip ${clipIndex + 1}`;
+        title.textContent = `References — Clip ${clipIndex + 1}`;
         const closeBtn = document.createElement("button");
         closeBtn.textContent = "×";
         closeBtn.style.width = "28px";
@@ -2927,10 +3109,99 @@ function openLocalRefsPanel(node, runtime, clipIndex) {
         summary.style.lineHeight = "1.45";
         summary.style.opacity = ".78";
         summary.style.margin = "8px 0 12px";
+        const selectedPictures = liveClip.local_refs.selected_images === null
+            ? liveClip.local_refs.images.map((item) => item.ref)
+            : liveClip.local_refs.selected_images;
+        const activePictureCount = liveClip.local_refs.selected_images === null
+            ? new Set([
+                ...occupied.pictures,
+                ...liveClip.local_refs.images.map((item) => item.slot),
+            ]).size
+            : occupied.pictures.size + selectedPictures.length;
         summary.textContent =
-            `${occupied.pictures.size} global Picture(s) • ${occupied.videos.size} global Video(s) • ${occupied.audios.size} global Audio slot(s). ` +
-            `Local refs take the first free logical slot; that same global slot is locked while any clip uses it locally. Global refs remain active on every clip. Mixed H3 limit: ${MAX_MIXED_REFS}.`;
+            `${occupied.pictures.size} global Picture(s) • ${occupied.videos.size} global Video(s) • ` +
+            `${occupied.audios.size} global Audio slot(s). Global refs apply to every clip unless a legacy local slot overrides one. ` +
+            `Pictures: ${activePictureCount}/${MAX_IMAGE_REFS} (global + local). ` +
+            `Mixed H3 limit: ${MAX_MIXED_REFS}.`;
         panel.appendChild(summary);
+
+        const globalTitle = document.createElement("strong");
+        globalTitle.textContent = "Global Reference Images";
+        globalTitle.style.fontSize = "11px";
+        panel.appendChild(globalTitle);
+        const globals = document.createElement("div");
+        globals.style.display = "flex";
+        globals.style.flexWrap = "wrap";
+        globals.style.gap = "7px";
+        globals.style.margin = "7px 0 13px";
+        let globalOrdinal = 0;
+        for (const [index, ref] of (runtime.refsState.refs || []).entries()) {
+            if (!ref) continue;
+            globalOrdinal += 1;
+            const card = document.createElement("div");
+            card.style.width = "62px";
+            const thumb = document.createElement("img");
+            thumb.src = refImageUrl(ref);
+            thumb.title = ref.original_name || `Picture ${globalOrdinal}`;
+            thumb.style.width = "62px";
+            thumb.style.height = "48px";
+            thumb.style.objectFit = "contain";
+            thumb.style.background = "rgba(0,0,0,.28)";
+            thumb.style.cursor = "pointer";
+            thumb.addEventListener("dblclick", () => {
+                close();
+                openReferenceEditor(node, runtime, index, ref);
+            });
+            const label = document.createElement("div");
+            label.textContent = liveClip.local_refs.selected_images === null
+                ? `Picture ${index + 1}` : `Picture ${globalOrdinal}`;
+            label.style.fontSize = "10px";
+            card.append(thumb, label);
+            globals.appendChild(card);
+        }
+        panel.appendChild(globals);
+
+        const libraryTitle = document.createElement("strong");
+        libraryTitle.textContent = "Local Reference Images";
+        libraryTitle.style.fontSize = "11px";
+        panel.appendChild(libraryTitle);
+        const libraryGrid = document.createElement("div");
+        libraryGrid.style.display = "grid";
+        libraryGrid.style.gridTemplateColumns = "repeat(auto-fill, minmax(92px, 1fr))";
+        libraryGrid.style.gap = "7px";
+        libraryGrid.style.margin = "7px 0 13px";
+        for (const ref of runtime.refsState.library || []) {
+            const position = selectedPictures.findIndex((item) => item.id === ref.id);
+            const card = document.createElement("div");
+            card.style.minWidth = "0";
+            const thumb = document.createElement("img");
+            thumb.src = refImageUrl(ref);
+            thumb.title = `${ref.original_name || "Local Picture"} — double-click to edit`;
+            thumb.style.width = "100%";
+            thumb.style.height = "62px";
+            thumb.style.objectFit = "contain";
+            thumb.style.background = "rgba(0,0,0,.28)";
+            thumb.style.cursor = "pointer";
+            thumb.addEventListener("dblclick", () => {
+                close();
+                openReferenceEditor(node, runtime, -1, ref, { kind: "library_picture", id: ref.id });
+            });
+            const toggle = document.createElement("button");
+            toggle.textContent = position < 0 ? "+ Use" : (liveClip.local_refs.selected_images === null
+                ? `Picture ${liveClip.local_refs.images[position]?.slot || position + 1}`
+                : `Picture ${occupied.pictures.size + position + 1} ✓`);
+            toggle.title = ref.original_name || "Local Picture";
+            toggle.style.width = "100%";
+            toggle.style.fontSize = "10px";
+            toggle.disabled = Boolean(runtime.refBusy || projectBusy(runtime))
+                || (position < 0 && occupied.pictures.size + selectedPictures.length >= MAX_IMAGE_REFS);
+            toggle.addEventListener("click", async () => {
+                if (await toggleLibraryPicture(node, runtime, clipIndex, ref.id) && overlay.isConnected) renderContents();
+            });
+            card.append(thumb, toggle);
+            libraryGrid.appendChild(card);
+        }
+        panel.appendChild(libraryGrid);
 
         if (conflicts.length) {
             const warning = document.createElement("div");
@@ -2972,7 +3243,9 @@ function openLocalRefsPanel(node, runtime, clipIndex) {
         const addButton = (label, kind, input) => {
             const b = document.createElement("button");
             b.textContent = label;
-            b.disabled = firstFreeLocalSlot(node, runtime, liveClip, kind) === null;
+            b.disabled = kind === "picture"
+                ? occupied.pictures.size + selectedPictures.length >= MAX_IMAGE_REFS
+                : firstFreeLocalSlot(node, runtime, liveClip, kind) === null;
             b.title = b.disabled ? `No free ${kind} slot remains` : `Add one clip-local ${kind} reference`;
             b.addEventListener("click", () => input.click());
             return b;
@@ -2986,7 +3259,9 @@ function openLocalRefsPanel(node, runtime, clipIndex) {
 
         const local = normalizeLocalRefs(liveClip.local_refs);
         const rows = [
-            ...local.images.map((item) => ({ kind: "picture", slot: item.slot, payload: item.ref })),
+            ...(local.selected_images === null
+                ? local.images.map((item) => ({ kind: "picture", slot: item.slot, payload: item.ref }))
+                : []),
             ...local.videos.map((item) => ({ kind: "video", slot: item.slot, payload: item.media })),
             ...local.audios.map((item) => ({ kind: "audio", slot: item.slot, payload: item.media })),
         ].sort((a, b) => a.kind.localeCompare(b.kind) || a.slot - b.slot);
@@ -3212,7 +3487,12 @@ function removeReference(node, runtime, slotIndex) {
         return;
     }
     const oldName = runtime.refsState.refs[slotIndex]?.original_name || `Ref ${slotIndex + 1}`;
+    const bindings = managedPromptBindings(runtime);
     runtime.refsState.refs[slotIndex] = null;
+    if (bindings.size) {
+        remapManagedPrompts(runtime, bindings);
+        updateHidden(node, runtime);
+    }
 
     // Nodes 2.0 can postpone the custom DOM-widget repaint triggered through
     // graph.change()/setDirtyCanvas until the next node interaction. Redraw the
@@ -3716,6 +3996,8 @@ function applyProjectPayload(node, runtime, projectPayload) {
     runtime.state = parseState(rawClips);
     runtime.state.motion_context = explicitMotionContextFromStateJson(rawClips) ?? projectMotion;
     activateModeState(runtime.state, projectMode);
+    syncLibraryFromClips(runtime);
+    updateRefsHidden(node, runtime);
     rememberManualResolution(node, runtime, savedManualW, savedManualH);
     // Loading a project mutates the disk cache outside ComfyUI's executor. A
     // one-shot token forces the Extender input hash to change even if every
@@ -3925,7 +4207,7 @@ async function saveProject(node, runtime) {
         runtime.projectName = String(payload.filename || projectName).replace(/\.ext$/i, "");
         node.properties = node.properties || {};
         node.properties.h3_project_name = runtime.projectName;
-        runtime.statusText = `Project ready: ${payload.filename || projectName} | refs ${Number(payload?.references?.count ?? refCount(runtime))} embedded`;
+        runtime.statusText = `Project ready: ${payload.filename || projectName} | ${refCount(runtime)} global, ${(runtime.refsState.library || []).length} local images`;
         render(node, runtime);
 
         // Do not fetch the archive into a JS Blob: .ext files may be many GB.
@@ -4105,7 +4387,8 @@ function renderReferences(node, runtime) {
         load.style.padding = "2px 4px";
         load.style.fontSize = "10px";
         load.disabled = Boolean(
-            reservedByLocal || runtime.refBusy || runtime.projectOperationBusy || projectBusy(runtime)
+            reservedByLocal || (!ref && !globalPictureCapacity(runtime))
+            || runtime.refBusy || runtime.projectOperationBusy || projectBusy(runtime)
         );
         if (reservedByLocal) {
             load.style.opacity = ".38";
@@ -4238,6 +4521,77 @@ function renderReferences(node, runtime) {
         slot.appendChild(meta);
 
         row.appendChild(slot);
+    }
+    renderReferenceLibrary(node, runtime);
+}
+
+function libraryReferenceUsed(runtime, refId) {
+    return (runtime?.state?.clips || []).some((clip) => {
+        const local = normalizeLocalRefs(clip.local_refs);
+        const selected = local.selected_images === null ? local.images.map((item) => item.ref) : local.selected_images;
+        return selected.some((ref) => ref.id === refId);
+    });
+}
+
+function renderReferenceLibrary(node, runtime) {
+    const row = runtime?.libraryRow;
+    if (!row) return;
+    row.replaceChildren();
+    if (!(runtime.refsState.library || []).length) {
+        const hint = document.createElement("span");
+        hint.textContent = "Drop images here";
+        hint.style.fontSize = "10px";
+        hint.style.opacity = ".5";
+        hint.style.alignSelf = "center";
+        row.appendChild(hint);
+    }
+    for (const ref of runtime.refsState.library || []) {
+        const card = document.createElement("div");
+        card.style.flex = "0 0 76px";
+        card.style.position = "relative";
+        card.style.minWidth = "0";
+        const thumb = document.createElement("img");
+        thumb.src = refImageUrl(ref);
+        thumb.alt = ref.original_name || "Local Picture";
+        thumb.title = `${ref.original_name || "Local Picture"} — double-click to edit`;
+        thumb.draggable = false;
+        thumb.style.width = "76px";
+        thumb.style.height = "62px";
+        thumb.style.objectFit = "contain";
+        thumb.style.background = "rgba(0,0,0,.28)";
+        thumb.style.borderRadius = "5px";
+        thumb.style.cursor = "pointer";
+        thumb.addEventListener("dblclick", () => openReferenceEditor(node, runtime, -1, ref, {
+            kind: "library_picture", id: ref.id,
+        }));
+        card.appendChild(thumb);
+        const remove = document.createElement("button");
+        remove.textContent = "×";
+        remove.title = libraryReferenceUsed(runtime, ref.id)
+            ? "Remove this Picture from clips before deleting it"
+            : "Remove from Local Pictures";
+        remove.disabled = libraryReferenceUsed(runtime, ref.id) || runtime.refBusy || projectBusy(runtime);
+        remove.style.position = "absolute";
+        remove.style.top = "1px";
+        remove.style.right = "1px";
+        remove.style.width = "19px";
+        remove.style.height = "19px";
+        remove.style.padding = "0";
+        remove.addEventListener("click", () => {
+            runtime.refsState.library = runtime.refsState.library.filter((item) => item.id !== ref.id);
+            updateRefsHidden(node, runtime);
+            render(node, runtime);
+        });
+        card.appendChild(remove);
+        const name = document.createElement("div");
+        name.textContent = ref.original_name || "Picture";
+        name.title = name.textContent;
+        name.style.fontSize = "9px";
+        name.style.whiteSpace = "nowrap";
+        name.style.overflow = "hidden";
+        name.style.textOverflow = "ellipsis";
+        card.appendChild(name);
+        row.appendChild(card);
     }
 }
 
@@ -4580,10 +4934,16 @@ function syncFl2vaHorizontalScroll(runtime) {
 }
 
 function renderMediaStrip(node, runtime, fl2vaMode) {
+    if (runtime.refsSection) {
+        const height = referenceSectionHeight(runtime.state);
+        runtime.refsSection.style.height = `${height}px`;
+        runtime.refsSection.style.flexBasis = `${height}px`;
+    }
+    if (runtime.librarySection) runtime.librarySection.style.display = fl2vaMode ? "none" : "block";
     if (runtime?.refsHeader) {
         runtime.refsHeader.textContent = fl2vaMode
             ? "FL2VA FIRST / LAST FRAMES — per-clip IMAGE GUIDES are inside each card"
-            : "REFERENCE IMAGES — double-click a thumbnail to edit";
+            : "GLOBAL REFERENCE IMAGES — double-click a thumbnail to edit";
     }
     if (runtime?.refsRow) {
         runtime.refsRow.style.gap = fl2vaMode ? "9px" : "7px";
@@ -5837,7 +6197,7 @@ function syncDomHeight(node, runtime, forceMin = false, retry = 0) {
         const actualH = Number(node.size?.[1] || h);
         const available = Math.max(uiMinH, actualH - y - BOTTOM_PAD);
         runtime.root.style.height = `${available}px`;
-        runtime.cards.style.height = `${Math.max(340, available - 55 - REF_SECTION_HEIGHT)}px`;
+        runtime.cards.style.height = `${Math.max(340, available - 55 - referenceSectionHeight(runtime.state))}px`;
         runtime.cards.style.flex = "0 0 auto";
         runtime.cards.style.minHeight = "";
         runtime.domHeight = available;
@@ -5873,6 +6233,8 @@ function hydrateRuntimeFromNativeWidgets(node, runtime, restoreCache = false) {
     if (runtime.motionContextWidget) runtime.motionContextWidget.value = motionContext;
 
     runtime.refsState = parseRefsState(runtime.refsWidget?.value);
+    syncLibraryFromClips(runtime);
+    runtime.refsWidget.value = serializeRefsState(runtime.refsState);
     snapshotModeValidation(runtime, mode, motionContext);
     const restoredValidatedPrefix = validatedPrefixFromState(runtime.state);
     runtime.cachedCount = restoredValidatedPrefix;
@@ -6151,15 +6513,26 @@ function buildUi(node) {
     frameFileInput.accept = "image/*,.png,.jpg,.jpeg,.webp,.bmp,.tif,.tiff";
     frameFileInput.style.display = "none";
 
+    const libraryFileInput = document.createElement("input");
+    libraryFileInput.type = "file";
+    libraryFileInput.accept = refFileInput.accept;
+    libraryFileInput.multiple = true;
+    libraryFileInput.style.display = "none";
+    libraryFileInput.addEventListener("change", async () => {
+        const files = Array.from(libraryFileInput.files || []);
+        libraryFileInput.value = "";
+        await uploadLibraryPictures(node, runtime, files);
+    });
+
     const refsSection = document.createElement("div");
-    refsSection.style.height = `${REF_SECTION_HEIGHT}px`;
+    refsSection.style.height = `${referenceSectionHeight(state)}px`;
     refsSection.style.minWidth = "0";
-    refsSection.style.flex = `0 0 ${REF_SECTION_HEIGHT}px`;
+    refsSection.style.flex = `0 0 ${referenceSectionHeight(state)}px`;
     refsSection.style.boxSizing = "border-box";
     refsSection.style.marginBottom = "7px";
 
     const refsHeader = document.createElement("div");
-    refsHeader.textContent = "REFERENCE IMAGES — double-click a thumbnail to edit";
+    refsHeader.textContent = "GLOBAL REFERENCE IMAGES — double-click a thumbnail to edit";
     refsHeader.style.fontSize = "10px";
     refsHeader.style.fontWeight = "600";
     refsHeader.style.opacity = ".75";
@@ -6180,7 +6553,52 @@ function buildUi(node) {
     refsRow.style.boxSizing = "border-box";
     refsRow.style.height = `${REF_SECTION_HEIGHT - 14}px`;
     refsRow.style.scrollbarGutter = "stable";
-    refsSection.append(refsHeader, refsRow);
+    const librarySection = document.createElement("div");
+    librarySection.style.height = `${REF_LIBRARY_HEIGHT}px`;
+    librarySection.style.boxSizing = "border-box";
+    librarySection.style.marginTop = "0";
+    const libraryHeader = document.createElement("div");
+    libraryHeader.style.display = "flex";
+    libraryHeader.style.alignItems = "center";
+    libraryHeader.style.justifyContent = "space-between";
+    libraryHeader.style.height = "22px";
+    const libraryTitle = document.createElement("strong");
+    libraryTitle.textContent = "LOCAL REFERENCE IMAGES — double-click a thumbnail to edit";
+    libraryTitle.style.fontSize = "10px";
+    const libraryAdd = document.createElement("button");
+    libraryAdd.textContent = "+ Add";
+    libraryAdd.style.height = "21px";
+    libraryAdd.style.fontSize = "10px";
+    libraryAdd.addEventListener("click", () => libraryFileInput.click());
+    libraryHeader.append(libraryTitle, libraryAdd);
+    const libraryRow = document.createElement("div");
+    libraryRow.style.display = "flex";
+    libraryRow.style.gap = "6px";
+    libraryRow.style.overflowX = "auto";
+    libraryRow.style.height = "82px";
+    libraryRow.style.border = "1px dashed rgba(255,255,255,.2)";
+    libraryRow.style.borderRadius = "5px";
+    libraryRow.style.padding = "3px";
+    libraryRow.style.boxSizing = "border-box";
+    libraryRow.addEventListener("dragover", (event) => {
+        if (!hasSystemFileDragPayload(event)) return;
+        event.preventDefault();
+        event.stopPropagation();
+        if (event.dataTransfer) event.dataTransfer.dropEffect = "copy";
+        libraryRow.style.borderColor = "rgba(150,205,255,.95)";
+    });
+    libraryRow.addEventListener("dragleave", () => {
+        libraryRow.style.borderColor = "rgba(255,255,255,.2)";
+    });
+    libraryRow.addEventListener("drop", async (event) => {
+        if (!hasSystemFileDragPayload(event)) return;
+        event.preventDefault();
+        event.stopPropagation();
+        libraryRow.style.borderColor = "rgba(255,255,255,.2)";
+        await uploadLibraryPictures(node, runtime, Array.from(event.dataTransfer?.files || []));
+    });
+    librarySection.append(libraryHeader, libraryRow);
+    refsSection.append(refsHeader, refsRow, librarySection);
 
     const cards = document.createElement("div");
     cards.style.display = "flex";
@@ -6193,10 +6611,10 @@ function buildUi(node) {
     cards.style.scrollbarGutter = "stable";
     cards.style.boxSizing = "border-box";
     cards.style.scrollBehavior = "smooth";
-    cards.style.height = `${Math.max(340, initialUiMinHeight - 55 - REF_SECTION_HEIGHT)}px`;
+    cards.style.height = `${Math.max(340, initialUiMinHeight - 55 - referenceSectionHeight(state))}px`;
     cards.style.minHeight = `${cardMinHeightForState(state) + CARD_SCROLLBAR_SPACE}px`;
 
-    root.append(toolbar, refsSection, cards, refFileInput, frameFileInput);
+    root.append(toolbar, refsSection, cards, refFileInput, frameFileInput, libraryFileInput);
 
     const restoredValidatedPrefix = validatedPrefixFromState(state);
     const runtime = {
@@ -6209,6 +6627,9 @@ function buildUi(node) {
         refsSection,
         refsHeader,
         refsRow,
+        librarySection,
+        libraryRow,
+        libraryFileInput,
         cards,
         counter,
         status,
@@ -6637,8 +7058,12 @@ app.registerExtension({
             const runtime = buildUi(node);
             if (!runtime || !detail?.refs_json) return;
 
-            runtime.refsWidget.value = String(detail.refs_json);
-            runtime.refsState = parseRefsState(detail.refs_json);
+            const bindings = managedPromptBindings(runtime);
+            const incomingRefs = parseRefsState(detail.refs_json);
+            incomingRefs.library = normalizeRefLibrary(runtime.refsState?.library);
+            runtime.refsState = incomingRefs;
+            remapManagedPrompts(runtime, bindings);
+            updateHidden(node, runtime);
             updateRefsHidden(node, runtime);
             const slots = Array.isArray(detail?.imported_slots)
                 ? detail.imported_slots.map((value) => Number(value)).filter((value) => Number.isInteger(value) && value >= 1 && value <= MAX_IMAGE_REFS)
@@ -6649,7 +7074,7 @@ app.registerExtension({
             const source = String(detail?.source || "External reference pack");
             const parts = [];
             if (slots.length) parts.push(`imported Ref ${slots.join(", ")}`);
-            if (skipped.length) parts.push(`ignored local-reserved Ref ${skipped.join(", ")}`);
+            if (skipped.length) parts.push(`skipped Ref ${skipped.join(", ")}`);
             runtime.statusText = parts.length
                 ? `${source}: ${parts.join(" • ")}`
                 : `${source}: synchronized`;
@@ -6749,8 +7174,12 @@ app.registerExtension({
                 if (runtime.motionContextWidget) runtime.motionContextWidget.value = runtime.state.motion_context;
             }
             if (info.refs_json) {
-                runtime.refsWidget.value = info.refs_json;
-                runtime.refsState = parseRefsState(info.refs_json);
+                const bindings = managedPromptBindings(runtime);
+                const incomingRefs = parseRefsState(info.refs_json);
+                incomingRefs.library = normalizeRefLibrary(runtime.refsState?.library);
+                runtime.refsState = incomingRefs;
+                remapManagedPrompts(runtime, bindings);
+                runtime.refsWidget.value = serializeRefsState(incomingRefs);
             }
     
             const generated = Array.isArray(info.generated) ? info.generated : [];

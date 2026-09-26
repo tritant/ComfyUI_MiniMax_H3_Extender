@@ -60,19 +60,20 @@ Use **Motion Context ON** when you want continuous multi-clip motion and seamles
 
 Ref2VA clips can now use their own **local Picture, Video and Audio references** in addition to the existing global references.
 
-Each clip gets a compact **Refs** panel where local references can be added, removed and previewed without cluttering the main card UI.
+Upload local images to the **Local Reference Images** strip below the global references. It accepts multiple dropped files and can hold more than nine images. In each clip's **Refs** panel, select the images that clip uses; global images appear first, followed by the selected local images in selection order.
 
-Local references use the normal H3 slot numbering and share the same limits as global references:
+The generation limits apply to each clip, not to the upload library:
 
-- up to **9 Pictures**
+- up to **9 Pictures** total (global + selected local)
 - up to **3 Videos**
 - up to **3 Audio references**
+- up to **12 mixed reference items**
 
-Global references remain global exactly as before. Local references simply use the next available slots for that clip.
+The **Refs** panel shows each image's `<Picture N>` number. Global images are numbered first; selected local images take the following numbers. Changing a clip's selection invalidates its cache and any dependent clips, while uploading an unselected image does not.
 
-If a slot is already used locally, the matching global slot is automatically reserved to avoid conflicts. References coming from a Ref Pack are also handled safely without remapping or blocking generation.
+Existing workflows and `.ext` projects with numbered local slots retain their original numbering until those clips are changed to the new selection flow.
 
-Local Pictures can be edited with the same image editor as global references, and local Video/Audio references include compact preview players directly inside the Refs panel.
+Double-click global or local images to edit them with the existing image editor. Local Video/Audio references keep their preview players inside the Refs panel.
 
 All local references are fully included in **Project Save/Load**, so they are restored automatically with the project.
 

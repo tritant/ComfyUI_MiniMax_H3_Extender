@@ -147,7 +147,7 @@ PROJECT_JSON_MAX_BYTES = 16 * 1024 * 1024
 PROJECT_DOWNLOAD_TTL_SECONDS = 2 * 60 * 60
 PROJECT_COPY_CHUNK = 8 * 1024 * 1024
 MAX_IMAGE_REFS = MAX_REFERENCE_SLOTS
-REFS_JSON_VERSION = 2
+REFS_JSON_VERSION = 3
 MAX_REF_UPLOAD_BYTES = 256 * 1024 * 1024
 MAX_LOCAL_MEDIA_UPLOAD_BYTES = 512 * 1024 * 1024
 LOCAL_REFS_VERSION = 1
@@ -364,7 +364,19 @@ def _normalize_media_descriptor(value, expected_kind=None):
 
 def _normalize_local_refs(value):
     raw = value if isinstance(value, dict) else {}
-    out = {"version": LOCAL_REFS_VERSION, "images": [], "videos": [], "audios": []}
+    out = {"version": LOCAL_REFS_VERSION, "images": [], "selected_images": None, "videos": [], "audios": []}
+    if isinstance(raw.get("selected_images"), list):
+        selected = []
+        selected_ids = set()
+        for value in raw["selected_images"]:
+            ref = _normalize_ref_descriptor(value.get("ref", value) if isinstance(value, dict) else value)
+            if ref is None or ref["id"] in selected_ids:
+                continue
+            selected.append(ref)
+            selected_ids.add(ref["id"])
+            if len(selected) >= MAX_IMAGE_REFS:
+                break
+        out["selected_images"] = selected
     seen = {"images": set(), "videos": set(), "audios": set()}
     specs = (("images", MAX_IMAGE_REFS), ("videos", MAX_VIDEO_REFS), ("audios", MAX_STANDALONE_AUDIO_REFS))
     for key, limit in specs:
@@ -390,6 +402,42 @@ def _normalize_local_refs(value):
                 out[key].append({"slot": slot, "media": payload})
             seen[key].add(slot)
     return out
+
+
+def _clip_picture_refs(refs, local_refs, clip_index):
+    selected = local_refs.get("selected_images")
+    if selected is not None:
+        packed = [ref for ref in refs if ref is not None] + selected
+        if len(packed) > MAX_IMAGE_REFS:
+            raise ValueError(
+                f"MiniMax H3 Extender: Clip {clip_index + 1} has {len(packed)} Picture references; "
+                f"maximum is {MAX_IMAGE_REFS}."
+            )
+        return packed + [None] * (MAX_IMAGE_REFS - len(packed)), True
+
+    clip_refs = list(refs)
+    local_visual = False
+    for item in local_refs.get("images", []):
+        slot = int(item["slot"])
+        if clip_refs[slot - 1] is not None:
+            _LOG.warning(
+                "H3 Extender: Clip %d local Picture %d overrides a conflicting global Picture %d for this clip.",
+                clip_index + 1,
+                slot,
+                slot,
+            )
+        clip_refs[slot - 1] = item["ref"]
+        local_visual = True
+    return clip_refs, local_visual
+
+
+def _max_selected_picture_count(clips):
+    maximum = 0
+    for cfg in clips:
+        selected = _normalize_local_refs(cfg.get("local_refs"))["selected_images"]
+        if selected is not None:
+            maximum = max(maximum, len(selected))
+    return maximum
 
 
 def _probe_media_file(path, kind):
@@ -613,6 +661,28 @@ def _refs_json(refs):
     )
 
 
+def _ref_library_from_json(raw):
+    if isinstance(raw, dict):
+        payload = raw
+    else:
+        try:
+            payload = json.loads(str(raw or "{}"))
+        except Exception:
+            payload = {}
+    library = []
+    seen = set()
+    values = payload.get("library", []) if isinstance(payload, dict) else []
+    if not isinstance(values, list):
+        values = []
+    for value in values:
+        ref = _normalize_ref_descriptor(value)
+        if ref is None or ref["id"] in seen:
+            continue
+        library.append(ref)
+        seen.add(ref["id"])
+    return library
+
+
 def _refs_signature(refs):
     ids = [ref.get("id") if isinstance(ref, dict) else None for ref in _normalize_ref_descriptors(refs)]
     raw = json.dumps(ids, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
@@ -825,7 +895,7 @@ def _local_picture_slot_reservations(clips):
     return reserved
 
 
-def _sync_refs_from_ref_pack(refs, pack, reserved_slots=None):
+def _sync_refs_from_ref_pack(refs, pack, reserved_slots=None, max_global_count=MAX_IMAGE_REFS):
     """Inject connected external slots into the existing internal Ref N slots.
 
     Empty external slots are deliberately no-ops: they never clear or compact an
@@ -854,6 +924,9 @@ def _sync_refs_from_ref_pack(refs, pack, reserved_slots=None):
                 index,
                 index,
             )
+            continue
+        if refs[index - 1] is None and _reference_count(refs) >= max_global_count:
+            skipped_slots.append(index)
             continue
         try:
             descriptor, changed = _store_external_reference(
@@ -1009,7 +1082,13 @@ def _refs_from_project_payload(project_payload):
 def _write_refs_to_project_payload(project_payload, refs):
     refs = _normalize_ref_descriptors(refs)
     extender = project_payload.setdefault("extender", {})
-    raw = _refs_json(refs)
+    settings = extender.get("settings") if isinstance(extender.get("settings"), dict) else {}
+    library = _ref_library_from_json(extender.get("refs_json") or settings.get("refs_json"))
+    raw = json.dumps(
+        {"version": REFS_JSON_VERSION, "refs": refs, "library": library},
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
     extender["refs_json"] = raw
     extender["references"] = copy.deepcopy(refs)
     settings = extender.setdefault("settings", {})
@@ -2623,13 +2702,18 @@ def _fl2va_frame_entries(project_payload):
     return entries
 
 
-def _local_ref_assets_from_clips(clips):
+def _local_ref_assets_from_clips(clips, library=None):
     image_refs = {}
     media_refs = {}
+    for ref in library or []:
+        for ref_id in (ref.get("id"), ref.get("source_id")):
+            if _ref_id_is_safe(ref_id):
+                image_refs[str(ref_id)] = ref
     for cfg in clips or []:
         local = _normalize_local_refs(cfg.get("local_refs"))
-        for item in local.get("images", []):
-            ref = item.get("ref") if isinstance(item, dict) else None
+        selected = local.get("selected_images")
+        images = selected if selected is not None else [item.get("ref") for item in local.get("images", [])]
+        for ref in images:
             if not isinstance(ref, dict):
                 continue
             for ref_id in (ref.get("id"), ref.get("source_id")):
@@ -2934,7 +3018,9 @@ def _build_project_archive(owner_id, requested_name, project_payload, output_pat
     local_image_files = []
     local_media_files = []
     project_clips = _clips_from_project_payload(project_payload)
-    local_image_refs, local_media_refs = _local_ref_assets_from_clips(project_clips)
+    local_image_refs, local_media_refs = _local_ref_assets_from_clips(
+        project_clips, _ref_library_from_json(extender_meta.get("refs_json"))
+    )
     for ref_id in sorted(local_image_refs):
         path = _ref_path(ref_id)
         if not path.exists():
@@ -3314,7 +3400,9 @@ def _import_project_archive(owner_id, archive_path):
 
             # Restore local per-clip assets. Their ids are content hashes, so the
             # clip JSON stays stable across machines and no slot remapping occurs.
-            local_image_refs, local_media_refs = _local_ref_assets_from_clips(clips)
+            local_image_refs, local_media_refs = _local_ref_assets_from_clips(
+                clips, _ref_library_from_json(project_payload.get("extender", {}).get("refs_json"))
+            )
             for ref_id in sorted(local_image_refs):
                 member = f"local_refs/images/{ref_id}.png"
                 if member not in names:
@@ -4817,10 +4905,12 @@ class MiniMaxH3Extender:
         refs = _parse_refs_json(refs_json)
         external_ref_pack = _normalize_external_ref_pack(ref_pack)
         local_picture_slots = _local_picture_slot_reservations(clips)
+        max_selected_pictures = _max_selected_picture_count(clips)
         refs, ref_pack_imported_slots, ref_pack_skipped_slots = _sync_refs_from_ref_pack(
             refs,
             external_ref_pack,
             local_picture_slots,
+            MAX_IMAGE_REFS - max_selected_pictures,
         )
         if (ref_pack_imported_slots or ref_pack_skipped_slots) and external_ref_pack is not None:
             _send_extender_ref_pack_import(
@@ -5074,27 +5164,11 @@ class MiniMaxH3Extender:
 
             frame_count = _duration_to_frames(cfg["duration"])
 
-            # Global references keep their historical semantics. Local references
-            # are clip-only additions that occupy still-free logical Picture/Video/Audio
-            # slots; they never replace/remap a global slot silently.
             local_refs = _normalize_local_refs(cfg.get("local_refs"))
-            clip_refs = list(refs)
+            clip_refs, local_visual = _clip_picture_refs(refs, local_refs, i)
             clip_ref_videos = list(ref_videos)
             clip_ref_video_fps = list(ref_video_fps)
             clip_ref_video_audios = list(ref_video_audios)
-
-            local_visual = False
-            for item in local_refs.get("images", []):
-                slot = int(item["slot"])
-                if clip_refs[slot - 1] is not None:
-                    _LOG.warning(
-                        "H3 Extender: Clip %d local Picture %d overrides a conflicting global Picture %d for this clip.",
-                        i + 1,
-                        slot,
-                        slot,
-                    )
-                clip_refs[slot - 1] = item["ref"]
-                local_visual = True
 
             for item in local_refs.get("videos", []):
                 slot = int(item["slot"])
@@ -5165,7 +5239,12 @@ class MiniMaxH3Extender:
                     ref_video_audios=clip_ref_video_audios,
                     standalone_audio_count=0,
                     frame_count=frame_count,
+                    cached_image_blocks=(
+                        prepared_image_blocks if local_refs.get("selected_images") is not None else None
+                    ),
                 )
+                if local_refs.get("selected_images") is not None and prepared_image_blocks is None:
+                    prepared_image_blocks = list(clip_base_blocks[:_reference_count(refs)])
             else:
                 needs_ref_prepare = (
                     ref_items is None
@@ -5433,7 +5512,7 @@ class MiniMaxH3Extender:
                 details.append(f"imported Ref {imported_text}")
             if ref_pack_skipped_slots:
                 skipped_text = ",".join(str(i) for i in ref_pack_skipped_slots)
-                details.append(f"ignored local-reserved Ref {skipped_text}")
+                details.append(f"skipped Ref {skipped_text}")
             ref_pack_text = f" | ref pack {connected_ref_count} linked"
             if details:
                 ref_pack_text += ", " + "; ".join(details)
