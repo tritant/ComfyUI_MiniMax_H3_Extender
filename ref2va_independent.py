@@ -607,8 +607,9 @@ def run(
     refs = e._parse_refs_json(refs_json)
     external_ref_pack = e._normalize_external_ref_pack(ref_pack)
     local_picture_slots = e._local_picture_slot_reservations(clips)
+    max_selected_pictures = e._max_selected_picture_count(clips)
     refs, ref_pack_imported_slots, ref_pack_skipped_slots = e._sync_refs_from_ref_pack(
-        refs, external_ref_pack, local_picture_slots
+        refs, external_ref_pack, local_picture_slots, e.MAX_IMAGE_REFS - max_selected_pictures
     )
     if (ref_pack_imported_slots or ref_pack_skipped_slots) and external_ref_pack is not None:
         e._send_extender_ref_pack_import(
@@ -783,21 +784,10 @@ def run(
         frame_count = e._duration_to_frames(cfg["duration"])
 
         local_refs = e._normalize_local_refs(cfg.get("local_refs"))
-        clip_refs = list(refs)
+        clip_refs, local_visual = e._clip_picture_refs(refs, local_refs, i)
         clip_ref_videos = list(ref_videos)
         clip_ref_video_fps = list(ref_video_fps)
         clip_ref_video_audios = list(ref_video_audios)
-
-        local_visual = False
-        for item in local_refs.get("images", []):
-            slot = int(item["slot"])
-            if clip_refs[slot - 1] is not None:
-                e._LOG.warning(
-                    "H3 Extender: Clip %d local Picture %d overrides a conflicting global Picture %d for this clip.",
-                    i + 1, slot, slot,
-                )
-            clip_refs[slot - 1] = item["ref"]
-            local_visual = True
 
         for item in local_refs.get("videos", []):
             slot = int(item["slot"])
@@ -854,7 +844,12 @@ def run(
                 ref_video_audios=clip_ref_video_audios,
                 standalone_audio_count=0,
                 frame_count=frame_count,
+                cached_image_blocks=(
+                    prepared_image_blocks if local_refs.get("selected_images") is not None else None
+                ),
             )
+            if local_refs.get("selected_images") is not None and prepared_image_blocks is None:
+                prepared_image_blocks = list(clip_base_blocks[:e._reference_count(refs)])
         else:
             needs_ref_prepare = (
                 ref_items is None
@@ -1082,7 +1077,7 @@ def run(
         if ref_pack_imported_slots:
             details.append("imported Ref " + ",".join(str(x) for x in ref_pack_imported_slots))
         if ref_pack_skipped_slots:
-            details.append("ignored local-reserved Ref " + ",".join(str(x) for x in ref_pack_skipped_slots))
+            details.append("skipped Ref " + ",".join(str(x) for x in ref_pack_skipped_slots))
         ref_pack_text = f" | ref pack {connected_ref_count} linked"
         if details:
             ref_pack_text += ", " + "; ".join(details)
