@@ -31,9 +31,10 @@ class Autosave(unittest.TestCase):
         self.root = Path(self.tmp.name)
         self.ns = dict(math=math, copy=copy, functools=functools, inspect=inspect, json=json, os=os, Path=Path, uuid=uuid,
                        DEFAULT_SEED_MAX=2**53-1)
-        tree = load_functions('extender.py', {'_capture_full_batch_project', '_auto_save_full_batch_project', '_restore_project_generation_seeds', '_generation_mode_from_project_payload'}, self.ns)
-        assignment = next(n for n in tree.body if isinstance(n, ast.Assign) and any(isinstance(t, ast.Name) and t.id == 'PROJECT_SETTING_NAMES' for t in n.targets))
-        exec(compile(ast.Module(body=[assignment], type_ignores=[]), 'settings', 'exec'), self.ns)
+        tree = load_functions('extender.py', {'_capture_full_batch_project', '_auto_save_full_batch_project', '_restore_project_generation_seeds', '_generation_mode_from_project_payload', '_validated_manual_canvas'}, self.ns)
+        for name in ('PROJECT_SETTING_NAMES', 'CANVAS_MULTIPLE', 'MAX_RESOLUTION'):
+            assignment = next(n for n in tree.body if isinstance(n, ast.Assign) and any(isinstance(t, ast.Name) and t.id == name for t in n.targets))
+            exec(compile(ast.Module(body=[assignment], type_ignores=[]), 'settings', 'exec'), self.ns)
         load_functions('fl2va_engine.py', {'normalize_mode'}, self.ns)
         self.ns['_normalize_generation_mode'] = self.ns['normalize_mode']
         self.ns['_clips_from_project_payload'] = lambda p: json.loads(p['extender']['clips_json'])['clips']
@@ -133,6 +134,28 @@ class Autosave(unittest.TestCase):
         for invalid in [{'width': -1, 'height': '640'}, {'width': 33, 'height': None}, []]:
             payload = self.capture(manual=invalid)['project_snapshot']['project']['extender']
             self.assertEqual((payload['settings']['width'], payload['settings']['height']), (896, 576))
+
+    def test_manual_fallback_is_accepted_or_rejected_as_one_canvas(self):
+        # The Manual fallback is a single canvas. A half-valid pair must never
+        # graft one manual axis onto the other axis of the auto canvas.
+        for manual in [{'width': 1024, 'height': 500}, {'width': 500, 'height': 640},
+                       {'width': 1024}, {'height': 640}, {'width': 1024, 'height': None}]:
+            payload = self.capture(manual=manual)['project_snapshot']['project']['extender']
+            self.assertEqual(
+                (payload['settings']['width'], payload['settings']['height']),
+                (896, 576),
+                manual,
+            )
+            self.assertEqual(
+                (payload['resolution']['manual_width'], payload['resolution']['manual_height']),
+                (896, 576),
+                manual,
+            )
+            self.assertEqual(
+                (payload['resolution']['resolved_width'], payload['resolution']['resolved_height']),
+                (896, 576),
+                manual,
+            )
 
     def test_queued_snapshots_do_not_share_mutable_settings(self):
         first, second = self.capture(seed=10), self.capture(seed=11)

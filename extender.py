@@ -263,6 +263,32 @@ def _manual_effective_resolution(width: int, height: int):
     return w, h
 
 
+def _validated_manual_canvas(manual):
+    """Return the archived Manual fallback canvas, or None when it is unusable.
+
+    The Manual fallback is one canvas, so both axes are accepted or rejected
+    together. A pair that only satisfies one axis is rejected as a whole: an
+    archived project must never mix a manual axis with the axis of the auto
+    canvas it was rendered with.
+    """
+    if not isinstance(manual, dict):
+        return None
+    size = []
+    for dimension in ("width", "height"):
+        value = manual.get(dimension)
+        if type(value) not in (int, float):
+            return None
+        if not math.isfinite(value) or value != int(value):
+            return None
+        pixels = int(value)
+        if pixels < CANVAS_MULTIPLE or pixels > MAX_RESOLUTION:
+            return None
+        if pixels % CANVAS_MULTIPLE != 0:
+            return None
+        size.append(pixels)
+    return size[0], size[1]
+
+
 def _auto_resolution_from_dimensions(src_w: int, src_h: int, megapixels: float):
     """Auto resolution on H3's 32-pixel grid without exceeding the MP budget.
 
@@ -4875,13 +4901,14 @@ def _capture_full_batch_project(function):
             settings["refs_json"] = state["refs_json"]
         # The Auto width/height widgets mirror the generated canvas. The UI
         # serializes its separate Manual fallback with this exact queued job.
+        # That fallback is a single canvas: it is applied to both axes at once
+        # so a half-valid pair can never be stored as a mixed manual/auto size.
         try:
             submitted = json.loads(inputs.get("clips_json") or "{}")
             manual = submitted.get("project_manual_resolution", {})
-            for dimension in ("width", "height"):
-                value = manual.get(dimension)
-                if type(value) in (int, float) and math.isfinite(value) and value == int(value) and 32 <= value <= 4096 and int(value) % 32 == 0:
-                    settings[dimension] = int(value)
+            manual_canvas = _validated_manual_canvas(manual)
+            if manual_canvas is not None:
+                settings["width"], settings["height"] = manual_canvas
         except (ValueError, TypeError, AttributeError):
             pass  # Legacy/API jobs retain their supplied width/height fallback.
         mode = str(state.get("generation_mode") or settings["generation_mode"])
