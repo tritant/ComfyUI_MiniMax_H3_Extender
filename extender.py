@@ -105,7 +105,7 @@ from .ref2va_independent import (
     run as _run_ref2va_independent,
 )
 
-BUILD = "minimax-h3-extender-v3.0.12"
+BUILD = "minimax-h3-extender-v3.0.13"
 _LOG = logging.getLogger(__name__)
 FPS = 24
 AUDIO_LATENT_FPS = 40
@@ -4901,8 +4901,6 @@ def _capture_full_batch_project(function):
             settings["refs_json"] = state["refs_json"]
         # The Auto width/height widgets mirror the generated canvas. The UI
         # serializes its separate Manual fallback with this exact queued job.
-        # That fallback is a single canvas: it is applied to both axes at once
-        # so a half-valid pair can never be stored as a mixed manual/auto size.
         try:
             submitted = json.loads(inputs.get("clips_json") or "{}")
             manual = submitted.get("project_manual_resolution", {})
