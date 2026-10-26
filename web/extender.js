@@ -4947,7 +4947,19 @@ async function saveProject(node, runtime) {
     }
 
     const suggested = runtime.projectName || "MiniMax_H3_Project";
-    const requested = prompt("Project name (.ext)", suggested);
+    // ComfyUI Desktop/Electron does not support window.prompt(). Use the
+    // frontend dialog API; retain the browser fallback for older frontends.
+    const nativePrompt = app.extensionManager?.dialog?.prompt;
+    let requested;
+    if (typeof nativePrompt === "function") {
+        requested = await nativePrompt.call(app.extensionManager.dialog, {
+            title: "Save Project",
+            message: "Project name (.ext)",
+            defaultValue: suggested,
+        });
+    } else {
+        requested = window.prompt("Project name (.ext)", suggested);
+    }
     if (requested == null) return;
     const projectName = String(requested || suggested).trim() || suggested;
 
