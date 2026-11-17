@@ -50,14 +50,25 @@ function stripFinalDecodeOutputs(node) {
     if (!node) return;
 
     // Old workflows may still serialize the nine historical Final Decode
-    // outputs. Since v2.1 the node intentionally exposes one native VIDEO
-    // output, so only remove legacy sockets and preserve that one.
+    // outputs. Since v3.0.7 the node intentionally exposes exactly two
+    // outputs: the native VIDEO plus the VIDEO_EDITOR_BATCH bridge. Remove
+    // only legacy sockets and preserve one socket of each supported type.
     let keptVideo = false;
+    let keptEditorBatch = false;
     for (let index = (node.outputs?.length || 0) - 1; index >= 0; index--) {
         const output = node.outputs[index];
-        const isVideo =
-            String(output?.type || "").toUpperCase() === "VIDEO" ||
-            String(output?.name || "").toLowerCase() === "video";
+        const outputType = String(output?.type || "").toUpperCase();
+        const outputName = String(output?.name || "").toLowerCase();
+        const isVideo = outputType === "VIDEO" || outputName === "video";
+        const isEditorBatch =
+            outputType === "VIDEO_EDITOR_BATCH" || outputName === "editor_batch";
+
+        if (isEditorBatch && !keptEditorBatch) {
+            keptEditorBatch = true;
+            output.name = "editor_batch";
+            output.type = "VIDEO_EDITOR_BATCH";
+            continue;
+        }
 
         if (isVideo && !keptVideo) {
             keptVideo = true;
@@ -75,9 +86,13 @@ function stripFinalDecodeOutputs(node) {
     }
 
     // Defensive recovery for workflow/configure paths where LiteGraph restored
-    // legacy sockets after the Python node definition was applied.
+    // legacy sockets after the Python node definition was applied. Keep the
+    // Python RETURN_TYPES order: VIDEO first, VIDEO_EDITOR_BATCH second.
     if (!keptVideo && typeof node.addOutput === "function") {
         node.addOutput("video", "VIDEO");
+    }
+    if (!keptEditorBatch && typeof node.addOutput === "function") {
+        node.addOutput("editor_batch", "VIDEO_EDITOR_BATCH");
     }
 
     node.graph?.setDirtyCanvas(true, true);
