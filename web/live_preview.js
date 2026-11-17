@@ -839,7 +839,7 @@ function makePlayer(node) {
 
     const relayButton = document.createElement("button");
     relayButton.type = "button";
-    relayButton.textContent = "UPScALE ×2";
+    relayButton.textContent = "UPSCALE ×2";
     relayButton.className = "h3-save-preview-button";
     relayButton.title = "Switch between the completed H3 original and its RelayVSR ×2 result";
     relayButton.style.flex = "0 0 auto";
@@ -1090,7 +1090,19 @@ app.registerExtension({
                 if (!(node?.comfyClass === TARGET || node?.type === TARGET)) continue;
                 if (String(findUpstreamExtenderId(node)) !== String(ownerId)) continue;
                 const state = makePlayer(node);
-                state.colorTimeline = timeline;
+                const changed = JSON.stringify(state.originalColorTimeline || []) !== JSON.stringify(timeline);
+                state.originalColorTimeline = timeline;
+                state.colorTimeline = state.previewVariant === "upscale" ? [] : timeline;
+                // A fresh manual color edit makes the previously rendered x2
+                // movie stale. Do not keep offering it beside the new original.
+                if (changed && state.relayVideoInfo?.filename) {
+                    state.relayVideoInfo = null;
+                    if (state.previewVariant === "upscale") {
+                        applyPreviewVariant(node, state, "original");
+                    } else {
+                        state.relayButton.style.display = "none";
+                    }
+                }
                 syncPreviewColorFilter(state);
             }
         });
