@@ -105,7 +105,7 @@ from .ref2va_independent import (
     run as _run_ref2va_independent,
 )
 
-BUILD = "minimax-h3-extender-v3.0.15"
+BUILD = "minimax-h3-extender-v3.1.0-RelayVSR-DEV"
 _LOG = logging.getLogger(__name__)
 FPS = 24
 AUDIO_LATENT_FPS = 40
@@ -3982,6 +3982,35 @@ def _build_project_archive(owner_id, requested_name, project_payload, output_pat
             )
         local_media_files.append((media_id, media, path))
 
+    final_settings = (project_payload.get("final_decode") or {})
+    final_settings = final_settings.get("settings", {}) if isinstance(final_settings, dict) else {}
+    relay_requested_for_project = bool(
+        isinstance(final_settings, dict)
+        and final_settings.get("relayvsr_x2", False)
+        and final_settings.get("relayvsr_cache_allowed", True)
+    )
+    try:
+        expected_relay_detail = float(final_settings.get("relayvsr_detail", 50)) / 100.0
+    except (ValueError, TypeError):
+        expected_relay_detail = 0.5
+    # Capture validity BEFORE compaction, which can rewrite the same H3 latent
+    # content at new offsets without changing any resulting video frames.
+    from .relayvsr_final import (
+        relay_cache_is_current, _h3_cache_identity, _h3_semantic_signature,
+    )
+    cache_owner = _project_cache_owner_id(owner_id, generation_mode, motion_context)
+    pre_compact_data, _ = _chain_paths(cache_owner)
+    relay_was_current = bool(
+        relay_requested_for_project and relay_cache_is_current(
+            pre_compact_data, expected_detail=expected_relay_detail
+        )
+    )
+    pre_compact_manifest = _load_manifest_from_paths(*_chain_paths(cache_owner)) if relay_was_current else None
+    pre_compact_semantics = (
+        _h3_semantic_signature(pre_compact_manifest)
+        if isinstance(pre_compact_manifest, dict) else None
+    )
+
     # FL2VA random-access editing is append-only for speed. Save Project is the
     # natural point to force compaction so both the live cache and portable .ext
     # contain only currently referenced latent/PCM blobs.
@@ -4001,6 +4030,20 @@ def _build_project_archive(owner_id, requested_name, project_payload, output_pat
             print(f"[WARNING] MiniMax H3 Extender: independent Ref2VA Save Project compaction skipped: {exc}")
 
     snapshot = _project_cache_snapshot(owner_id, project_payload)
+    # The physical cache may have been compacted by Save Project. Its byte
+    # offsets/mtime changed, but its clips are the same. Rebind ONLY a Relay
+    # cache proven valid immediately before that compaction.
+    if (relay_was_current and snapshot is not None and pre_compact_semantics
+            and pre_compact_semantics == _h3_semantic_signature(snapshot["manifest"])):
+        relay_video_path, relay_meta_path = _project_relay_cache_paths(snapshot["data_path"])
+        try:
+            relay_metadata_before = json.loads(relay_meta_path.read_text(encoding="utf-8"))
+            rebinding = _h3_cache_identity(snapshot["data_path"], snapshot["manifest"])
+            if relay_metadata_before.get("h3_state") != rebinding:
+                relay_metadata_before["h3_state"] = rebinding
+                _write_json_atomic(relay_meta_path, relay_metadata_before)
+        except (OSError, ValueError, TypeError) as exc:
+            print(f"[WARNING] MiniMax H3 Extender: unable to rebind RelayVSR after compaction: {exc}")
     if snapshot is not None:
         _restore_project_generation_seeds(project_payload, snapshot["manifest"])
     continuity_files = (
@@ -4035,6 +4078,19 @@ def _build_project_archive(owner_id, requested_name, project_payload, output_pat
             final_dir = Path(snapshot["data_path"]).with_suffix(".final.video")
             if final_dir.exists():
                 final_video_files = sorted([p for p in final_dir.iterdir() if p.is_file()])
+
+    relay_video = None
+    relay_sidecar = None
+    relay_metadata = None
+    if snapshot is not None and relay_requested_for_project:
+        candidate_video, candidate_sidecar = _project_relay_cache_paths(snapshot["data_path"])
+        if relay_cache_is_current(
+            snapshot["data_path"], snapshot["manifest"], expected_detail=expected_relay_detail
+        ):
+            relay_video, relay_sidecar = candidate_video, candidate_sidecar
+            relay_metadata = json.loads(relay_sidecar.read_text(encoding="utf-8"))
+        else:
+            print("[INFO] MiniMax H3 Extender: skipping stale/missing RelayVSR cache in portable project.")
 
     if snapshot is not None:
         cache_resolution = _base_resolution_from_manifest(snapshot.get("manifest"))
@@ -4073,6 +4129,14 @@ def _build_project_archive(owner_id, requested_name, project_payload, output_pat
             "has_committed_preview": bool(snapshot and snapshot["preview_path"].exists()),
             "has_portable_full_preview": bool(snapshot and snapshot.get("preview_is_full", False)),
             "has_decoded_audio_cache": bool(snapshot and int(snapshot.get("audio_limit", 0)) > 0),
+            "relayvsr_x2": {
+                "present": bool(relay_video is not None and relay_sidecar is not None),
+                "video": "cache/relayvsr_x2.mp4" if relay_video is not None and relay_sidecar is not None else "",
+                "meta": "cache/relayvsr_x2.json" if relay_video is not None and relay_sidecar is not None else "",
+                "detail": (
+                    None if relay_metadata is None else float(relay_metadata.get("detail", 0.5))
+                ),
+            },
             "final_video_files": [
                 f"cache/final_video/{path.name}" for path in final_video_files
             ],
@@ -4154,6 +4218,18 @@ def _build_project_archive(owner_id, requested_name, project_payload, output_pat
                 compress_type=zipfile.ZIP_STORED,
             )
 
+        if relay_video is not None and relay_sidecar is not None:
+            zf.write(
+                relay_video,
+                arcname="cache/relayvsr_x2.mp4",
+                compress_type=zipfile.ZIP_STORED,
+            )
+            zf.write(
+                relay_sidecar,
+                arcname="cache/relayvsr_x2.json",
+                compress_type=zipfile.ZIP_DEFLATED,
+            )
+
         if snapshot is not None:
             manifest_bytes = json.dumps(
                 snapshot["manifest"],
@@ -4205,6 +4281,11 @@ def _zip_copy_member(zf, member_name, destination):
         os.fsync(dst.fileno())
 
 
+def _project_relay_cache_paths(data_path):
+    root = Path(data_path)
+    return root.with_suffix(".relayvsr_x2.mp4"), root.with_suffix(".relayvsr_x2.json")
+
+
 def _replace_cache_transaction(
     owner_id,
     new_data=None,
@@ -4212,6 +4293,8 @@ def _replace_cache_transaction(
     new_preview=None,
     new_audio=None,
     new_final_video_dir=None,
+    new_relay_video=None,
+    new_relay_sidecar=None,
     generation_mode="ref2va",
     motion_context=True,
 ):
@@ -4222,6 +4305,7 @@ def _replace_cache_transaction(
     target_preview = _decoded_preview_cache_path(target_data)
     target_preview_video = _decoded_preview_video_cache_path(target_data)
     target_audio = _decoded_audio_cache_path(target_data)
+    target_relay_video, target_relay_sidecar = _project_relay_cache_paths(target_data)
     target_fl2va_video_dir = target_data.with_suffix(".fl2va.video")
     target_ref2va_final_video_dir = target_data.with_suffix(".final.video")
     target_final_video_dir = (
@@ -4229,8 +4313,12 @@ def _replace_cache_transaction(
     )
     # The video-only preview prefix is derived and is intentionally not stored
     # in .ext. The decoded-audio cache is primary cache data and is restored
-    # together with the latent chain when present.
-    targets = [target_data, target_manifest, target_preview, target_preview_video, target_audio]
+    # together with the latent chain when present. RelayVSR belongs to this
+    # project-specific cache too, so loading another project replaces it.
+    targets = [
+        target_data, target_manifest, target_preview, target_preview_video, target_audio,
+        target_relay_video, target_relay_sidecar,
+    ]
     backups = []
     token = uuid.uuid4().hex[:10]
 
@@ -4262,6 +4350,10 @@ def _replace_cache_transaction(
                 for source in Path(new_final_video_dir).iterdir():
                     if source.is_file():
                         os.replace(str(source), target_final_video_dir / source.name)
+            if new_relay_video is not None and Path(new_relay_video).exists():
+                os.replace(str(new_relay_video), target_relay_video)
+            if new_relay_sidecar is not None and Path(new_relay_sidecar).exists():
+                os.replace(str(new_relay_sidecar), target_relay_sidecar)
         # No imported cache means an intentionally empty project. The old cache
         # remains only in backups until this transaction succeeds.
     except Exception:
@@ -4296,6 +4388,8 @@ def _import_project_archive(owner_id, archive_path):
     new_audio = work_root / "chain.audio.h3cache"
     new_preview = work_root / "chain.preview.mp4"
     new_final_video_dir = work_root / "final_video"
+    new_relay_video = work_root / "relayvsr_x2.mp4"
+    new_relay_sidecar = work_root / "relayvsr_x2.json"
     continuity_restore = []
 
     try:
@@ -4328,6 +4422,16 @@ def _import_project_archive(owner_id, archive_path):
             project_payload = archive_meta.get("project", {})
             if not isinstance(project_payload, dict):
                 raise ValueError("MiniMax H3 Extender Project: invalid project metadata.")
+            loaded_final = project_payload.get("final_decode")
+            loaded_final_settings = loaded_final.get("settings") if isinstance(loaded_final, dict) else None
+            loaded_relay_requested = bool(
+                isinstance(loaded_final_settings, dict)
+                and loaded_final_settings.get("relayvsr_x2", False)
+            )
+            try:
+                loaded_relay_detail = float((loaded_final_settings or {}).get("relayvsr_detail", 50)) / 100.0
+            except (ValueError, TypeError):
+                loaded_relay_detail = 0.5
             generation_mode = _generation_mode_from_project_payload(project_payload)
             motion_context = _motion_context_from_project_payload(project_payload)
             random_access = generation_mode == "fl2va" or (generation_mode == "ref2va" and not motion_context)
@@ -4580,9 +4684,47 @@ def _import_project_archive(owner_id, archive_path):
                             )
                         _zip_copy_member(zf, member, new_final_video_dir / base)
 
+                relay_video_member = "cache/relayvsr_x2.mp4"
+                relay_meta_member = "cache/relayvsr_x2.json"
+                relay_meta = None
+                if loaded_relay_requested and relay_video_member in names and relay_meta_member in names:
+                    relay_info = zf.getinfo(relay_video_member)
+                    meta_info = zf.getinfo(relay_meta_member)
+                    if 0 < int(relay_info.file_size) and 0 < int(meta_info.file_size) <= 256 * 1024:
+                        _zip_copy_member(zf, relay_meta_member, new_relay_sidecar)
+                        try:
+                            relay_meta = json.loads(new_relay_sidecar.read_text(encoding="utf-8"))
+                            if (not isinstance(relay_meta, dict)
+                                    or int(relay_meta.get("format", 0) or 0) != 1
+                                    or not re.fullmatch(r"[0-9a-f]{64}", str(relay_meta.get("source_sha256", "")))
+                                    or not isinstance(relay_meta.get("h3_state"), dict)
+                                    or abs(float(relay_meta.get("detail", -1)) - loaded_relay_detail) > 1e-8):
+                                relay_meta = None
+                        except (OSError, ValueError, TypeError):
+                            relay_meta = None
+                        if relay_meta is not None:
+                            _zip_copy_member(zf, relay_video_member, new_relay_video)
+                # Older .ext files can have unbound Relay sidecars. The H3
+                # project remains loadable; only the unverifiable upscale is
+                # discarded rather than silently attached to the wrong video.
+                if relay_meta is None:
+                    new_relay_video.unlink(missing_ok=True)
+                    new_relay_sidecar.unlink(missing_ok=True)
+
                 imported_manifest = _load_manifest_from_paths(new_data, new_manifest)
                 if imported_manifest is None:
                     raise ValueError("MiniMax H3 Extender Project: cache manifest is empty.")
+
+                if new_relay_video.exists() and new_relay_sidecar.exists():
+                    from .relayvsr_final import _h3_cache_identity
+                    state = _h3_cache_identity(new_data, imported_manifest)
+                    # The original .ext may contain an H3 prefix only, and its
+                    # mtime is necessarily different after extraction. Compare
+                    # the logical H3 source signature before normalizing ids.
+                    if relay_meta.get("h3_state", {}).get("manifest_sha256") != state["manifest_sha256"]:
+                        new_relay_video.unlink(missing_ok=True)
+                        new_relay_sidecar.unlink(missing_ok=True)
+                        print("[WARNING] MiniMax H3 Extender: discarded stale RelayVSR from portable project.")
 
                 imported_segments = [dict(x) for x in imported_manifest.get("segments", [])]
                 needs_audio_cache = any(
@@ -4635,6 +4777,17 @@ def _import_project_archive(owner_id, archive_path):
                 imported_manifest["imported_at"] = time.time()
                 imported_manifest["updated_at"] = time.time()
                 _write_json_atomic(new_manifest, imported_manifest)
+                if new_relay_video.exists() and new_relay_sidecar.exists():
+                    # Do not rebind if the imported timeline was legitimately
+                    # shortened/reordered while normalizing the project.
+                    post_import_state = _h3_cache_identity(new_data, imported_manifest)
+                    if relay_meta["h3_state"]["manifest_sha256"] != post_import_state["manifest_sha256"]:
+                        new_relay_video.unlink(missing_ok=True)
+                        new_relay_sidecar.unlink(missing_ok=True)
+                    else:
+                        relay_meta["h3_state"] = post_import_state
+                        relay_meta.pop("h3_original_output", None)
+                        _write_json_atomic(new_relay_sidecar, relay_meta)
 
                 imported_resolution = _base_resolution_from_manifest(imported_manifest)
                 if imported_resolution is not None:
@@ -4751,6 +4904,9 @@ def _import_project_archive(owner_id, archive_path):
 
             _restore_project_generation_seeds(project_payload, imported_manifest)
 
+            restored_relay_present = bool(
+                imported_manifest is not None and new_relay_video.exists() and new_relay_sidecar.exists()
+            )
             _replace_cache_transaction(
                 owner_id,
                 new_data if imported_manifest is not None else None,
@@ -4760,6 +4916,16 @@ def _import_project_archive(owner_id, archive_path):
                 new_final_video_dir=(
                     new_final_video_dir
                     if imported_manifest is not None and new_final_video_dir.exists()
+                    else None
+                ),
+                new_relay_video=(
+                    new_relay_video
+                    if imported_manifest is not None and new_relay_video.exists()
+                    else None
+                ),
+                new_relay_sidecar=(
+                    new_relay_sidecar
+                    if imported_manifest is not None and new_relay_sidecar.exists()
                     else None
                 ),
                 generation_mode=generation_mode,
@@ -4868,6 +5034,7 @@ def _import_project_archive(owner_id, archive_path):
                     "frame_count": int(imported_manifest.get("final_frame_count", 0)) if imported_manifest else 0,
                     "resolved_width": int(loaded_resolution["width"]) if loaded_resolution else 0,
                     "resolved_height": int(loaded_resolution["height"]) if loaded_resolution else 0,
+                    "relayvsr_x2_present": restored_relay_present,
                 },
             }
     finally:

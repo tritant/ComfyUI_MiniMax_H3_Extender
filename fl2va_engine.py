@@ -1826,6 +1826,7 @@ def export_fl2va_final(
                     "preview_frames": expected_frames,
                     "total_clips": len(segments),
                     "autosave_path": str(autosave_path),
+                    "relay_source_path": str(autosave_path),
                     "color_timeline": color_timeline,
                     "color_preview_baked": False,
                 }],
@@ -2010,9 +2011,6 @@ def export_fl2va_final(
     )
 
     d._embed_final_metadata_in_place(output_path, workflow=workflow, prompt=prompt)
-    project_autosave_info = d._maybe_auto_save_project(
-        cache, output_path, unique_id, project_autosave_settings, len(segments), expected_frames
-    )
     progress.advance()
     d._LOG.info(
         "FL2VA incremental Full Decode: clips=%d frames=%d interrupted=%s video=%s output=%s",
@@ -2024,7 +2022,6 @@ def export_fl2va_final(
         "ui": {
             "h3_video": [item],
             "h3_preview_info": [{
-                **project_autosave_info,
                 **individual_export_info,
                 "mode": "fl2va_full_batch_incremental",
                 "clip": len(segments),
@@ -2034,6 +2031,7 @@ def export_fl2va_final(
                 "interrupted": bool(interrupted),
                 "cache_mode": "decoded_plans_incremental",
                 "final_video_mode": str(final_video_mode),
+                "relay_source_path": str(output_path),
                 "color_timeline": color_timeline,
                 "color_preview_baked": False,
             }],

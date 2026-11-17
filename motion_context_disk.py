@@ -61,7 +61,7 @@ from .motion_context_ram import (
     _streams_from_latent,
 )
 
-BUILD = "motion-context-disk-v3.0.15"
+BUILD = "motion-context-disk-v3.1.0-RelayVSR-DEV"
 PREVIEW_AUDIO_MODE = "pcm_single_aac_gain_chain_v3_entry_ramp"
 CACHE_VERSION = 12
 PREVIEW_ROTATION_SLOTS = 3
@@ -5497,8 +5497,13 @@ if web is not None and PromptServer is not None and getattr(PromptServer, "insta
                     {"ok": False, "error": "Save Preview only accepts the Extender temp preview."},
                     status=400,
                 )
-            if Path(filename).name != filename or not re.fullmatch(
-                r"h3_motion_preview_[A-Za-z0-9._-]+_[0-2]\.mp4", filename
+            relay_preview = bool(re.fullmatch(
+                r"h3_motion_preview_[A-Za-z0-9._-]+_relay_[0-2]\.mp4", filename
+            ))
+            if Path(filename).name != filename or not (
+                relay_preview or re.fullmatch(
+                    r"h3_motion_preview_[A-Za-z0-9._-]+_[0-2]\.mp4", filename
+                )
             ):
                 return web.json_response(
                     {"ok": False, "error": "Invalid H3 preview filename."}, status=400
@@ -5518,7 +5523,7 @@ if web is not None and PromptServer is not None and getattr(PromptServer, "insta
             workflow = body.get("workflow")
             prompt = body.get("prompt")
             color_timeline = None
-            if owner_id:
+            if owner_id and not relay_preview:
                 try:
                     generation_mode = str(body.get("generation_mode") or "ref2va").lower()
                     motion_context = _request_bool(body.get("motion_context"), True)
@@ -5665,9 +5670,23 @@ if web is not None and PromptServer is not None and getattr(PromptServer, "insta
                 restored_segments,
                 float(manifest.get("fps", FPS)) if manifest else FPS,
             )
+            # Never republish a Relay cache when the Final Decode widget is OFF.
+            # Merely restoring a project must not delete anything on disk.
+            relay_enabled = _request_bool(request.query.get("relay_enabled"), False)
+            try:
+                relay_detail = float(request.query.get("relay_detail", "50")) / 100.0
+            except (TypeError, ValueError):
+                relay_detail = 0.5
+            relay_item = (
+                _restore_relay_preview_item(
+                    final_id, restored["fps"], data_path, manifest, expected_detail=relay_detail
+                )
+                if relay_enabled else None
+            )
             return web.json_response({
                 "found": True,
                 "video": item,
+                "relay_video": relay_item,
                 "clip_count": restored["clip_count"],
                 "frame_count": restored["frame_count"],
                 "cache_mode": restored["cache_mode"],
@@ -5702,6 +5721,168 @@ def _maybe_auto_save_project(cache, output_path, final_id, settings, clip_count,
         return {"project_autosave_error": str(exc)}
 
 
+
+def _relay_preview_temp_path(final_id, source):
+    """Browser preview independent of the 3 original preview rotation slots."""
+    root = _preview_temp_root()
+    root.mkdir(parents=True, exist_ok=True)
+    safe_id = _safe_name(final_id)
+    candidates = [root / f"h3_motion_preview_{safe_id}_relay_{slot}.mp4" for slot in range(3)]
+    newest = sorted(candidates, key=lambda p: p.stat().st_mtime if p.exists() else -1)
+    # Prefer a currently missing slot, then replace the oldest. On Windows a
+    # browser-opened file may be locked: try the next slot instead.
+    for path in newest:
+        staged = path.with_name(path.stem + f"_{uuid.uuid4().hex}.tmp.mp4")
+        try:
+            try:
+                os.link(source, staged)
+            except OSError:
+                shutil.copy2(source, staged)
+            os.replace(staged, path)
+            return path
+        except OSError:
+            continue
+        finally:
+            staged.unlink(missing_ok=True)
+    raise RuntimeError("RelayVSR: all three preview slots are locked by the browser.")
+
+
+def _restore_relay_preview_item(final_id, fps, data_path, manifest=None, expected_detail=None):
+    """Restore RelayVSR from persistent project cache, not disposable ComfyUI temp.
+
+    No inference, model load, decode, or modification of the persistent output.
+    Legacy RelayVSR sidecars without an H3 source binding are not trusted:
+    a new Relay Final Decode upgrades them using the current finished movie.
+    """
+    cache = Path(data_path).with_suffix(".relayvsr_x2.mp4")
+    sidecar = Path(data_path).with_suffix(".relayvsr_x2.json")
+    try:
+        if not cache.is_file() or cache.stat().st_size <= 0 or not sidecar.is_file():
+            return None
+        from .relayvsr_final import relay_cache_is_current
+        # A stored source SHA by itself is not sufficient: it may refer to an
+        # earlier H3 export. Require the exact current H3 cache identity.
+        if not relay_cache_is_current(
+            data_path, manifest, source_check=False, expected_detail=expected_detail
+        ):
+            _LOG.info("RelayVSR restore skipped: H3 source cache does not match upscale")
+            return None
+        # Re-publish into a fresh /view-safe temp slot after each restart.
+        # The persistent .relayvsr_x2.mp4 and its signature remain untouched.
+        preview = _relay_preview_temp_path(final_id, cache)
+        return _comfy_media_item(preview, fps, "temp")
+    except (OSError, ValueError, TypeError) as exc:
+        _LOG.warning("RelayVSR preview restore unavailable: %s", exc)
+        return None
+
+
+def _clear_relay_cache_after_disabled_decode(data_path, final_id):
+    """Discard only this project's Relay cache and this Final Decode's temp previews.
+
+    Called after a *successful* H3 Final Decode with RelayVSR explicitly OFF.
+    Never remove exported videos, H3 clips, decoded segments, or other projects.
+    A Windows browser may have an open preview file; a locked temp slot is
+    harmless, so we log and continue without failing the H3 export.
+    """
+    root = Path(data_path)
+    files = [
+        root.with_suffix(".relayvsr_x2.mp4"),
+        root.with_suffix(".relayvsr_x2.json"),
+    ]
+    if final_id is not None:
+        preview_root = _preview_temp_root()
+        safe_id = _safe_name(final_id)
+        files.extend(
+            preview_root / f"h3_motion_preview_{safe_id}_relay_{slot}.mp4"
+            for slot in range(3)
+        )
+
+    for path in files:
+        try:
+            path.unlink(missing_ok=True)
+        except OSError as exc:
+            _LOG.warning("RelayVSR cleanup could not delete %s: %s", path, exc)
+
+
+def _finish_with_optional_relay(result, *, enabled, data_path, unique_id,
+                                fps, workflow, prompt, detail_percent=50,
+                                final_path=None, relay_requested=False):
+    if not enabled:
+        # An unfinished Clip-by-Clip run with Relay ON must NOT purge an
+        # existing upscale. Only an explicit OFF + successful Final Decode
+        # triggers the project-specific cache cleanup.
+        if not relay_requested:
+            _clear_relay_cache_after_disabled_decode(data_path, unique_id)
+        return result
+    from .relayvsr_final import upscale_finished_video, _h3_cache_identity
+    infos = result.get("ui", {}).get("h3_preview_info") or []
+    info = infos[0] if infos else {}
+    source = final_path or info.get("relay_source_path") or info.get("autosave_path")
+    if not source:
+        raise RuntimeError("RelayVSR x2: Final Decode did not return a finished video path.")
+    # RelayVSR starts only AFTER the native Final Decode has finalized its
+    # video/audio, all seam fixes, and metadata on disk.
+    upscaled, was_cached = upscale_finished_video(
+        source, data_path, _find_ffmpeg(), workflow=workflow, prompt=prompt,
+        detail=float(detail_percent) / 100.0,
+        h3_state=_h3_cache_identity(data_path),
+    )
+    preview = _relay_preview_temp_path(unique_id, upscaled)
+    result["ui"]["h3_relay_video"] = [_comfy_media_item(preview, fps, "temp")]
+    if infos:
+        info["relayvsr_x2_ready"] = True
+        info["relayvsr_x2_reused"] = bool(was_cached)
+        info["relayvsr_x2_output"] = str(upscaled)
+        info["final_output_path"] = str(upscaled)
+    output_values = tuple(result["result"])
+    result["result"] = (_video_output_from_path(upscaled), *output_values[1:])
+    return result
+
+def _finish_final_decode_and_autosave(
+    result, *, cache, original_path=None, data_path, unique_id, fps, workflow,
+    prompt, relay_enabled, relay_requested, relay_detail=50,
+    autosave_settings=None, clip_count=0, frame_count=0,
+):
+    """One postprocessing order for ALL H3 modes: H3 -> Relay -> Auto Save.
+
+    An optional Relay failure must not discard the completed native H3 video or
+    suppress its portable project backup. Do not preserve any old Relay preview
+    in the returned UI after such a failure.
+    """
+    infos = result.get("ui", {}).get("h3_preview_info") or []
+    info = infos[0] if infos and isinstance(infos[0], dict) else None
+    original_path = original_path or (info or {}).get("relay_source_path") or (info or {}).get("autosave_path")
+    if original_path is None:
+        raise RuntimeError("H3 Final Decode: finished original video path is missing")
+    relay_failed = False
+    try:
+        result = _finish_with_optional_relay(
+            result, enabled=relay_enabled, data_path=data_path, unique_id=unique_id,
+            fps=fps, workflow=workflow, prompt=prompt, detail_percent=relay_detail,
+            final_path=original_path, relay_requested=relay_requested,
+        )
+    except Exception as exc:
+        if not relay_enabled:
+            raise
+        relay_failed = True
+        _LOG.error("RelayVSR failed; preserving H3 original and Auto Save: %s", exc)
+        result.setdefault("ui", {}).pop("h3_relay_video", None)
+        if info is not None:
+            info.update({"relayvsr_x2_ready": False, "relayvsr_x2_error": str(exc)})
+        # _finish_with_optional_relay only substitutes VIDEO after successful
+        # Relay processing; no native H3 output is lost on the failure path.
+    if info is not None:
+        effective_settings = dict(autosave_settings) if autosave_settings else autosave_settings
+        if relay_failed and effective_settings is not None:
+            # Save the H3 checkpoint even if Relay failed. Never package an
+            # earlier Relay cache as if this attempted upscale had succeeded.
+            effective_settings["relayvsr_cache_allowed"] = False
+        info.update(_maybe_auto_save_project(
+            cache, original_path, unique_id, effective_settings, clip_count, frame_count,
+        ))
+    return result
+
+
 class MiniMaxH3MotionContextDiskFinalDecode:
     @classmethod
     def INPUT_TYPES(cls):
@@ -5726,6 +5907,9 @@ class MiniMaxH3MotionContextDiskFinalDecode:
                 "autoplay": ("BOOLEAN", {"default": True, "tooltip": "Auto-play the video preview when generating finishes or the node is loaded."}),
                 "auto_save_project": ("BOOLEAN", {"default": False, "tooltip": "Save a portable .ext project beside each completed Full Batch video. All three modes supported. Ignored in Clip-by-Clip and for interrupted batches. Large projects add disk space and saving time."}),
                 "save_individual_clips": ("BOOLEAN", {"default": False, "tooltip": "Full Batch only. Export each final user-visible clip beside the assembled video, with final video treatment and audio. Disabled leaves the existing export path unchanged."}),
+                # Appended after all existing widgets; old positional values stay valid.
+                "relayvsr_x2": ("BOOLEAN", {"default": False, "tooltip": "Optional RelayVSR x2 on the COMPLETE finished video only. Automatically downloads official weights once when missing. Keeps the H3 original."}),
+                "relayvsr_detail": ("INT", {"default": 50, "min": 0, "max": 100, "step": 1, "tooltip": "RelayVSR x2 detail strength in percent (0 = bicubic-like, 100 = full generated detail). Default 50%. Affects only the RelayVSR output, never H3 clips."}),
             },
             "hidden": {
                 "unique_id": "UNIQUE_ID",
@@ -5758,6 +5942,8 @@ class MiniMaxH3MotionContextDiskFinalDecode:
         extra_pnginfo=None,
         auto_save_project=False,
         save_individual_clips=False,
+        relayvsr_x2=False,
+        relayvsr_detail=50,
     ):
         data_path, manifest_path, manifest = _load_manifest(cache)
         # FPS is cache metadata, never a user choice. The compatibility widget
@@ -5778,6 +5964,8 @@ class MiniMaxH3MotionContextDiskFinalDecode:
                 "audio_bitrate": audio_bitrate, "autoplay": autoplay,
                 "auto_save_project": True,
                 "save_individual_clips": bool(save_individual_clips),
+                "relayvsr_x2": bool(relayvsr_x2),
+                "relayvsr_detail": int(relayvsr_detail),
             }
         segments = [dict(x) for x in manifest.get("segments", [])]
         if not segments:
@@ -5788,28 +5976,51 @@ class MiniMaxH3MotionContextDiskFinalDecode:
         if interrupted:
             snapshot_count = max(1, min(len(segments), snapshot_count))
             segments = segments[:snapshot_count]
+        # Relay works on the FINISHED video only. Clip-by-Clip previews before
+        # the last clip and interrupted batches keep their original output.
+        relay_final_ready = bool(
+            relayvsr_x2 and not interrupted and
+            (str(cache.get("run_mode", "full_batch")) != "clip_by_clip"
+             or len(segments) >= project_total_clips)
+        )
         sequence_mode = str(manifest.get("sequence_mode") or "ref2va").lower()
         if sequence_mode == "ref2va_independent":
             from .ref2va_independent import export_final as export_ref2va_independent_final
-            return export_ref2va_independent_final(
+            finished = export_ref2va_independent_final(
                 cache=cache, vae=vae, audio_vae=audio_vae, fps=fps,
                 filename_prefix=filename_prefix, output_directory=output_directory,
                 codec=codec, crf=crf, preset=preset, audio_bitrate=audio_bitrate,
                 unique_id=unique_id, workflow=workflow, prompt=prompt,
-                project_autosave_settings=project_autosave_settings,
+                project_autosave_settings=None,  # centralized after optional RelayVSR
                 save_individual_clips=bool(save_individual_clips),
                 editor_batch_requested=bool(editor_batch_requested),
             )
+            info = (finished.get("ui", {}).get("h3_preview_info") or [{}])[0]
+            return _finish_final_decode_and_autosave(
+                finished, cache=cache, data_path=data_path, unique_id=unique_id,
+                fps=fps, workflow=workflow, prompt=prompt,
+                relay_enabled=relay_final_ready, relay_requested=bool(relayvsr_x2),
+                relay_detail=relayvsr_detail, autosave_settings=project_autosave_settings,
+                clip_count=len(segments), frame_count=int(info.get("preview_frames", 0)),
+            )
         if sequence_mode == "fl2va":
             from .fl2va_engine import export_fl2va_final
-            return export_fl2va_final(
+            finished = export_fl2va_final(
                 cache=cache, vae=vae, audio_vae=audio_vae, fps=fps,
                 filename_prefix=filename_prefix, output_directory=output_directory,
                 codec=codec, crf=crf, preset=preset, audio_bitrate=audio_bitrate,
                 unique_id=unique_id, workflow=workflow, prompt=prompt,
-                project_autosave_settings=project_autosave_settings,
+                project_autosave_settings=None,  # centralized after optional RelayVSR
                 save_individual_clips=bool(save_individual_clips),
                 editor_batch_requested=bool(editor_batch_requested),
+            )
+            info = (finished.get("ui", {}).get("h3_preview_info") or [{}])[0]
+            return _finish_final_decode_and_autosave(
+                finished, cache=cache, data_path=data_path, unique_id=unique_id,
+                fps=fps, workflow=workflow, prompt=prompt,
+                relay_enabled=relay_final_ready, relay_requested=bool(relayvsr_x2),
+                relay_detail=relayvsr_detail, autosave_settings=project_autosave_settings,
+                clip_count=len(segments), frame_count=int(info.get("preview_frames", 0)),
             )
         source_meta = _source_meta(manifest)
         source_frames = _source_frame_count(source_meta)
@@ -5927,7 +6138,7 @@ class MiniMaxH3MotionContextDiskFinalDecode:
                 f"full_preview_cached_{len(segments)}_clips_shift_{int(seam_shift)}"
             )
 
-            return {
+            result = {
                 "ui": {
                     "h3_video": [item],
                     "h3_preview_info": [{
@@ -5950,6 +6161,13 @@ class MiniMaxH3MotionContextDiskFinalDecode:
                     editor_batch if bool(editor_batch_requested) else None,
                 ),
             }
+            return _finish_final_decode_and_autosave(
+                result, cache=cache, original_path=autosave_path, data_path=data_path,
+                unique_id=unique_id, fps=fps, workflow=workflow, prompt=prompt,
+                relay_enabled=relay_final_ready, relay_requested=bool(relayvsr_x2),
+                relay_detail=relayvsr_detail, autosave_settings=project_autosave_settings,
+                clip_count=len(segments), frame_count=total_frames,
+            )
 
         # Full Batch is strictly incremental and keeps a separate exact-final
         # video sidecar per clip. CRF/preset/codec are frozen when the Extender
@@ -6051,9 +6269,6 @@ class MiniMaxH3MotionContextDiskFinalDecode:
         )
 
         _embed_final_metadata_in_place(output_path, workflow=workflow, prompt=prompt)
-        project_autosave_info = _maybe_auto_save_project(
-            cache, output_path, unique_id, project_autosave_settings, len(segments), expected_frames
-        )
         progress.advance()
 
         _LOG.info(
@@ -6062,11 +6277,10 @@ class MiniMaxH3MotionContextDiskFinalDecode:
         )
         item = _comfy_media_item(preview_path, fps, "temp")
         progress.finish()
-        return {
+        result = {
             "ui": {
                 "h3_video": [item],
                 "h3_preview_info": [{
-                    **project_autosave_info,
                     **individual_export_info,
                     "mode": "full_batch_incremental",
                     "clip": int(len(segments)),
@@ -6085,6 +6299,13 @@ class MiniMaxH3MotionContextDiskFinalDecode:
                 individual_export_info.get("video_editor_batch") if bool(editor_batch_requested) else None,
             ),
         }
+        return _finish_final_decode_and_autosave(
+            result, cache=cache, original_path=output_path, data_path=data_path,
+            unique_id=unique_id, fps=fps, workflow=workflow, prompt=prompt,
+            relay_enabled=relay_final_ready, relay_requested=bool(relayvsr_x2),
+            relay_detail=relayvsr_detail, autosave_settings=project_autosave_settings,
+            clip_count=len(segments), frame_count=expected_frames,
+        )
 
 
 NODE_CLASS_MAPPINGS = {
