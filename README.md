@@ -14,6 +14,24 @@ Apart from possible bug fixes or compatibility corrections, I do not currently p
 
 ---
 
+### 🚀 New in v3.1.0 — RelayVSR ×2 Upscaling
+
+MiniMax H3 Extender now includes **RelayVSR ×2**, directly integrated into Final Decode!
+
+- **2× video upscaling** for sharper, more detailed videos.
+- **Adjustable Detail strength** (0–100%).
+- **Automatic upscaling** after the final video is generated.
+- **Automatic model download on first use** if the required RelayVSR models are not already installed.
+- **Original / Upscale preview toggle** to compare both versions.
+- **Both videos are preserved**, including audio.
+- **Save/Load Project and Auto Save support**, including upscaled videos.
+- **Smart caching** to avoid unnecessary processing.
+- Works with **all three generation modes**.
+
+Simply enable **RelayVSR ×2** in Final Decode. No additional nodes required!
+
+---
+
 ### 🚀 New: v3.0.5 — Latent Refine / Upscale
 
 A new optional **Latent Refine / Upscale** mode is now available, inspired by the latent refine work introduced in **PR #83**.
