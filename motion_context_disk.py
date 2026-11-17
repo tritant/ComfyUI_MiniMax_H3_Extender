@@ -61,7 +61,7 @@ from .motion_context_ram import (
     _streams_from_latent,
 )
 
-BUILD = "motion-context-disk-v3.0.14"
+BUILD = "motion-context-disk-v3.0.15"
 PREVIEW_AUDIO_MODE = "pcm_single_aac_gain_chain_v3_entry_ramp"
 CACHE_VERSION = 12
 PREVIEW_ROTATION_SLOTS = 3
@@ -1326,6 +1326,101 @@ def _decode_pair_video(vae, chain, meta):
     return decoded, previous_raw, current_raw, int(shift)
 
 
+def _correct_isolated_bright_first_frame(previous_raw, current_raw):
+    """Fix a bright/over-contrasted first frame on an otherwise good seam.
+
+    Called ONLY if the existing 4-frame seam test accepts the pair. If the
+    original correction runs, this helper is never called: no double grading.
+    Only current_raw[0] is ever written; all other frames remain untouched.
+    """
+    current_n = int(current_raw.shape[0])
+    if current_n < 3 or int(previous_raw.shape[0]) < 1:
+        return current_raw
+
+    # Preserve the existing isolated-bright-frame detection and thresholds.
+    # The neighbors must agree, and the FIRST frame must be a positive spike.
+    prev_ref = previous_raw[-min(4, int(previous_raw.shape[0])):]
+    next_ref = current_raw[1:min(4, current_n)]
+    prev_mean, prev_std, _ = _luma_stats(prev_ref)
+    next_mean, next_std, _ = _luma_stats(next_ref)
+    if abs(prev_mean - next_mean) >= 0.012:
+        return current_raw
+
+    first_mean, first_std, _ = _luma_stats(current_raw[:1])
+    if first_mean - max(prev_mean, next_mean) <= 0.012:
+        return current_raw
+
+    target_mean = (prev_mean + next_mean) * 0.5
+    offset = max(-0.060, min(0.0, target_mean - first_mean))
+
+    # Match a contrast spike without touching well-matched contrast. Never
+    # amplify contrast: this is a narrowly scoped flash-reduction guard.
+    contrast_gain = 1.0
+    if first_std > max(prev_std, next_std) + 0.0035:
+        target_std = (prev_std + next_std) * 0.5
+        contrast_gain = max(0.90, min(1.0, target_std / max(first_std, 1e-5)))
+
+    def mean_saturation(frames):
+        # HSV-style S=(max(R,G,B)-min(R,G,B))/max(R,G,B), measured one
+        # frame at a time to avoid a full-clip float32 GPU allocation.
+        total = 0.0
+        count = int(frames.shape[0])
+        for i in range(count):
+            rgb_frame = frames[i, ..., :3].float()
+            maximum = rgb_frame.amax(dim=-1)
+            minimum = rgb_frame.amin(dim=-1)
+            sat = (maximum - minimum) / maximum.clamp_min(1e-4)
+            total += float(sat.mean().item())
+            del rgb_frame, maximum, minimum, sat
+        return total / max(1, count)
+
+    frame = current_raw[0]
+    rgb = frame[..., :3].float()
+    y = _luma_map(rgb)
+    # Build the adjusted first frame in memory, before a SINGLE write below.
+    # Brightness uses the existing capped offset; contrast operates on luma.
+    matched_y = ((y - first_mean) * contrast_gain + first_mean + offset).clamp(0.0, 1.0)
+    chroma = rgb - y.unsqueeze(-1)
+
+    # IMPORTANT: measure saturation AFTER the brightness correction. A first
+    # frame may start less saturated than its neighbors yet become *more*
+    # saturated after the darkening offset (especially in shadow areas).
+    # Measuring the uncorrected input would miss precisely that residual flash.
+    prev_sat = mean_saturation(prev_ref)
+    next_sat = mean_saturation(next_ref)
+    candidate = (matched_y.unsqueeze(-1) + chroma).clamp(0.0, 1.0)
+    candidate_sat = mean_saturation(candidate.unsqueeze(0))
+    del candidate
+    saturation_gain = 1.0
+    if candidate_sat > max(prev_sat, next_sat) + 0.008:
+        target_sat = (prev_sat + next_sat) * 0.5
+        # A bounded scalar chroma adjustment preserves hue. Four tiny trials
+        # on this *one* frame let us match the target after RGB clipping;
+        # the original frame is never written or graded twice.
+        low, high = 0.80, 1.0
+        for _ in range(4):
+            trial_gain = (low + high) * 0.5
+            trial = (matched_y.unsqueeze(-1) + chroma * trial_gain).clamp(0.0, 1.0)
+            trial_sat = mean_saturation(trial.unsqueeze(0))
+            del trial
+            if trial_sat > target_sat:
+                high = trial_gain
+            else:
+                low = trial_gain
+        saturation_gain = (low + high) * 0.5
+
+    frame[..., :3] = (
+        matched_y.unsqueeze(-1) + chroma * saturation_gain
+    ).clamp(0.0, 1.0).to(frame.dtype)
+    _LOG.info(
+        "H3 Final Decode: isolated bright first seam frame corrected "
+        "(before=%.4f, prev=%.4f, next=%.4f, offset=%.4f, "
+        "contrast=%.4f, saturation_gain=%.4f)",
+        first_mean, prev_mean, next_mean, offset, contrast_gain, saturation_gain,
+    )
+    return current_raw
+
+
 def _correct_current_segment(previous_raw, current_raw, chunk_frames=8):
     """Memory-bounded disk Final Decode seam correction.
 
@@ -1350,7 +1445,10 @@ def _correct_current_segment(previous_raw, current_raw, chunk_frames=8):
     src_mean, src_std, src_med = _luma_stats(src)
 
     if abs(ref_mean - src_mean) < 0.008 and abs(ref_med - src_med) < 0.012:
-        return current_raw
+        # The normal correction is skipped, but a single bright first frame
+        # can be hidden by the four-frame averages. Correct that one frame
+        # only in this branch; never apply this on top of the normal seam fix.
+        return _correct_isolated_bright_first_frame(previous_raw, current_raw)
 
     eps = 1e-4
     src_med_c = min(max(src_med, 0.05), 0.95)

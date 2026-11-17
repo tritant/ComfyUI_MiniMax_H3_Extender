@@ -105,7 +105,7 @@ from .ref2va_independent import (
     run as _run_ref2va_independent,
 )
 
-BUILD = "minimax-h3-extender-v3.0.14"
+BUILD = "minimax-h3-extender-v3.0.15"
 _LOG = logging.getLogger(__name__)
 FPS = 24
 AUDIO_LATENT_FPS = 40
@@ -2803,7 +2803,11 @@ def _refine_ref2va_sample(
             str(context_length), int(audio_context_length),
         )
     _refine_progress(owner, clip_index, clip_count, f"Refining clip {clip_index + 1}/{clip_count}")
-    refine_sigmas = _resolve_sample_sigmas(external_sigmas, float(refine_denoise))
+    # Manual SIGMAS define the complete sampling schedule for this model,
+    # including the Refine pass (e.g. Pika H3 Flex: 6 steps / 7 sigmas).
+    # Do not trim them by the separate Refine denoise setting.
+    # With no external SIGMAS, _sample_h3 still uses refine_steps/denoise.
+    refine_sigmas = _coerce_external_sigmas(external_sigmas)
     _release_models_before_refine(clip_model)
     refined = _sample_h3(
         clip_model, refine_positive, up_latent, seed, sampler_name, scheduler,
@@ -2828,7 +2832,11 @@ def _refine_fl2va_sample(
         clip_text_encoder, vae, prompt, out_w, out_h, frame_count,
         first_frame=first_frame, last_frame=last_frame, guide_frames=guide_frames,
     )
-    refine_sigmas = _resolve_sample_sigmas(external_sigmas, float(refine_denoise))
+    # Manual SIGMAS define the complete sampling schedule for this model,
+    # including the Refine pass (e.g. Pika H3 Flex: 6 steps / 7 sigmas).
+    # Do not trim them by the separate Refine denoise setting.
+    # With no external SIGMAS, _sample_h3 still uses refine_steps/denoise.
+    refine_sigmas = _coerce_external_sigmas(external_sigmas)
     _refine_progress(owner, clip_index, clip_count, f"Refining clip {clip_index + 1}/{clip_count}")
     _release_models_before_refine(clip_model)
     refined = _sample_h3(
