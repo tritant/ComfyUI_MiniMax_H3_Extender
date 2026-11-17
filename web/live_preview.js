@@ -379,13 +379,15 @@ function upstreamMotionContext(node) {
     return origin?.__h3Extender?.state?.motion_context !== false;
 }
 
-function loadPreviewSource(node, state, url) {
+function loadPreviewSource(node, state, url, options = null) {
     if (!state?.video) return;
 
     const video = state.video;
     const autoplayWidget = getWidget(node, "autoplay");
     const rawAutoplay = autoplayWidget?.value;
-    const wantsAutoplay = rawAutoplay === true || rawAutoplay === 1 || String(rawAutoplay).toLowerCase() === "true";
+    const configuredAutoplay = rawAutoplay === true || rawAutoplay === 1 || String(rawAutoplay).toLowerCase() === "true";
+    const wantsAutoplay = options?.wasPlaying == null ? configuredAutoplay : Boolean(options.wasPlaying);
+    const seekTime = Number.isFinite(options?.seekTime) ? Math.max(0, options.seekTime) : null;
 
     // Always fetch enough media to paint frame 0 after workflow restore.
     video.preload = "auto";
@@ -398,6 +400,7 @@ function loadPreviewSource(node, state, url) {
 
     const paintPausedFrame = () => {
         if (state.previewLoadToken !== loadToken) return;
+        if (seekTime != null) return;  // Source toggle keeps its previous position.
         try {
             video.pause();
             const target = Number.isFinite(video.duration) && video.duration > 0
@@ -445,8 +448,40 @@ function loadPreviewSource(node, state, url) {
         if (wantsAutoplay && video.paused) tryAutoplay();
     }, { once: true });
 
+    if (seekTime != null) {
+        video.addEventListener("loadedmetadata", () => {
+            if (state.previewLoadToken !== loadToken) return;
+            const duration = Number(video.duration);
+            video.currentTime = Number.isFinite(duration) && duration > 0
+                ? Math.min(seekTime, Math.max(0, duration - 1 / Math.max(1, state.currentFps)))
+                : seekTime;
+        }, { once: true });
+    }
     video.src = url;
     video.load();
+}
+
+function applyPreviewVariant(node, state, variant, preserveTime = true) {
+    const hasUpscale = Boolean(state?.relayVideoInfo?.filename);
+    const wanted = hasUpscale && variant === "upscale" ? "upscale" : "original";
+    const info = wanted === "upscale" ? state.relayVideoInfo : state.originalVideoInfo;
+    if (!info?.filename) return;
+    const previousPosition = preserveTime ? Number(state.video.currentTime || 0) : null;
+    const wasPlaying = preserveTime ? !state.video.paused : null;
+    state.previewVariant = wanted;
+    state.currentVideoInfo = { ...info };
+    state.colorTimeline = wanted === "upscale" ? [] : (state.originalColorTimeline || []);
+    syncPreviewColorFilter(state);
+    state.relayButton.style.display = hasUpscale ? "inline-block" : "none";
+    state.relayButton.textContent = wanted === "upscale" ? "ORIGINAL" : "UPSCALE ×2";
+    state.relayButton.title = wanted === "upscale"
+        ? "Return to the original H3 video"
+        : "View the RelayVSR ×2 result";
+    state.saveButton.disabled = false;
+    loadPreviewSource(node, state, mediaUrl(info) + "&t=" + Date.now(), {
+        seekTime: previousPosition,
+        wasPlaying,
+    });
 }
 
 async function restorePreviewOnLoad(node, state, attempt = 0) {
@@ -476,6 +511,11 @@ async function restorePreviewOnLoad(node, state, attempt = 0) {
             ? upstreamMotionContext(node)
             : Boolean(state.restoreMotionOverride);
         params.set("motion_context", restoreMotion ? "true" : "false");
+        const relayWidgetValue = getWidget(node, "relayvsr_x2")?.value;
+        const relayEnabled = relayWidgetValue === true || relayWidgetValue === 1
+            || String(relayWidgetValue ?? "").trim().toLowerCase() === "true";
+        params.set("relay_enabled", relayEnabled ? "true" : "false");
+        params.set("relay_detail", String(Number(getWidget(node, "relayvsr_detail")?.value ?? 50)));
 
         const response = await fetch(
             api.apiURL("/h3_extender/restored_preview?" + params.toString())
@@ -504,7 +544,14 @@ async function restorePreviewOnLoad(node, state, attempt = 0) {
             ? `INTERRUPTED PREVIEW — ${clips}/${totalClips} clips (${frames} frames)`
             : `RESTORED PREVIEW — ${clips} clip${clips === 1 ? "" : "s"} (${frames} frames)`;
 
-        state.currentVideoInfo = { ...payload.video };
+        state.originalVideoInfo = { ...payload.video };
+        state.relayVideoInfo = payload?.relay_video?.filename
+            ? { ...payload.relay_video } : null;
+        state.previewVariant = state.relayVideoInfo ? "upscale" : "original";
+        state.relayButton.style.display = state.relayVideoInfo ? "inline-block" : "none";
+        state.relayButton.textContent = state.relayVideoInfo ? "ORIGINAL" : "UPSCALE ×2";
+        state.originalColorTimeline = Array.isArray(payload.color_timeline) ? payload.color_timeline : [];
+        state.currentVideoInfo = state.relayVideoInfo ? { ...state.relayVideoInfo } : { ...payload.video };
         state.currentPreviewMeta = {
             clip_count: clips,
             frame_count: frames,
@@ -513,9 +560,9 @@ async function restorePreviewOnLoad(node, state, attempt = 0) {
             total_clips: totalClips,
         };
         state.currentFps = Number(payload.video?.frame_rate || state.currentFps || 24);
-        state.colorTimeline = Array.isArray(payload.color_timeline) ? payload.color_timeline : [];
+        state.colorTimeline = state.relayVideoInfo ? [] : (Array.isArray(payload.color_timeline) ? payload.color_timeline : []);
         state.saveButton.disabled = false;
-        loadPreviewSource(node, state, mediaUrl(payload.video) + "&t=" + Date.now());
+        loadPreviewSource(node, state, mediaUrl(state.currentVideoInfo) + "&t=" + Date.now());
         state.restoreLoaded = true;
         state.restoreModeOverride = null;
         state.restoreMotionOverride = null;
@@ -790,7 +837,16 @@ function makePlayer(node) {
     saveButton.disabled = true;
     saveButton.style.flex = "0 0 auto";
 
+    const relayButton = document.createElement("button");
+    relayButton.type = "button";
+    relayButton.textContent = "UPScALE ×2";
+    relayButton.className = "h3-save-preview-button";
+    relayButton.title = "Switch between the completed H3 original and its RelayVSR ×2 result";
+    relayButton.style.flex = "0 0 auto";
+    relayButton.style.minWidth = "92px";
+    relayButton.style.display = "none";
     header.appendChild(label);
+    header.appendChild(relayButton);
     header.appendChild(saveButton);
 
     const video = document.createElement("video");
@@ -815,7 +871,12 @@ function makePlayer(node) {
         header,
         label,
         saveButton,
+        relayButton,
         video,
+        originalVideoInfo: null,
+        relayVideoInfo: null,
+        originalColorTimeline: [],
+        previewVariant: "original",
         widget: null,
         currentVideoInfo: null,
         currentPreviewMeta: null,
@@ -873,6 +934,9 @@ function makePlayer(node) {
     });
     state.widget = widget;
     saveButton.addEventListener("click", () => saveCurrentPreview(node, state));
+    relayButton.addEventListener("click", () => {
+        applyPreviewVariant(node, state, state.previewVariant === "upscale" ? "original" : "upscale");
+    });
 
     node.__h3LivePreview = state;
 
@@ -915,6 +979,10 @@ function clearPreviewForNewProject(ownerId) {
         state.restoreModeOverride = null;
         state.restoreMotionOverride = null;
         state.currentVideoInfo = null;
+        state.originalVideoInfo = null;
+        state.relayVideoInfo = null;
+        state.previewVariant = "original";
+        state.relayButton.style.display = "none";
         state.currentPreviewMeta = null;
         state.colorTimeline = [];
         state.video.style.filter = "none";
@@ -945,6 +1013,10 @@ function refreshImportedProjectPreview(ownerId, generationMode = null, motionCon
             : (String(generationMode || "") === "ref2va" ? "ref2va" : null);
         state.restoreMotionOverride = motionContext == null ? null : boolValue(motionContext, true);
         state.currentVideoInfo = null;
+        state.originalVideoInfo = null;
+        state.relayVideoInfo = null;
+        state.previewVariant = "original";
+        state.relayButton.style.display = "none";
         state.currentPreviewMeta = null;
         state.colorTimeline = [];
         state.video.style.filter = "none";
@@ -1128,16 +1200,23 @@ app.registerExtension({
                 state.label.title = "";
             }
 
-            state.currentVideoInfo = { ...info };
+            state.originalVideoInfo = { ...info };
+            state.relayVideoInfo = message?.h3_relay_video?.[0]?.filename
+                ? { ...message.h3_relay_video[0] } : null;
+            state.originalColorTimeline = Array.isArray(meta?.color_timeline) ? meta.color_timeline : [];
+            state.previewVariant = state.relayVideoInfo ? "upscale" : "original";
+            state.relayButton.style.display = state.relayVideoInfo ? "inline-block" : "none";
+            state.relayButton.textContent = state.relayVideoInfo ? "ORIGINAL" : "UPSCALE ×2";
+            state.currentVideoInfo = state.relayVideoInfo ? { ...state.relayVideoInfo } : { ...info };
             state.currentPreviewMeta = {
                 clip_count: Number(meta?.preview_clips || meta?.total_clips || 0),
                 frame_count: Number(meta?.preview_frames || 0),
                 mode: String(meta?.mode || ""),
             };
             state.currentFps = Number(info.frame_rate || state.currentFps || 24);
-            state.colorTimeline = Array.isArray(meta?.color_timeline) ? meta.color_timeline : [];
+            state.colorTimeline = state.relayVideoInfo ? [] : state.originalColorTimeline;
             state.saveButton.disabled = false;
-            loadPreviewSource(this, state, mediaUrl(info) + "&t=" + Date.now());
+            loadPreviewSource(this, state, mediaUrl(state.currentVideoInfo) + "&t=" + Date.now());
 
             // Do not reset a node the user already enlarged.
             // Only enforce the minimum if necessary, then fit the player

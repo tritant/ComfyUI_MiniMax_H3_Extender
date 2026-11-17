@@ -110,6 +110,8 @@ const FINAL_PROJECT_WIDGETS = [
     "audio_bitrate",
     "auto_save_project",
     "save_individual_clips",
+    "relayvsr_x2",
+    "relayvsr_detail",
 ];
 
 function boolValue(value, defaultValue = true) {
@@ -4779,6 +4781,12 @@ function applyProjectPayload(node, runtime, projectPayload) {
         }
         if (!Object.prototype.hasOwnProperty.call(finalSettings, "save_individual_clips")) {
             setWidgetValue(finalNode, "save_individual_clips", false);
+        }
+        if (!Object.prototype.hasOwnProperty.call(finalSettings, "relayvsr_x2")) {
+            setWidgetValue(finalNode, "relayvsr_x2", false);
+        }
+        if (!Object.prototype.hasOwnProperty.call(finalSettings, "relayvsr_detail")) {
+            setWidgetValue(finalNode, "relayvsr_detail", 50);
         }
         for (const name of FINAL_PROJECT_WIDGETS) {
             if (Object.prototype.hasOwnProperty.call(finalSettings, name)) {
