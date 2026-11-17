@@ -105,7 +105,7 @@ from .ref2va_independent import (
     run as _run_ref2va_independent,
 )
 
-BUILD = "minimax-h3-extender-v3.1.0-RelayVSR-DEV"
+BUILD = "minimax-h3-extender-v3.1.1-RelayVSR"
 _LOG = logging.getLogger(__name__)
 FPS = 24
 AUDIO_LATENT_FPS = 40
@@ -5931,6 +5931,8 @@ class MiniMaxH3Extender:
         previous_handle, final_manifest = set_fl2va_validation(
             owner, FPS, clip_ids, validation_by_id, run_mode=str(run_mode)
         )
+        previous_handle = dict(previous_handle)
+        previous_handle["project_total_clips"] = int(len(clips))
 
         if str(run_mode) == "full_batch":
             if interrupted:
@@ -6904,6 +6906,9 @@ class MiniMaxH3Extender:
             # which _parse_clips_json prevents. Keep a defensive error anyway.
             raise RuntimeError("MiniMax H3 Extender: sequence produced no cache handle.")
 
+        # Final Decode must know the FULL configured timeline in Clip-by-Clip.
+        previous_handle = dict(previous_handle)
+        previous_handle["project_total_clips"] = int(len(clips))
         final_manifest = _load_manifest_from_paths(data_path, manifest_path)
         if str(run_mode) == "full_batch" and final_manifest is not None:
             if interrupted:

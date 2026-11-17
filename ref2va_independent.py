@@ -1116,6 +1116,8 @@ def run(
     previous_handle, final_manifest = set_validation(
         owner, e.FPS, clip_ids, validation_by_id, run_mode=str(run_mode)
     )
+    previous_handle = dict(previous_handle)
+    previous_handle["project_total_clips"] = int(len(clips))
 
     if str(run_mode) == "full_batch":
         if interrupted:

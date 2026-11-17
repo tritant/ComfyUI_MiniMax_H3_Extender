@@ -61,7 +61,7 @@ from .motion_context_ram import (
     _streams_from_latent,
 )
 
-BUILD = "motion-context-disk-v3.1.0-RelayVSR-DEV"
+BUILD = "motion-context-disk-v3.1.1-RelayVSR"
 PREVIEW_AUDIO_MODE = "pcm_single_aac_gain_chain_v3_entry_ramp"
 CACHE_VERSION = 12
 PREVIEW_ROTATION_SLOTS = 3
@@ -706,11 +706,12 @@ def _load_manifest(cache):
 
 
 def _make_handle(
-    data_path, manifest_path, manifest, run_mode, stop=False, status="", next_index=None
+    data_path, manifest_path, manifest, run_mode, stop=False, status="", next_index=None,
+    previous_cache=None,
 ):
     if next_index is None:
         next_index = len(manifest.get("segments", []))
-    return {
+    handle = {
         "version": CACHE_VERSION,
         "data_path": str(Path(data_path).resolve()),
         "manifest_path": str(Path(manifest_path).resolve()),
@@ -719,6 +720,18 @@ def _make_handle(
         "next_index": int(next_index),
         "status": str(status),
     }
+    # The Extender knows the configured timeline length. Disk Join must not
+    # drop it when rebuilding the handle: Final Decode needs it to tell the
+    # last Clip-by-Clip candidate from an intermediate preview. Standalone
+    # Disk Join chains without a known total retain the fail-safe behavior.
+    if isinstance(previous_cache, dict):
+        try:
+            total = int(previous_cache.get("project_total_clips") or 0)
+        except (TypeError, ValueError):
+            total = 0
+        if total > 0:
+            handle["project_total_clips"] = total
+    return handle
 
 
 def _cache_size_mb(data_path, manifest_path):
@@ -1115,7 +1128,8 @@ class MiniMaxH3MotionContextDiskJoin:
         if mode == "clip_by_clip" and stop:
             status = f"skipped after clip {len(segments)} (clip_by_clip)"
             handle = _make_handle(
-                data_path, manifest_path, manifest, mode, stop=True, status=status
+                data_path, manifest_path, manifest, mode, stop=True, status=status,
+                previous_cache=previous_cache,
             )
             size = _cache_size_mb(data_path, manifest_path)
             return (
@@ -1219,7 +1233,7 @@ class MiniMaxH3MotionContextDiskJoin:
         stop_out = bool(mode == "clip_by_clip" and not bool(validated))
         handle = _make_handle(
             data_path, manifest_path, manifest, mode, stop=stop_out, status=status,
-            next_index=index + 1,
+            next_index=index + 1, previous_cache=previous_cache,
         )
         size = _cache_size_mb(data_path, manifest_path)
 
@@ -5722,13 +5736,20 @@ def _maybe_auto_save_project(cache, output_path, final_id, settings, clip_count,
 
 
 
+# Preview slots can be hardlinks to the same source inode. Their mtime cannot
+# encode publish order; track rotation explicitly while ComfyUI is running.
+_RELAY_PREVIEW_LAST_USED = {}
+
+
 def _relay_preview_temp_path(final_id, source):
     """Browser preview independent of the 3 original preview rotation slots."""
     root = _preview_temp_root()
     root.mkdir(parents=True, exist_ok=True)
     safe_id = _safe_name(final_id)
     candidates = [root / f"h3_motion_preview_{safe_id}_relay_{slot}.mp4" for slot in range(3)]
-    newest = sorted(candidates, key=lambda p: p.stat().st_mtime if p.exists() else -1)
+    published = globals().get("_RELAY_PREVIEW_LAST_USED", {})
+    newest = sorted(candidates, key=lambda p: published.get(str(p),
+                    p.stat().st_mtime_ns if p.exists() else -1))
     # Prefer a currently missing slot, then replace the oldest. On Windows a
     # browser-opened file may be locked: try the next slot instead.
     for path in newest:
@@ -5739,6 +5760,7 @@ def _relay_preview_temp_path(final_id, source):
             except OSError:
                 shutil.copy2(source, staged)
             os.replace(staged, path)
+            published[str(path)] = time.time_ns()
             return path
         except OSError:
             continue
@@ -5806,7 +5828,8 @@ def _clear_relay_cache_after_disabled_decode(data_path, final_id):
 
 def _finish_with_optional_relay(result, *, enabled, data_path, unique_id,
                                 fps, workflow, prompt, detail_percent=50,
-                                final_path=None, relay_requested=False):
+                                final_path=None, relay_requested=False,
+                                audio_bitrate="192k"):
     if not enabled:
         # An unfinished Clip-by-Clip run with Relay ON must NOT purge an
         # existing upscale. Only an explicit OFF + successful Final Decode
@@ -5826,6 +5849,7 @@ def _finish_with_optional_relay(result, *, enabled, data_path, unique_id,
         source, data_path, _find_ffmpeg(), workflow=workflow, prompt=prompt,
         detail=float(detail_percent) / 100.0,
         h3_state=_h3_cache_identity(data_path),
+        fps_override=float(fps), audio_bitrate=audio_bitrate,
     )
     preview = _relay_preview_temp_path(unique_id, upscaled)
     result["ui"]["h3_relay_video"] = [_comfy_media_item(preview, fps, "temp")]
@@ -5842,6 +5866,7 @@ def _finish_final_decode_and_autosave(
     result, *, cache, original_path=None, data_path, unique_id, fps, workflow,
     prompt, relay_enabled, relay_requested, relay_detail=50,
     autosave_settings=None, clip_count=0, frame_count=0,
+    audio_bitrate="192k",
 ):
     """One postprocessing order for ALL H3 modes: H3 -> Relay -> Auto Save.
 
@@ -5855,31 +5880,37 @@ def _finish_final_decode_and_autosave(
     if original_path is None:
         raise RuntimeError("H3 Final Decode: finished original video path is missing")
     relay_failed = False
+    interrupted_exception = None
     try:
         result = _finish_with_optional_relay(
             result, enabled=relay_enabled, data_path=data_path, unique_id=unique_id,
             fps=fps, workflow=workflow, prompt=prompt, detail_percent=relay_detail,
             final_path=original_path, relay_requested=relay_requested,
+            audio_bitrate=audio_bitrate,
         )
-    except Exception as exc:
-        if not relay_enabled:
+    except BaseException as exc:
+        is_interrupt = any(cls.__name__ == "InterruptProcessingException"
+                           for cls in type(exc).__mro__)
+        if not relay_enabled or (not isinstance(exc, Exception) and not is_interrupt):
             raise
         relay_failed = True
-        _LOG.error("RelayVSR failed; preserving H3 original and Auto Save: %s", exc)
+        if is_interrupt:
+            interrupted_exception = exc
+        _LOG.error("RelayVSR failed/interrupted; preserving H3 original and Auto Save: %s", exc)
         result.setdefault("ui", {}).pop("h3_relay_video", None)
         if info is not None:
             info.update({"relayvsr_x2_ready": False, "relayvsr_x2_error": str(exc)})
-        # _finish_with_optional_relay only substitutes VIDEO after successful
-        # Relay processing; no native H3 output is lost on the failure path.
+        # Relay processing cannot replace the H3 VIDEO output before success.
     if info is not None:
         effective_settings = dict(autosave_settings) if autosave_settings else autosave_settings
         if relay_failed and effective_settings is not None:
-            # Save the H3 checkpoint even if Relay failed. Never package an
-            # earlier Relay cache as if this attempted upscale had succeeded.
+            # Save H3 even on an interrupted upscale; never package an old Relay.
             effective_settings["relayvsr_cache_allowed"] = False
         info.update(_maybe_auto_save_project(
             cache, original_path, unique_id, effective_settings, clip_count, frame_count,
         ))
+    if interrupted_exception is not None:
+        raise interrupted_exception
     return result
 
 
@@ -5971,7 +6002,7 @@ class MiniMaxH3MotionContextDiskFinalDecode:
         if not segments:
             raise ValueError("Disk Final Decode: empty cache.")
         interrupted = bool(cache.get("interrupted", False)) if isinstance(cache, dict) else False
-        project_total_clips = int(cache.get("project_total_clips", len(segments))) if isinstance(cache, dict) else len(segments)
+        project_total_clips = int(cache.get("project_total_clips") or 0) if isinstance(cache, dict) else 0
         snapshot_count = int(cache.get("snapshot_count", len(segments))) if isinstance(cache, dict) else len(segments)
         if interrupted:
             snapshot_count = max(1, min(len(segments), snapshot_count))
@@ -5981,7 +6012,7 @@ class MiniMaxH3MotionContextDiskFinalDecode:
         relay_final_ready = bool(
             relayvsr_x2 and not interrupted and
             (str(cache.get("run_mode", "full_batch")) != "clip_by_clip"
-             or len(segments) >= project_total_clips)
+             or (project_total_clips > 0 and len(segments) >= project_total_clips))
         )
         sequence_mode = str(manifest.get("sequence_mode") or "ref2va").lower()
         if sequence_mode == "ref2va_independent":
@@ -6002,6 +6033,7 @@ class MiniMaxH3MotionContextDiskFinalDecode:
                 relay_enabled=relay_final_ready, relay_requested=bool(relayvsr_x2),
                 relay_detail=relayvsr_detail, autosave_settings=project_autosave_settings,
                 clip_count=len(segments), frame_count=int(info.get("preview_frames", 0)),
+                audio_bitrate=audio_bitrate,
             )
         if sequence_mode == "fl2va":
             from .fl2va_engine import export_fl2va_final
@@ -6021,6 +6053,7 @@ class MiniMaxH3MotionContextDiskFinalDecode:
                 relay_enabled=relay_final_ready, relay_requested=bool(relayvsr_x2),
                 relay_detail=relayvsr_detail, autosave_settings=project_autosave_settings,
                 clip_count=len(segments), frame_count=int(info.get("preview_frames", 0)),
+                audio_bitrate=audio_bitrate,
             )
         source_meta = _source_meta(manifest)
         source_frames = _source_frame_count(source_meta)
@@ -6167,6 +6200,7 @@ class MiniMaxH3MotionContextDiskFinalDecode:
                 relay_enabled=relay_final_ready, relay_requested=bool(relayvsr_x2),
                 relay_detail=relayvsr_detail, autosave_settings=project_autosave_settings,
                 clip_count=len(segments), frame_count=total_frames,
+                audio_bitrate=audio_bitrate,
             )
 
         # Full Batch is strictly incremental and keeps a separate exact-final
@@ -6305,6 +6339,7 @@ class MiniMaxH3MotionContextDiskFinalDecode:
             relay_enabled=relay_final_ready, relay_requested=bool(relayvsr_x2),
             relay_detail=relayvsr_detail, autosave_settings=project_autosave_settings,
             clip_count=len(segments), frame_count=expected_frames,
+            audio_bitrate=audio_bitrate,
         )
 
 
