@@ -4691,6 +4691,8 @@ function setWidgetValue(node, name, value) {
 }
 
 function applyProjectPayload(node, runtime, projectPayload) {
+    // A loaded project starts at its first clip, not at the previous offset.
+    runtime.resetStripScroll = true;
     const extender = projectPayload?.extender || {};
     const settings = extender?.settings || {};
     if (typeof extender?.node_title === "string" && extender.node_title.trim()) {
@@ -4827,6 +4829,7 @@ function freshProjectState(runtime) {
 
 function resetRuntimeForNewProject(node, runtime) {
     if (!node || !runtime) return;
+    runtime.resetStripScroll = true;
 
     runtime.state = freshProjectState(runtime);
     runtime.refsState = emptyRefsState();
@@ -5146,6 +5149,8 @@ function makeNumberInput(value, min, max, step) {
 function renderReferences(node, runtime) {
     const row = runtime?.refsRow;
     if (!row) return;
+    // removeReference() redraws this strip directly, outside render().
+    const rowScroll = captureStripScroll(row);
     row.replaceChildren();
 
     const refs = runtime.refsState?.refs || [];
@@ -5313,6 +5318,7 @@ function renderReferences(node, runtime) {
 
         row.appendChild(slot);
     }
+    restoreStripScroll(row, rowScroll);
 }
 
 
@@ -5653,6 +5659,54 @@ function syncFl2vaHorizontalScroll(runtime) {
     runtime.refsRow.scrollLeft = left;
 }
 
+// The clip strip and the media strip are rebuilt with replaceChildren().
+// Emptying a scroller lets the browser clamp its offset back to zero, so keep
+// each strip's viewport across the rebuild. Restore instantly: the clip strip
+// uses CSS smooth scrolling, which would otherwise animate from the start.
+function captureStripScroll(row) {
+    if (!row) return null;
+    return { left: Number(row.scrollLeft) || 0, top: Number(row.scrollTop) || 0 };
+}
+
+function restoreStripScroll(row, saved) {
+    if (!row || !saved) return;
+    if (typeof row.scrollTo === "function") {
+        row.scrollTo({ left: saved.left, top: saved.top, behavior: "instant" });
+    } else {
+        row.scrollLeft = saved.left;
+        row.scrollTop = saved.top;
+    }
+}
+
+// Add Clip and the active-card follow are smooth programmatic scrolls. An
+// instant restore during render() aborts such an animation, so the pending
+// destination is resumed after the rebuild. Direct user input on the strip
+// cancels it, and it expires on its own.
+const CARD_NAVIGATION_MS = 1500;
+
+function navigateCards(runtime, left) {
+    const cards = runtime?.cards;
+    if (!cards) return;
+    runtime.cardsNavigation = {
+        left: Math.max(0, Number(left) || 0),
+        expires: Date.now() + CARD_NAVIGATION_MS,
+    };
+    cards.scrollTo({ left: runtime.cardsNavigation.left, behavior: "smooth" });
+}
+
+function resumeCardNavigation(runtime) {
+    const cards = runtime?.cards;
+    const navigation = runtime?.cardsNavigation;
+    if (!cards || !navigation) return;
+    const maxLeft = Math.max(0, (Number(cards.scrollWidth) || 0) - (Number(cards.clientWidth) || 0));
+    const target = Math.min(navigation.left, maxLeft);
+    if (Date.now() > navigation.expires || Math.abs((Number(cards.scrollLeft) || 0) - target) < 1) {
+        runtime.cardsNavigation = null;
+        return;
+    }
+    cards.scrollTo({ left: target, behavior: "smooth" });
+}
+
 function renderMediaStrip(node, runtime, fl2vaMode) {
     if (runtime?.refsHeader) {
         runtime.refsHeader.textContent = fl2vaMode
@@ -5748,6 +5802,12 @@ function restorePromptUiState(prompt, runtime, clipId) {
 
 function render(node, runtime) {
     const { state, cards, counter, status } = runtime;
+    // Keep the strip viewports across the rebuild, except after a project
+    // load, New Project or a REF2VA/FL2VA switch, which start at clip 1.
+    const resetStripScroll = Boolean(runtime.resetStripScroll);
+    runtime.resetStripScroll = false;
+    if (resetStripScroll) runtime.cardsNavigation = null;
+    const cardsScroll = resetStripScroll ? { left: 0, top: 0 } : captureStripScroll(cards);
     // render() rebuilds every card. Capture textarea-local UI state first so
     // long prompts do not jump back to the top after progress/status updates.
     capturePromptUiState(runtime);
@@ -6724,6 +6784,19 @@ function render(node, runtime) {
         restorePromptUiState(prompt, runtime, clip.id);
     });
 
+    // Every card is attached: put the strips back where they were. FL2VA
+    // First/Last frames follow the clip strip; the reference strip restored
+    // its own position in renderReferences().
+    restoreStripScroll(cards, cardsScroll);
+    if (runtime.refsRow) {
+        if (fl2vaMode) {
+            restoreStripScroll(runtime.refsRow, { left: Number(cards.scrollLeft) || 0, top: 0 });
+        } else if (resetStripScroll) {
+            restoreStripScroll(runtime.refsRow, { left: 0, top: 0 });
+        }
+    }
+    resumeCardNavigation(runtime);
+
     // Nodes 2.0 can recompute the DOM-widget grid after the Extender rebuilds
     // its cards (for example when toggling a Validated checkbox). During that
     // Vue layout pass the timeline may temporarily fall back to intrinsic card
@@ -7171,6 +7244,8 @@ function buildUi(node) {
             : runtime.statusText;
         updateHidden(node, runtime);
         captureNativeWorkflowState(node, runtime);
+        // REF2VA and FL2VA show separate timelines: open the other one at clip 1.
+        runtime.resetStripScroll = true;
         render(node, runtime);
         restoreCacheState(node, runtime);
         requestAnimationFrame(() => syncDomHeight(node, runtime, true));
@@ -7363,7 +7438,7 @@ function buildUi(node) {
         updateHidden(node, runtime);
         render(node, runtime);
         requestAnimationFrame(() => {
-            cards.scrollLeft = cards.scrollWidth;
+            navigateCards(runtime, cards.scrollWidth);
         });
     });
 
@@ -7746,6 +7821,10 @@ function buildUi(node) {
     // it passively, which avoids the feedback/repaint flicker of two synchronized
     // scroll containers while keeping every keyframe aligned with its card.
     cards.addEventListener("scroll", () => syncFl2vaHorizontalScroll(runtime), { passive: true });
+    // The user takes over: never resume an older programmatic destination.
+    for (const type of ["wheel", "pointerdown", "touchstart", "keydown"]) {
+        cards.addEventListener(type, () => { runtime.cardsNavigation = null; }, { passive: true });
+    }
 
     installInvalidationHooks(node, runtime);
     wrapResolutionWidgetCallbacks(node, runtime);
@@ -7817,10 +7896,7 @@ function scrollActiveCard(runtime, index) {
         card.offsetLeft -
             Math.max(0, (runtime.cards.clientWidth - card.offsetWidth) / 2)
     );
-    runtime.cards.scrollTo({
-        left,
-        behavior: "smooth",
-    });
+    navigateCards(runtime, left);
 }
 
 // A cancelled/failed ComfyUI execution does not call this node's onExecuted
