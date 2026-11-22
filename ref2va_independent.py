@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import time
 from pathlib import Path
 
@@ -119,6 +120,17 @@ def compact_cache(owner_id, *, force=False):
     if not compact_latent and not compact_audio:
         return manifest, {"compacted": False, "reclaimed_bytes": 0}
 
+    # Clips inherited from Motion ON may still carry PCM embedded in the latent
+    # file (pre-audio-cache chains). Latent compaction keeps only the video and
+    # audio latents, so move that PCM into the primary audio cache first.
+    embedded_pcm = [
+        i for i, desc in enumerate(segments)
+        if isinstance(desc.get("decoded_audio"), dict)
+        and desc["decoded_audio"].get("storage") != "audio_cache"
+        and isinstance(desc["decoded_audio"].get("waveform"), dict)
+    ] if compact_latent else []
+    rewrite_audio = bool(compact_audio or embedded_pcm)
+
     token = os.urandom(6).hex()
     data_tmp = data_path.with_name(data_path.name + f".compact_{token}.tmp")
     audio_tmp = audio_path.with_name(audio_path.name + f".compact_{token}.tmp")
@@ -134,23 +146,54 @@ def compact_cache(owner_id, *, force=False):
                     item = dict(desc)
                     item["video"] = f._copy_cache_spec(src, dst, item["video"])
                     item["audio"] = f._copy_cache_spec(src, dst, item["audio"])
+                    # A decoded MP4 blob inherited from Motion ON lives in the
+                    # old byte layout and is not copied. Drop it with its
+                    # latent_end marker rather than keep offsets into nothing.
+                    item.pop("decoded_mp4_blob", None)
+                    item.pop("latent_end", None)
                     item["segment_end"] = int(dst.tell())
                     updated_segments[i] = item
                 dst.flush(); os.fsync(dst.fileno())
 
-        if compact_audio:
-            with open(audio_path, "rb", buffering=0) as src, open(audio_tmp, "wb", buffering=0) as dst:
-                if src.read(int(d._AUDIO_CACHE_START)) != d._AUDIO_CACHE_MAGIC:
-                    raise ValueError("Independent Ref2VA cache compaction: invalid decoded-audio cache magic.")
-                dst.write(d._AUDIO_CACHE_MAGIC)
-                for i, desc in enumerate(updated_segments):
-                    item = dict(desc)
-                    meta = item.get("decoded_audio")
-                    if isinstance(meta, dict) and meta.get("storage") == "audio_cache" and isinstance(meta.get("waveform"), dict):
-                        meta = dict(meta)
-                        meta["waveform"] = f._copy_cache_spec(src, dst, meta["waveform"])
-                        item["decoded_audio"] = meta
-                        updated_segments[i] = item
+        if rewrite_audio:
+            with open(audio_tmp, "wb", buffering=0) as dst:
+                if compact_audio:
+                    with open(audio_path, "rb", buffering=0) as src:
+                        if src.read(int(d._AUDIO_CACHE_START)) != d._AUDIO_CACHE_MAGIC:
+                            raise ValueError("Independent Ref2VA cache compaction: invalid decoded-audio cache magic.")
+                        dst.write(d._AUDIO_CACHE_MAGIC)
+                        for i, desc in enumerate(updated_segments):
+                            item = dict(desc)
+                            meta = item.get("decoded_audio")
+                            if isinstance(meta, dict) and meta.get("storage") == "audio_cache" and isinstance(meta.get("waveform"), dict):
+                                meta = dict(meta)
+                                meta["waveform"] = f._copy_cache_spec(src, dst, meta["waveform"])
+                                item["decoded_audio"] = meta
+                                updated_segments[i] = item
+                elif audio_path.exists():
+                    # Only embedded PCM moves: keep the audio cache verbatim.
+                    with open(audio_path, "rb", buffering=0) as src:
+                        if src.read(int(d._AUDIO_CACHE_START)) != d._AUDIO_CACHE_MAGIC:
+                            raise ValueError("Independent Ref2VA cache compaction: invalid decoded-audio cache magic.")
+                        dst.write(d._AUDIO_CACHE_MAGIC)
+                        shutil.copyfileobj(src, dst, 8 * 1024 * 1024)
+                else:
+                    dst.write(d._AUDIO_CACHE_MAGIC)
+                if embedded_pcm:
+                    with open(data_path, "rb", buffering=0) as src:
+                        for i in embedded_pcm:
+                            item = dict(updated_segments[i])
+                            meta = dict(item["decoded_audio"])
+                            try:
+                                meta["waveform"] = f._copy_cache_spec(src, dst, meta["waveform"])
+                            except (OSError, ValueError, TypeError):
+                                # Unreadable derived PCM: decode it again from
+                                # the latent instead of failing the compaction.
+                                item.pop("decoded_audio", None)
+                            else:
+                                meta["storage"] = "audio_cache"
+                                item["decoded_audio"] = meta
+                            updated_segments[i] = item
                 dst.flush(); os.fsync(dst.fileno())
 
         updated = dict(manifest)
@@ -166,7 +209,7 @@ def compact_cache(owner_id, *, force=False):
 
         replacements = []
         if compact_latent: replacements.append((data_path, data_tmp))
-        if compact_audio: replacements.append((audio_path, audio_tmp))
+        if rewrite_audio: replacements.append((audio_path, audio_tmp))
         replacements.append((manifest_path, manifest_tmp))
         backups = []
         try:

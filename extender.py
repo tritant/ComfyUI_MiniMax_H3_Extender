@@ -105,7 +105,7 @@ from .ref2va_independent import (
     run as _run_ref2va_independent,
 )
 
-BUILD = "minimax-h3-extender-v3.1.1-RelayVSR"
+BUILD = "minimax-h3-extender-v3.1.2-RelayVSR"
 _LOG = logging.getLogger(__name__)
 FPS = 24
 AUDIO_LATENT_FPS = 40

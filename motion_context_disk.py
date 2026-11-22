@@ -61,7 +61,7 @@ from .motion_context_ram import (
     _streams_from_latent,
 )
 
-BUILD = "motion-context-disk-v3.1.1-RelayVSR"
+BUILD = "motion-context-disk-v3.1.2-RelayVSR"
 PREVIEW_AUDIO_MODE = "pcm_single_aac_gain_chain_v3_entry_ramp"
 CACHE_VERSION = 12
 PREVIEW_ROTATION_SLOTS = 3
@@ -680,6 +680,107 @@ def _recover_manifest(data_path, manifest_path, manifest):
     return manifest
 
 
+_STALE_INDEPENDENT_WARNED = set()
+
+
+def _embedded_decoded_pcm(desc):
+    meta = desc.get("decoded_audio")
+    return (
+        isinstance(meta, dict)
+        and meta.get("storage") != "audio_cache"
+        and isinstance(meta.get("waveform"), dict)
+    )
+
+
+def _byte_range(spec):
+    """(start, end) of an offset/nbytes spec, or None when it is malformed."""
+    try:
+        start, nbytes = int(spec["offset"]), int(spec["nbytes"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    return (start, start + nbytes) if nbytes > 0 else None
+
+
+def _drop_stale_independent_derivatives(data_path, manifest):
+    """Ignore Motion ON leftovers that an older compaction left dangling.
+
+    Independent Ref2VA never writes ``decoded_mp4_blob`` itself; a blob, like
+    embedded PCM, can only be inherited from Motion ON. Up to v3.1.1,
+    compaction rewrote the latent file as its header plus the video/audio
+    latents only, but kept the offsets of those inherited entries. After such
+    a compaction every byte belongs to a latent, so a stale offset either lies
+    outside the file or overlaps a latent. Each entry is judged on its own
+    byte range: it is kept only when it lies inside the file after the header
+    and overlaps no video/audio latent (PCM must not overlap a kept blob
+    either); a blob must also still start with an MP4 ``ftyp`` box. One
+    unreadable entry never removes the others. Both are derived caches rebuilt
+    from latents. Only the returned manifest changes; the next regular manifest
+    write persists it.
+    """
+    segments = manifest.get("segments") or []
+    if not any(
+        isinstance(desc.get("decoded_mp4_blob"), dict) or _embedded_decoded_pcm(desc)
+        for desc in segments
+    ):
+        return manifest
+    size = int(Path(data_path).stat().st_size)
+    latents = [
+        span
+        for desc in segments
+        for key in ("video", "audio")
+        if isinstance(desc.get(key), dict)
+        for span in [_byte_range(desc[key])]
+        if span is not None
+    ]
+
+    def free_range(span, occupied):
+        return (
+            span is not None
+            and span[0] >= _DATA_START
+            and span[1] <= size
+            and not any(span[0] < other[1] and other[0] < span[1] for other in occupied)
+        )
+
+    cleaned = [dict(desc) for desc in segments]
+    kept_blobs = []
+    with open(data_path, "rb") as fh:
+        for item in cleaned:
+            blob = item.get("decoded_mp4_blob")
+            if not isinstance(blob, dict):
+                continue
+            span = _byte_range(blob)
+            valid = free_range(span, latents) and span[1] - span[0] >= 8
+            if valid:
+                try:
+                    fh.seek(span[0] + 4)
+                    valid = fh.read(4) == b"ftyp"
+                except OSError:
+                    valid = False
+            if valid:
+                kept_blobs.append(span)
+            else:
+                item.pop("decoded_mp4_blob", None)
+                item.pop("latent_end", None)
+    for item in cleaned:
+        if not _embedded_decoded_pcm(item):
+            continue
+        span = _byte_range(item["decoded_audio"]["waveform"])
+        if not free_range(span, latents + kept_blobs):
+            item.pop("decoded_audio", None)
+    if cleaned == segments:
+        return manifest
+    key = str(Path(data_path).resolve())
+    if key not in _STALE_INDEPENDENT_WARNED:
+        _STALE_INDEPENDENT_WARNED.add(key)
+        _LOG.warning(
+            "H3 independent Ref2VA cache: ignoring stale derived preview/PCM offsets "
+            "left by an earlier compaction; they will be rebuilt from latents."
+        )
+    fixed = dict(manifest)
+    fixed["segments"] = cleaned
+    return fixed
+
+
 def _load_manifest_from_paths(data_path, manifest_path):
     data_path = Path(data_path)
     manifest_path = Path(manifest_path)
@@ -691,7 +792,10 @@ def _load_manifest_from_paths(data_path, manifest_path):
             f"H3 Disk Cache version {manifest.get('version')} is incompatible; "
             f"expected {CACHE_VERSION}."
         )
-    return _recover_manifest(data_path, manifest_path, manifest)
+    manifest = _recover_manifest(data_path, manifest_path, manifest)
+    if str(manifest.get("sequence_mode") or "").lower() == "ref2va_independent":
+        manifest = _drop_stale_independent_derivatives(data_path, manifest)
+    return manifest
 
 
 def _load_manifest(cache):
